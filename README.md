@@ -1,14 +1,16 @@
 # GENESIS
 
 Landsat Analysis Toolbox
+
 A comprehensive set of ArcGIS Python tools for processing and analyzing Landsat 8/9 satellite imagery.
+
 Overview
 The Landsat Analysis Toolbox provides specialized tools for creating mosaics, calculating spectral indices, performing statistical transformations, and classifying Landsat imagery. This toolbox is designed to streamline remote sensing workflows in ArcGIS Pro for geospatial analysts, environmental scientists, and GIS professionals.
+
 Tools Included
 The toolbox contains four main tools:
 1. Create Landsat Mosaic
 Creates mosaics from Landsat 8/9 scenes with cloud removal and advanced processing options.
-
 Supports temporal filtering by year, month, or season
 Includes regional presets for Portugal, Azores, Madeira, Cape Verde, Angola, and Mozambique
 Creates geometric median mosaics for improved results
@@ -17,7 +19,6 @@ Optional spatial masking
 2. Calculate Indices and Composites
 Calculates spectral indices and creates band composites for geological, vegetation, and environmental analysis.
 Spectral Indices:
-
 Clay Minerals Index (CMI)
 Ferrous Minerals Index (FMI)
 Iron Oxide Index (IOI)
@@ -26,7 +27,6 @@ NDWI (Normalized Difference Water Index)
 And many more...
 
 Color Composites:
-
 Natural Color (4,3,2)
 False Color (5,4,3)
 SWIR Geology Composite (7,6,4)
@@ -35,7 +35,6 @@ And others...
 
 3. Statistical Transformations
 Performs advanced statistical transformations on Landsat imagery to enhance features and reduce noise.
-
 Minimum Noise Fraction (MNF)
 Principal Component Analysis (PCA)
 Independent Component Analysis (ICA)
@@ -57,43 +56,6 @@ Open the Catalog pane
 Right-click on Toolboxes and select "Add Toolbox"
 Navigate to the downloaded landsat_toolbox.pyt file and select it
 
-Usage
-Example: Creating a Landsat Mosaic for Azores Islands
-pythonimport arcpy
-
-# Add the toolbox
-arcpy.ImportToolbox(r"path\to\landsat_toolbox.pyt")
-
-# Run the mosaic tool
-arcpy.landsattools.LandsatMosaicTool(
-    gdb_path="C:/GIS/Projects/Azores.gdb",
-    mosaic_name="AzoresMosaic2023",
-    data_folder="C:/GIS/LandsatData/",
-    region="Azores Central (Faial, Pico, São Jorge, Graciosa, Terceira)",
-    time_type="Specific Year",
-    year=2023,
-    month=None,
-    season=None,
-    mask_feature=None,
-    save_stats=True
-)
-Example: Calculating Spectral Indices
-pythonimport arcpy
-
-# Add the toolbox
-arcpy.ImportToolbox(r"path\to\landsat_toolbox.pyt")
-
-# Run the indices tool
-arcpy.landsattools.LandsatIndicesComposite(
-    input_raster="C:/GIS/Projects/Azores.gdb/AzoresMosaic2023",
-    out_workspace="C:/GIS/Projects/Azores.gdb",
-    process_type="Spectral Indices",
-    indices=["NDVI", "Clay Minerals Index (CMI)", "Iron Oxide Index (IOI)"],
-    composites=None,
-    out_prefix="azores_",
-    rescale=False,
-    mask_feature=None
-)
 Documentation
 Each tool includes detailed parameter descriptions and help text within the ArcGIS Pro interface. Additionally, the code contains comprehensive documentation for each function and parameter.
 For detailed implementation of statistical algorithms:
