@@ -1,0 +1,47 @@
+# Citation metadata for GENESIS. Renders as "Cite this repository"
+# in the GitHub sidebar. After minting the Zenodo DOI, replace the
+# placeholder `value:` field below.
+
+cff-version: 1.2.0
+message: "If you use GENESIS in your work, please cite it as below."
+title: "GENESIS — Multisensor Satellite Analysis Toolbox for ArcGIS Pro"
+abstract: >
+  GENESIS is an ArcGIS Pro Python Toolbox for remote-sensing analysis of
+  Sentinel-2 L2A, Landsat 8/9 Collection 2 Level 2, and ASTER L2 (AST_07XT)
+  imagery in a single unified workflow. It provides cloud-masked
+  mosaicking with provenance tracking, sensor-aware spectral indices and
+  composites (~25 indices + ~8 composites covering vegetation, water,
+  built-up, and mineralogical / hydrothermal alteration targets),
+  PCA / MNF / ICA statistical transformations, and Spectral Angle Mapper
+  classification. Designed for geological mapping at LNEG (Laboratório
+  Nacional de Energia e Geologia, Portugal).
+type: software
+version: "1.0.0"
+date-released: "2026-05-20"
+license: Apache-2.0
+authors:
+  - family-names: "Gonçalves"
+    given-names: "Pedro"
+    affiliation: "Laboratório Nacional de Energia e Geologia (LNEG)"
+    # orcid: "https://orcid.org/0000-0000-0000-0000"   # add when known
+repository-code: "https://github.com/PedroMMGoncalves/GENESIS"
+keywords:
+  - "remote sensing"
+  - "sentinel-2"
+  - "landsat"
+  - "aster"
+  - "arcgis pro"
+  - "python toolbox"
+  - "geological mapping"
+  - "mineral mapping"
+  - "hydrothermal alteration"
+  - "cloud masking"
+  - "geometric median"
+  - "spectral angle mapper"
+identifiers:
+  # After minting the Zenodo DOI for your first release, paste the
+  # concept DOI here (the one that always points to the latest version).
+  # Format: 10.5281/zenodo.<numeric_id>
+  - type: doi
+    value: "10.5281/zenodo.PLACEHOLDER"
+    description: "Concept DOI (latest release, via Zenodo)"

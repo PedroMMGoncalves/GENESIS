@@ -1,87 +1,117 @@
 # GENESIS
 
-Landsat Analysis Toolbox
+> Multisensor Satellite Analysis Toolbox for ArcGIS Pro
 
-A comprehensive set of ArcGIS Python tools for processing and analyzing Landsat 8/9 satellite imagery.
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![ArcGIS Pro](https://img.shields.io/badge/ArcGIS_Pro-3.0%2B-green.svg)](https://www.esri.com/en-us/arcgis/products/arcgis-pro/overview)
+[![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org)
+[![DOI](https://img.shields.io/badge/DOI-pending-lightgrey.svg)](https://zenodo.org/)
+<!-- Once the Zenodo DOI is minted, replace the badge above with:
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.PLACEHOLDER.svg)](https://doi.org/10.5281/zenodo.PLACEHOLDER) -->
 
-Overview
-The Landsat Analysis Toolbox provides specialized tools for creating mosaics, calculating spectral indices, performing statistical transformations, and classifying Landsat imagery. This toolbox is designed to streamline remote sensing workflows in ArcGIS Pro for geospatial analysts, environmental scientists, and GIS professionals.
+GENESIS is a unified ArcGIS Pro Python Toolbox for remote-sensing analysis
+of **Sentinel-2 L2A**, **Landsat 8/9 Collection 2 Level 2**, and **ASTER L2
+AST_07XT** imagery. Six tools cover the full workflow — from raw scene
+folders to cloud-removed multi-band mosaics, spectral indices, PCA/MNF/ICA
+transforms, and Spectral Angle Mapper classification — across all three
+sensors via a single sensor-aware design.
 
-Tools Included
-The toolbox contains four main tools:
-1. Create Landsat Mosaic
-Creates mosaics from Landsat 8/9 scenes with cloud removal and advanced processing options.
-Supports temporal filtering by year, month, or season
-Includes regional presets for Portugal, Azores, Madeira, Cape Verde, Angola, and Mozambique
-Creates geometric median mosaics for improved results
-Optional spatial masking
+Developed at **LNEG** (Laboratório Nacional de Energia e Geologia) for
+geological mapping, mineral exploration, and hydrothermal alteration
+detection across Portuguese and African study areas (Iberian Peninsula,
+Azores, Madeira, Cape Verde, Angola, Mozambique).
 
-2. Calculate Indices and Composites
-Calculates spectral indices and creates band composites for geological, vegetation, and environmental analysis.
-Spectral Indices:
-Clay Minerals Index (CMI)
-Ferrous Minerals Index (FMI)
-Iron Oxide Index (IOI)
-NDVI (Normalized Difference Vegetation Index)
-NDWI (Normalized Difference Water Index)
-And many more...
+---
 
-Color Composites:
-Natural Color (4,3,2)
-False Color (5,4,3)
-SWIR Geology Composite (7,6,4)
-Clay Minerals Composite (7,5,6)
-And others...
+## Tools
 
-3. Statistical Transformations
-Performs advanced statistical transformations on Landsat imagery to enhance features and reduce noise.
-Minimum Noise Fraction (MNF)
-Principal Component Analysis (PCA)
-Independent Component Analysis (ICA)
+The toolbox exposes six tools in workflow order:
 
-4. Spectral Angle Mapper
-Performs Spectral Angle Mapper (SAM) classification using reference spectra from tables, training samples, or individual pixels.
-Requirements
+| # | Tool | Purpose |
+| --- | --- | --- |
+| **01** | Sentinel-2 L2A Mosaic | Cloud-masked mosaic from S2 `.SAFE` archives or `.zip` downloads (SCL classes 3/8/9/10 masked; 20m bands resampled to 10m) |
+| **02** | Landsat 8/9 C2L2 Mosaic | Cloud-masked mosaic from EarthExplorer `.tar` archives (QA_PIXEL bits 0-4 masked; multi-UTM-zone merging) |
+| **03** | ASTER L2 Mosaic | Mineral-mapping mosaic from AST_07XT V004 (TIFF + HDF input; SWIR 30m → 15m; QA Data Plane + multitemporal cloud refinement) |
+| **04** | Spectral Indices & Composites | ~25 indices + ~8 RGB composites, sensor-filtered to what each sensor can compute (red-edge for S2; per-wavelength SWIR minerals for ASTER) |
+| **05** | Statistical Transformations | PCA, MNF, and ICA — sensor-agnostic algorithm with persisted `.npz` statistics for cross-AOI re-application |
+| **06** | Spectral Angle Mapper | Reference-spectra classification (table / training samples / endmember pixels) |
 
-ArcGIS Pro 3.0 or higher
-Spatial Analyst extension
-Image Analyst extension (recommended)
-Python 3.x with NumPy, SciPy, and scikit-learn
+All three mosaic tools write a `_provenance.csv` next to the output documenting every scene that contributed (scene ID, acquisition date, cloud cover, input path, processing baseline, toolbox version).
 
-Installation
+---
 
-Clone this repository or download the ZIP file
-Open ArcGIS Pro
-Open the Catalog pane
-Right-click on Toolboxes and select "Add Toolbox"
-Navigate to the downloaded landsat_toolbox.pyt file and select it
+## Sensor-aware design
 
-Documentation
-Each tool includes detailed parameter descriptions and help text within the ArcGIS Pro interface. Additionally, the code contains comprehensive documentation for each function and parameter.
-For detailed implementation of statistical algorithms:
+Tools 04, 05, and 06 take a `Sensor Type` parameter (Auto-detect / Landsat 8/9 / Sentinel-2 / ASTER). The auto-detection reads the input raster's filename pattern or band count and resolves to the right sensor. Indices and composites are filtered at runtime to only what the selected sensor can compute — NDRE only appears for Sentinel-2, Alunite / Kaolinite / Muscovite / Calcite only for ASTER, Iron Oxide via Red/Blue for L8/9 and S2 (ASTER gets the Red/Green variant since it lacks a blue band).
 
-The MNF transformation uses a two-step process with noise estimation and signal extraction
-PCA implementation follows standard covariance-based computation
-ICA uses FastICA algorithm from scikit-learn
+| Sensor | Canonical band stack | Specific indices |
+| --- | --- | --- |
+| **Landsat 8/9** | 7 bands: Coastal, Blue, Green, Red, NIR, SWIR1, SWIR2 | NDVI, NDWI, NDMI, NDBI, geological mineral ratios with Blue |
+| **Sentinel-2** | 10 bands: B02, B03, B04, B05, B06, B07, B08, B8A, B11, B12 | All of the above + NDRE, CIred-edge, IRECI |
+| **ASTER** | 9 bands: B01, B02, B03N, B04, B05, B06, B07, B08, B09 | Geological staples + Alunite, Kaolinite, Muscovite, Calcite, Hydrothermal Alteration (Cudahy) |
 
-Troubleshooting
-Common issues and solutions:
+---
 
-Memory Errors: For large datasets, consider processing by tiles or regions
-Missing Extensions: Ensure Spatial Analyst extension is properly licensed
-Performance Issues: Statistical transformations are computationally intensive; reduce input resolution for testing
+## Requirements
 
-Contributing
-Contributions are welcome! Please feel free to submit a Pull Request.
+- **ArcGIS Pro 3.0 or higher**
+- **Spatial Analyst** extension (required for all six tools)
+- **Image Analyst** extension (used by Mosaic and Transformations)
+- Python 3.9+ with `numpy`, `scipy`, `scikit-learn` — all included with ArcGIS Pro's bundled Python
+- `osgeo.gdal` (also bundled with ArcGIS Pro) — used by Tool 03 for HDF input
 
-License
-This project is licensed under the MIT License - see the LICENSE file for details.
-Acknowledgments
+---
 
-Developed for geological and environmental remote sensing applications
-Spectral indices formulations derived from published literature
-Transformation algorithms based on established remote sensing methodologies
+## Installation
 
-Contact
-For questions or support, please open an issue on this repository.
+1. Clone or download this repository.
+2. Open **ArcGIS Pro**.
+3. In the **Catalog** pane, right-click **Toolboxes** → **Add Toolbox**.
+4. Navigate to `genesis_toolbox.pyt` and select it.
+5. The six tools appear under "GENESIS — Satellite Analysis Toolbox" in workflow order (01–06).
 
+---
+
+## Input formats
+
+| Sensor | Accepted | Notes |
+| --- | --- | --- |
+| Sentinel-2 L2A | `.SAFE` folders or `.zip` Copernicus archives | Zips auto-extracted on first run; idempotent |
+| Landsat 8/9 | EarthExplorer `.tar` archives or extracted scene folders | Both L2SR and L2SP accepted; tars auto-extracted |
+| ASTER | AST_07XT V004 per-band TIFFs or `.hdf` archives | TIFFs grouped by 17-char scene ID; HDF read via `osgeo.gdal` |
+
+---
+
+## Output convention
+
+- Reflectance: **float 0–1** (analysis-friendly; Sentinel-2 ×0.0001, ASTER ×0.001 applied during ingestion)
+- Mosaic CRS: inherited from input (UTM for Landsat / S2; resample-aligned for ASTER)
+- Each mosaic: **multi-band GeoTIFF or geodatabase raster + `_provenance.csv`**
+- Transformation statistics: **`.npz` (NumPy archive)** for re-applying to new AOIs
+
+---
+
+## Citation
+
+If you use GENESIS in your research, please cite it via the metadata in
+[`CITATION.cff`](CITATION.cff) (GitHub renders this in the sidebar as
+"Cite this repository"). A versioned DOI is minted via Zenodo for each
+release.
+
+---
+
+## License
+
+Licensed under the **Apache License, Version 2.0**. See [`LICENSE`](LICENSE)
+for the full text. In short: you can use, modify, and redistribute this
+work commercially or otherwise, provided attribution is preserved; explicit
+patent grant and patent-retaliation clauses apply per the Apache 2.0 terms.
+
+---
+
+## Acknowledgements
+
+- Developed at **LNEG** (Laboratório Nacional de Energia e Geologia)
+- Spectral index formulations from the published remote-sensing literature; mineral indices for ASTER follow Cudahy (alteration), Mars & Rowan (clays), and Sabins (iron oxides)
+- PCA / MNF / ICA implementations follow Green et al. (1988) for MNF and use scikit-learn's FastICA
+- Cloud-masking conventions: Landsat C2L2 QA_PIXEL (Vermote et al.), Sentinel-2 SCL (Sen2Cor), ASTER QA Data Plane (LP DAAC)

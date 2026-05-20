@@ -1,0 +1,36 @@
+# Local-only reference copies of the legacy single-sensor toolboxes
+# (landsat_toolbox.pyt, sentinel2_toolbox.pyt). Kept on disk for
+# comparison but excluded from the repo — the active toolbox is the
+# unified genesis_toolbox.pyt at root.
+legacy/
+
+# Tests are author-side development scaffolding, not part of the
+# public deliverable. Kept locally for re-running before changes;
+# excluded from the repo so the public-facing artefact stays focused
+# on the tool itself (genesis_toolbox.pyt + README + CITATION + LICENSE).
+tests/
+
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest
+.pytest_cache/
+
+# ArcGIS Pro scratch artefacts
+*.aux.xml
+# Per-tool metadata sidecars (e.g., `landsat_toolbox.LandsatMosaic.pyt.xml`) —
+# regenerated automatically by ArcGIS Pro and not portable across machines.
+*.pyt.xml
+
+# OS / editor crud
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Editor / tooling local config — user-specific, not part of the repo
+.claude/
+.vscode/
+.idea/
