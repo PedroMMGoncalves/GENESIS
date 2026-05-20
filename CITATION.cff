@@ -14,8 +14,10 @@ abstract: >
   built-up, and mineralogical / hydrothermal alteration targets),
   PCA / MNF / ICA statistical transformations, and Spectral Angle Mapper
   classification. Used to support analytical work for the GENESIS
-  Horizon 2020 project (genesisnbs.eu), in particular processing
-  satellite imagery over the Faial Island (Azores) case study.
+  Horizon Europe project (genesisnbs.eu, grant agreement Nº 101157447),
+  in particular processing satellite imagery over the Faial (Azores)
+  demonstrator site — an aquifer storage and recovery study at
+  Furo das Cancelas targeting saltwater intrusion mitigation.
 type: software
 version: "1.0.0"
 date-released: "2026-05-20"
@@ -49,9 +51,22 @@ identifiers:
 
 references:
   - type: website
-    title: "GENESIS — Nature-based Solutions for sustainable cities (Horizon 2020 project)"
+    title: "GENESIS — Nature-based Solutions for sustainable cities (Horizon Europe project, grant 101157447)"
     url: "https://genesisnbs.eu"
     notes: >
-      Parent research context. This toolbox is independently authored work
-      used in support of GENESIS NBS analytical tasks (Faial Island case
-      study). It is not an official project deliverable.
+      Parent research context. Funded by the European Union's Horizon
+      Europe research and innovation programme under grant agreement
+      Nº 101157447. This toolbox is independently authored work used
+      in support of GENESIS analytical tasks at the Faial demonstrator
+      site. It is not an official project deliverable. Views and
+      opinions expressed are those of the author only and do not
+      necessarily reflect those of the European Union or CINEA.
+  - type: website
+    title: "GENESIS — Faial demonstrator site"
+    url: "https://genesisnbs.eu/faial/"
+    notes: >
+      The Faial demonstrator is designing an aquifer storage and
+      recovery system at Furo das Cancelas to counter saltwater
+      intrusion and re-establish freshwater supply for ~3,000
+      inhabitants. This toolbox supports that work by producing
+      cloud-removed multisensor mosaics and derived spectral products.
