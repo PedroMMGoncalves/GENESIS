@@ -2125,11 +2125,44 @@ class LandsatMosaic(object):
                 if 'rasters' in s and len(s['rasters']) == 7
             )
 
+            # Temp composites go to a scratch folder as standalone .tif files,
+            # NOT into the production geodatabase. Previous behaviour put
+            # each composite in `gdb_path/temp_composite_<UUID>`, which
+            # caused per-scene CompositeBands time to grow monotonically
+            # over the run (10s → 40s on the 173-scene Faial run) because
+            # every CompositeBands call had to register the new raster
+            # in the GDB catalog, and the catalog walk gets slower with
+            # each addition. Scratch-folder .tif files have zero catalog
+            # overhead — each composite stays at its native ~10s.
+            #
+            # Scratch folder is created adjacent to the output GDB so the
+            # cleanup is local and reviewable; falls back to arcpy's
+            # scratchFolder if the GDB parent isn't writeable.
+            scratch_root = arcpy.env.scratchFolder or os.path.dirname(gdb_path)
+            scratch_dir = os.path.join(
+                scratch_root,
+                f"_genesis_landsat_composites_{uuid.uuid4().hex[:8]}",
+            )
+            os.makedirs(scratch_dir, exist_ok=True)
+
+            # If env.mask is active, wrap each cleaned band with
+            # ExtractByMask so its native extent IS the AOI extent.
+            # arcpy.management.CompositeBands ignores arcpy.env.extent
+            # (management tools use input-raster extent intersection),
+            # so without this wrapping the composite would materialise
+            # the full /vsitar/ scene extent regardless of AOI scope.
+            aoi_active = bool(arcpy.env.mask)
+            if aoi_active:
+                arcpy.AddMessage(
+                    f"\nAOI mask active: each cleaned band wrapped with "
+                    f"ExtractByMask before CompositeBands. Composites will "
+                    f"be sized to AOI extent, not full scene footprint."
+                )
+
             arcpy.AddMessage(
                 f"\nBuilding {total} per-scene multi-band composites in "
-                f"geodatabase (this materialises the cloud-masked stack "
-                f"for each scene — expect several seconds per scene on "
-                f"archive inputs)..."
+                f"scratch folder (cloud-masked stack per scene; expect "
+                f"several seconds per scene on archive inputs)..."
             )
 
             composite_idx = 0
@@ -2143,8 +2176,19 @@ class LandsatMosaic(object):
                     arcpy.AddMessage(
                         f"  [{composite_idx}/{total}] composite for {scene_id}"
                     )
-                    temp_composite = os.path.join(gdb_path, f"temp_composite_{uuid.uuid4().hex}")
-                    arcpy.management.CompositeBands(scene['rasters'], temp_composite)
+
+                    if aoi_active:
+                        cleaned_inputs = [
+                            arcpy.sa.ExtractByMask(r, arcpy.env.mask)
+                            for r in scene['rasters']
+                        ]
+                    else:
+                        cleaned_inputs = scene['rasters']
+
+                    temp_composite = os.path.join(
+                        scratch_dir, f"composite_{composite_idx:04d}.tif"
+                    )
+                    arcpy.management.CompositeBands(cleaned_inputs, temp_composite)
                     multiband_rasters.append(temp_composite)
                     arcpy.AddMessage(
                         f"      done in {(datetime.now() - scene_start).total_seconds():.1f}s"
@@ -2190,17 +2234,28 @@ class LandsatMosaic(object):
             return None
 
         finally:
-            # Always clean up temp composites, even on failure.
+            # Cleanup is trivial now that composites live in a scratch
+            # folder instead of the production GDB: one shutil.rmtree
+            # tears the whole directory down. No GDB catalog locks, no
+            # retry dance, no chance of orphan rasters in the user's
+            # output geodatabase.
             if multiband_rasters:
                 arcpy.AddMessage(
-                    f"  Cleaning up {len(multiband_rasters)} temp composite(s)..."
+                    f"  Cleaning up scratch folder "
+                    f"({len(multiband_rasters)} composite(s))..."
                 )
-            for temp_raster in multiband_rasters:
-                try:
-                    if arcpy.Exists(temp_raster):
-                        arcpy.management.Delete(temp_raster)
-                except Exception:
-                    pass
+            try:
+                import shutil
+                if 'scratch_dir' in locals() and os.path.isdir(scratch_dir):
+                    shutil.rmtree(scratch_dir, ignore_errors=True)
+                    if os.path.isdir(scratch_dir):
+                        arcpy.AddWarning(
+                            f"  Scratch folder {scratch_dir} could not be "
+                            f"fully removed (likely a file lock). It is "
+                            f"safe to delete manually."
+                        )
+            except Exception as e:
+                arcpy.AddWarning(f"  Scratch cleanup failed (non-fatal): {e}")
                     
     def execute(self, parameters, messages):
         try:
@@ -2344,21 +2399,56 @@ class LandsatMosaic(object):
                 arcpy.AddError("No valid mosaics were created")
                 return None
 
+            # Track intermediates created during this run so we can delete
+            # them after the final output is established. The user wants
+            # ONE raster in the output GDB, not a trail of per-zone /
+            # pre-mask intermediates.
+            intermediates_to_delete = []
+
             # Merge zones if needed
             if len(final_mosaics) > 1:
                 arcpy.AddMessage("\nMerging UTM zones...")
-                final_mosaic = self._merge_zone_mosaics(
+                merged = self._merge_zone_mosaics(
                     gdb_path, mosaic_name, final_mosaics, region_info
                 )
+                if merged:
+                    # The per-zone Geomedian rasters are now superseded
+                    # by the merge — queue them for cleanup.
+                    intermediates_to_delete.extend(final_mosaics)
+                    final_mosaic = merged
+                else:
+                    # Merge failed; fall back to the single-zone path
+                    final_mosaic = final_mosaics[0]
             else:
                 final_mosaic = final_mosaics[0]
 
             # Apply mask if specified
             if final_mosaic and mask_feature:
                 arcpy.AddMessage("\nApplying mask...")
-                final_mosaic = self._apply_mask(
+                masked = self._apply_mask(
                     final_mosaic, mask_feature, gdb_path, mosaic_name
                 )
+                if masked and masked != final_mosaic:
+                    # The unmasked mosaic is now superseded by the masked
+                    # version — queue it for cleanup.
+                    intermediates_to_delete.append(final_mosaic)
+                    final_mosaic = masked
+
+            # Clean up superseded intermediates (per-zone Geomedians +
+            # the unmasked mosaic). Done before the success report so the
+            # final log line accurately reflects what's left in the GDB.
+            for path in intermediates_to_delete:
+                if path and path != final_mosaic:
+                    try:
+                        if arcpy.Exists(path):
+                            arcpy.management.Delete(path)
+                            arcpy.AddMessage(
+                                f"  Removed intermediate: {os.path.basename(path)}"
+                            )
+                    except Exception as e:
+                        arcpy.AddWarning(
+                            f"  Could not delete intermediate {path}: {e}"
+                        )
 
             # Save statistics
             if save_stats:
@@ -3749,6 +3839,12 @@ class Sentinel2Mosaic(object):
 
             # Merge multi-tile result.
             arcpy.AddMessage("\nStep 5/5 — Finalising output...")
+
+            # Track intermediates created during this run so we can
+            # delete them after the final output is established. The
+            # user wants ONE raster in the output GDB.
+            intermediates_to_delete = []
+
             if len(tile_mosaics) > 1:
                 final_path = os.path.join(gdb_path, mosaic_name)
                 merge_start = datetime.now()
@@ -3771,6 +3867,8 @@ class Sentinel2Mosaic(object):
                     f"{(datetime.now() - merge_start).total_seconds():.1f}s "
                     f"→ {final_path}"
                 )
+                # Per-tile mosaics are superseded by the merged result.
+                intermediates_to_delete.extend(tile_mosaics)
                 final_mosaic = final_path
             else:
                 arcpy.AddMessage(
@@ -3786,6 +3884,8 @@ class Sentinel2Mosaic(object):
                 masked = arcpy.sa.ExtractByMask(final_mosaic, mask_feature)
                 masked_path = os.path.join(gdb_path, f"{mosaic_name}_Masked")
                 masked.save(masked_path)
+                # The unmasked mosaic is superseded by the masked one.
+                intermediates_to_delete.append(final_mosaic)
                 final_mosaic = masked_path
                 arcpy.AddMessage(
                     f"    AOI mask applied in "
@@ -3796,6 +3896,21 @@ class Sentinel2Mosaic(object):
                 arcpy.AddWarning(
                     f"AOI mask {mask_feature!r} not found — output is unmasked."
                 )
+
+            # Delete superseded intermediates so only the final mosaic
+            # remains in the output GDB.
+            for path in intermediates_to_delete:
+                if path and path != final_mosaic:
+                    try:
+                        if arcpy.Exists(path):
+                            arcpy.management.Delete(path)
+                            arcpy.AddMessage(
+                                f"  Removed intermediate: {os.path.basename(path)}"
+                            )
+                    except Exception as e:
+                        arcpy.AddWarning(
+                            f"  Could not delete intermediate {path}: {e}"
+                        )
 
             # Provenance CSV.
             if save_stats:
@@ -4654,12 +4769,17 @@ class AsterMosaic(object):
             # Step 6: AOI mask + provenance.
             arcpy.AddMessage("\nStep 6/6 — Finalising output...")
             final_path = output_path
+            unmasked_to_delete = None
             if mask_feature and arcpy.Exists(mask_feature):
                 mask_start = datetime.now()
                 arcpy.AddMessage(f"  Applying AOI mask: {mask_feature}")
                 masked = arcpy.sa.ExtractByMask(output_path, mask_feature)
                 masked_path = os.path.join(gdb_path, f"{mosaic_name}_Masked")
                 masked.save(masked_path)
+                # The unmasked Geomedian output is superseded by the
+                # masked one — queue it for cleanup so the GDB ends up
+                # with one raster, not two.
+                unmasked_to_delete = output_path
                 final_path = masked_path
                 arcpy.AddMessage(
                     f"    AOI mask applied in "
@@ -4668,6 +4788,19 @@ class AsterMosaic(object):
                 )
             elif mask_feature:
                 arcpy.AddWarning(f"AOI mask {mask_feature!r} not found — output is unmasked.")
+
+            # Delete superseded unmasked intermediate.
+            if unmasked_to_delete and unmasked_to_delete != final_path:
+                try:
+                    if arcpy.Exists(unmasked_to_delete):
+                        arcpy.management.Delete(unmasked_to_delete)
+                        arcpy.AddMessage(
+                            f"  Removed intermediate: {os.path.basename(unmasked_to_delete)}"
+                        )
+                except Exception as e:
+                    arcpy.AddWarning(
+                        f"  Could not delete intermediate {unmasked_to_delete}: {e}"
+                    )
 
             if save_stats:
                 arcpy.AddMessage("  Writing provenance CSV...")
