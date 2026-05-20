@@ -2107,19 +2107,64 @@ class LandsatMosaic(object):
         .save() left orphan temp rasters in the production geodatabase;
         re-runs accumulated more. We now build the list under a
         try/finally so cleanup ALWAYS runs.
+
+        Instrumentation: this phase used to run silently for tens of
+        minutes — each `CompositeBands` call forces the full lazy
+        pipeline (tar read via VSI → QA decode → TransposeBits → Con
+        mask), and `GeometricMedian` then iterates up to 20 passes
+        across all scenes without any internal progress hook. We log
+        per-scene composite progress and announce the median phase so
+        the user knows the tool is making progress, not hung.
         """
         multiband_rasters = []
         output_path = None
         try:
             start_time = datetime.now()
+            total = sum(
+                1 for s in clean_scenes
+                if 'rasters' in s and len(s['rasters']) == 7
+            )
 
+            arcpy.AddMessage(
+                f"\nBuilding {total} per-scene multi-band composites in "
+                f"geodatabase (this materialises the cloud-masked stack "
+                f"for each scene — expect several seconds per scene on "
+                f"archive inputs)..."
+            )
+
+            composite_idx = 0
             for scene in clean_scenes:
                 if 'rasters' in scene and len(scene['rasters']) == 7:
+                    composite_idx += 1
+                    scene_id = scene.get('scene_id') or os.path.basename(
+                        (scene.get('path') or '').rstrip(os.sep)
+                    ) or f"scene_{composite_idx}"
+                    scene_start = datetime.now()
+                    arcpy.AddMessage(
+                        f"  [{composite_idx}/{total}] composite for {scene_id}"
+                    )
                     temp_composite = os.path.join(gdb_path, f"temp_composite_{uuid.uuid4().hex}")
                     arcpy.management.CompositeBands(scene['rasters'], temp_composite)
                     multiband_rasters.append(temp_composite)
+                    arcpy.AddMessage(
+                        f"      done in {(datetime.now() - scene_start).total_seconds():.1f}s"
+                    )
+
+            composite_elapsed = (datetime.now() - start_time).total_seconds()
+            arcpy.AddMessage(
+                f"\nAll {len(multiband_rasters)} composites materialised in "
+                f"{composite_elapsed:.1f}s ({composite_elapsed/max(1,len(multiband_rasters)):.1f}s/scene)."
+            )
 
             output_path = os.path.join(gdb_path, f"{mosaic_name}_Geomedian")
+            median_start = datetime.now()
+            arcpy.AddMessage(
+                f"\nStarting GeometricMedian over {len(multiband_rasters)} "
+                f"stacks (max 20 iterations, epsilon=0.001). This phase "
+                f"is silent — arcpy.ia.GeometricMedian does not expose "
+                f"per-iteration progress. Memory and disk activity will "
+                f"continue; please wait for completion."
+            )
             geomedian = arcpy.ia.GeometricMedian(
                 multiband_rasters,
                 epsilon=0.001,
@@ -2128,10 +2173,14 @@ class LandsatMosaic(object):
                 cellsize_type="FirstOf",
             )
             geomedian.save(output_path)
+            arcpy.AddMessage(
+                f"GeometricMedian complete in "
+                f"{(datetime.now() - median_start).total_seconds():.1f}s."
+            )
 
             arcpy.AddMessage(f"Multi-band geometric median created: {output_path}")
             arcpy.AddMessage(
-                f"  Processed {len(multiband_rasters)} scenes in "
+                f"  Total {len(multiband_rasters)} scenes in "
                 f"{(datetime.now() - start_time).total_seconds():.1f}s."
             )
             return output_path
@@ -2142,6 +2191,10 @@ class LandsatMosaic(object):
 
         finally:
             # Always clean up temp composites, even on failure.
+            if multiband_rasters:
+                arcpy.AddMessage(
+                    f"  Cleaning up {len(multiband_rasters)} temp composite(s)..."
+                )
             for temp_raster in multiband_rasters:
                 try:
                     if arcpy.Exists(temp_raster):
@@ -3543,33 +3596,53 @@ class Sentinel2Mosaic(object):
                 return None
             arcpy.AddMessage(f"  Kept {len(kept_scenes)} scenes after temporal filter.")
 
-            # Step 4: process each scene (mask + scale + stack), grouped by tile.
-            arcpy.AddMessage("\nStep 3/5 — Cloud-masking and stacking scenes...")
+            # Step 3: process each scene (mask + scale + stack), grouped by tile.
+            arcpy.AddMessage(
+                f"\nStep 3/5 — Cloud-masking and stacking {len(kept_scenes)} "
+                f"scenes (per-band SCL mask + scale + resample-to-10m + 10-band "
+                f"stack). On archive inputs the JP2 decode happens once per band "
+                f"during resample; expect tens of seconds per scene."
+            )
             scenes_by_tile = {}
             all_scenes_used = []
-            for scene in kept_scenes:
+            stack_start = datetime.now()
+            for idx, scene in enumerate(kept_scenes, 1):
                 meta = scene["metadata"]
                 tile = meta.get("tile_id")
                 if not tile:
                     arcpy.AddWarning(
-                        f"  Skipped (no tile ID): {os.path.basename(scene['path'])}"
+                        f"  [{idx}/{len(kept_scenes)}] Skipped (no tile ID): "
+                        f"{os.path.basename(scene['path'])}"
                     )
                     continue
+                src_tag = "zip" if scene.get("source_kind") == "zip" else "safe"
                 arcpy.AddMessage(
-                    f"  [{tile}] {os.path.basename(scene['path'])}"
+                    f"  [{idx}/{len(kept_scenes)}] [{tile}] [{src_tag}] "
+                    f"{os.path.basename(scene['path'])}"
                 )
+                scene_start = datetime.now()
                 try:
                     stacked_path = self._process_scene(scene, scratch_dir)
                 except Exception as e:
-                    arcpy.AddWarning(f"    Failed: {e}")
+                    arcpy.AddWarning(f"      Failed: {e}")
                     continue
                 if stacked_path:
                     scenes_by_tile.setdefault(tile, []).append(stacked_path)
                     composite_temp_paths.append(stacked_path)
                     all_scenes_used.append(scene)
+                    arcpy.AddMessage(
+                        f"      done in "
+                        f"{(datetime.now() - scene_start).total_seconds():.1f}s"
+                    )
             if not scenes_by_tile:
                 arcpy.AddError("No scenes survived cloud masking + stacking.")
                 return None
+            stack_elapsed = (datetime.now() - stack_start).total_seconds()
+            arcpy.AddMessage(
+                f"  Step 3 done in {stack_elapsed:.1f}s "
+                f"({stack_elapsed/max(1,len(all_scenes_used)):.1f}s/scene). "
+                f"Tiles ready: {sorted(scenes_by_tile.keys())}"
+            )
 
             # Optional Step 3b: multitemporal cloud refinement layer.
             if apply_temporal:
@@ -3580,21 +3653,39 @@ class Sentinel2Mosaic(object):
                     "temporal anomaly pass will land in a follow-up phase."
                 )
 
-            # Step 5: per-tile geometric median, then merge.
-            arcpy.AddMessage("\nStep 4/5 — Computing per-tile geometric median...")
+            # Step 4: per-tile geometric median, then merge.
+            arcpy.AddMessage(
+                f"\nStep 4/5 — Computing per-tile geometric median across "
+                f"{len(scenes_by_tile)} tile(s). arcpy.sa.GeometricMedian "
+                f"iterates internally (no per-iteration log); each tile is "
+                f"silent until its mosaic is saved."
+            )
             tile_mosaics = []
-            for tile, stacked_paths in scenes_by_tile.items():
-                arcpy.AddMessage(f"  [{tile}] {len(stacked_paths)} scenes")
+            median_phase_start = datetime.now()
+            for ti, (tile, stacked_paths) in enumerate(scenes_by_tile.items(), 1):
+                arcpy.AddMessage(
+                    f"  [{ti}/{len(scenes_by_tile)}] [{tile}] computing median "
+                    f"over {len(stacked_paths)} scenes..."
+                )
+                tile_start = datetime.now()
                 try:
                     tile_mosaic_name = f"{mosaic_name}_{tile}"
                     tile_mosaic_path = os.path.join(gdb_path, tile_mosaic_name)
                     median = arcpy.sa.GeometricMedian(stacked_paths)
                     median.save(tile_mosaic_path)
                     tile_mosaics.append(tile_mosaic_path)
-                    arcpy.AddMessage(f"    Saved tile mosaic: {tile_mosaic_path}")
+                    arcpy.AddMessage(
+                        f"      saved {tile_mosaic_path} in "
+                        f"{(datetime.now() - tile_start).total_seconds():.1f}s"
+                    )
                 except Exception as e:
-                    arcpy.AddError(f"    Geometric median failed for {tile}: {e}")
+                    arcpy.AddError(f"      Geometric median failed for {tile}: {e}")
                     continue
+            arcpy.AddMessage(
+                f"  Step 4 done in "
+                f"{(datetime.now() - median_phase_start).total_seconds():.1f}s "
+                f"({len(tile_mosaics)} tile mosaic(s) created)."
+            )
 
             if not tile_mosaics:
                 arcpy.AddError("No tile mosaics were created.")
@@ -3604,7 +3695,11 @@ class Sentinel2Mosaic(object):
             arcpy.AddMessage("\nStep 5/5 — Finalising output...")
             if len(tile_mosaics) > 1:
                 final_path = os.path.join(gdb_path, mosaic_name)
-                arcpy.AddMessage(f"  Merging {len(tile_mosaics)} tile mosaics...")
+                merge_start = datetime.now()
+                arcpy.AddMessage(
+                    f"  Merging {len(tile_mosaics)} tile mosaics via "
+                    f"MosaicToNewRaster (MEAN, 10m, 32-bit float)..."
+                )
                 arcpy.management.MosaicToNewRaster(
                     input_rasters=tile_mosaics,
                     output_location=gdb_path,
@@ -3615,17 +3710,32 @@ class Sentinel2Mosaic(object):
                     number_of_bands=len(_S2_STACK_ORDER),
                     mosaic_method="MEAN",
                 )
+                arcpy.AddMessage(
+                    f"    Merge complete in "
+                    f"{(datetime.now() - merge_start).total_seconds():.1f}s "
+                    f"→ {final_path}"
+                )
                 final_mosaic = final_path
             else:
+                arcpy.AddMessage(
+                    f"  Single tile — skipping merge. Final mosaic: "
+                    f"{tile_mosaics[0]}"
+                )
                 final_mosaic = tile_mosaics[0]
 
             # Apply AOI mask if requested.
             if mask_feature and arcpy.Exists(mask_feature):
+                mask_start = datetime.now()
                 arcpy.AddMessage(f"  Applying AOI mask: {mask_feature}")
                 masked = arcpy.sa.ExtractByMask(final_mosaic, mask_feature)
                 masked_path = os.path.join(gdb_path, f"{mosaic_name}_Masked")
                 masked.save(masked_path)
                 final_mosaic = masked_path
+                arcpy.AddMessage(
+                    f"    AOI mask applied in "
+                    f"{(datetime.now() - mask_start).total_seconds():.1f}s "
+                    f"→ {masked_path}"
+                )
             elif mask_feature:
                 arcpy.AddWarning(
                     f"AOI mask {mask_feature!r} not found — output is unmasked."
@@ -3633,6 +3743,7 @@ class Sentinel2Mosaic(object):
 
             # Provenance CSV.
             if save_stats:
+                arcpy.AddMessage("  Writing provenance CSV...")
                 self._write_provenance_csv(final_mosaic, all_scenes_used)
 
             arcpy.AddMessage("\nDone. Final mosaic: " + str(final_mosaic))
@@ -3928,14 +4039,15 @@ class Sentinel2Mosaic(object):
         scene_id = scene["metadata"]["product_uri"]
         bands = self._locate_band_files(source_path, source_kind)
         if not bands or "SCL" not in bands:
-            arcpy.AddWarning("    Missing SCL or band data; scene skipped.")
+            arcpy.AddWarning("      Missing SCL or band data; scene skipped.")
             return None
         if not all(b in bands for b in _S2_STACK_ORDER):
-            arcpy.AddWarning("    Missing one or more required bands; scene skipped.")
+            arcpy.AddWarning("      Missing one or more required bands; scene skipped.")
             return None
 
         # Build the cloud mask from SCL resampled to 10m (NEAREST so we
         # don't blur the class boundaries).
+        arcpy.AddMessage("      • SCL resample → 10m (NEAREST) + cloud-class mask build")
         scl_10m_path = os.path.join(scratch_dir, f"{scene_id}_SCL_10m.tif")
         arcpy.management.Resample(bands["SCL"], scl_10m_path, 10, "NEAREST")
         scl_10m = arcpy.sa.Raster(scl_10m_path)
@@ -3946,6 +4058,12 @@ class Sentinel2Mosaic(object):
 
         # Process each band: resample if 20m, scale to reflectance,
         # apply cloud mask, save.
+        n_20m = sum(1 for b in _S2_STACK_ORDER if b not in _S2_NATIVE_10M)
+        n_10m = len(_S2_STACK_ORDER) - n_20m
+        arcpy.AddMessage(
+            f"      • scale + mask {len(_S2_STACK_ORDER)} bands "
+            f"({n_10m} @ 10m native, {n_20m} resampled 20m→10m)"
+        )
         masked_paths = []
         for band in _S2_STACK_ORDER:
             band_src = bands[band]
@@ -3966,6 +4084,7 @@ class Sentinel2Mosaic(object):
             masked_paths.append(out_path)
 
         # Composite into a single 10-band raster.
+        arcpy.AddMessage("      • composite 10 bands → scene stack")
         stacked_path = os.path.join(scratch_dir, f"{scene_id}_stack.tif")
         arcpy.management.CompositeBands(masked_paths, stacked_path)
         return stacked_path
@@ -4374,31 +4493,55 @@ class AsterMosaic(object):
             arcpy.AddMessage(f"  Kept {len(kept_scenes)} scene(s) after temporal filter.")
 
             # Step 3: per-scene processing — scale, resample SWIR, QA mask, stack.
-            arcpy.AddMessage("\nStep 3/6 — Processing scenes (scale + resample + QA mask + stack)...")
+            arcpy.AddMessage(
+                f"\nStep 3/6 — Processing {len(kept_scenes)} scenes "
+                f"(scale + SWIR 30m→15m resample + optional QA mask + 9-band stack). "
+                f"HDF inputs are extracted lazily per scene via gdal.Translate."
+            )
             stacked_paths = []
             scenes_used = []
-            for scene in kept_scenes:
-                arcpy.AddMessage(f"  {scene['scene_id']}")
+            stack_phase_start = datetime.now()
+            for idx, scene in enumerate(kept_scenes, 1):
+                arcpy.AddMessage(
+                    f"  [{idx}/{len(kept_scenes)}] [{scene.get('format','?')}] "
+                    f"{scene['scene_id']}"
+                )
+                scene_start = datetime.now()
                 try:
                     stacked = self._process_scene(scene, scratch_dir, use_qa)
                 except Exception as e:
-                    arcpy.AddWarning(f"    Failed: {e}")
+                    arcpy.AddWarning(f"      Failed: {e}")
                     continue
                 if stacked:
                     stacked_paths.append(stacked)
                     scenes_used.append(scene)
+                    arcpy.AddMessage(
+                        f"      done in "
+                        f"{(datetime.now() - scene_start).total_seconds():.1f}s"
+                    )
             if not stacked_paths:
                 arcpy.AddError("No scenes survived per-scene processing.")
                 return None
+            stack_phase_elapsed = (datetime.now() - stack_phase_start).total_seconds()
+            arcpy.AddMessage(
+                f"  Step 3 done in {stack_phase_elapsed:.1f}s "
+                f"({stack_phase_elapsed/max(1,len(stacked_paths)):.1f}s/scene)."
+            )
 
             # Step 4: optional multitemporal anomaly refinement.
             if apply_temporal and len(stacked_paths) >= 5:
                 arcpy.AddMessage(
                     f"\nStep 4/6 — Multitemporal cloud refinement "
-                    f"({len(stacked_paths)} scenes)..."
+                    f"({len(stacked_paths)} scenes). Computes per-pixel "
+                    f"temporal median + MAD and flags anomalies."
                 )
+                temporal_start = datetime.now()
                 stacked_paths = self._apply_multitemporal_refinement(
                     stacked_paths, scratch_dir,
+                )
+                arcpy.AddMessage(
+                    f"  Step 4 done in "
+                    f"{(datetime.now() - temporal_start).total_seconds():.1f}s."
                 )
             elif apply_temporal:
                 arcpy.AddWarning(
@@ -4407,12 +4550,20 @@ class AsterMosaic(object):
                 )
 
             # Step 5: geometric median.
-            arcpy.AddMessage("\nStep 5/6 — Computing geometric median across scene stack...")
+            arcpy.AddMessage(
+                f"\nStep 5/6 — Computing geometric median across "
+                f"{len(stacked_paths)} scene stack(s). arcpy.sa.GeometricMedian "
+                f"is silent during iteration; please wait."
+            )
+            median_start = datetime.now()
             output_path = os.path.join(gdb_path, mosaic_name)
             try:
                 median = arcpy.sa.GeometricMedian(stacked_paths)
                 median.save(output_path)
-                arcpy.AddMessage(f"  Saved: {output_path}")
+                arcpy.AddMessage(
+                    f"  Saved {output_path} in "
+                    f"{(datetime.now() - median_start).total_seconds():.1f}s."
+                )
             except Exception as e:
                 arcpy.AddError(f"GeometricMedian failed: {e}")
                 return None
@@ -4421,15 +4572,22 @@ class AsterMosaic(object):
             arcpy.AddMessage("\nStep 6/6 — Finalising output...")
             final_path = output_path
             if mask_feature and arcpy.Exists(mask_feature):
+                mask_start = datetime.now()
                 arcpy.AddMessage(f"  Applying AOI mask: {mask_feature}")
                 masked = arcpy.sa.ExtractByMask(output_path, mask_feature)
                 masked_path = os.path.join(gdb_path, f"{mosaic_name}_Masked")
                 masked.save(masked_path)
                 final_path = masked_path
+                arcpy.AddMessage(
+                    f"    AOI mask applied in "
+                    f"{(datetime.now() - mask_start).total_seconds():.1f}s "
+                    f"→ {masked_path}"
+                )
             elif mask_feature:
                 arcpy.AddWarning(f"AOI mask {mask_feature!r} not found — output is unmasked.")
 
             if save_stats:
+                arcpy.AddMessage("  Writing provenance CSV...")
                 self._write_provenance_csv(final_path, scenes_used)
 
             arcpy.AddMessage(f"\nDone. Final mosaic: {final_path}")
@@ -4594,9 +4752,10 @@ class AsterMosaic(object):
         unreadable QA, etc.).
         """
         if scene["format"] == "hdf":
+            arcpy.AddMessage("      • extracting HDF subdatasets to scratch TIFFs")
             extracted = self._extract_hdf_to_tiffs(scene["files"]["hdf"], scratch_dir)
             if extracted is None:
-                arcpy.AddWarning("    HDF extraction failed; scene skipped.")
+                arcpy.AddWarning("      HDF extraction failed; scene skipped.")
                 return None
             scene = dict(scene, format="tiff", files=extracted)
 
@@ -4606,7 +4765,7 @@ class AsterMosaic(object):
         # Verify we have all 9 image bands.
         missing = [b for b in _ASTER_STACK_ORDER if b not in files]
         if missing:
-            arcpy.AddWarning(f"    Missing bands {missing}; scene skipped.")
+            arcpy.AddWarning(f"      Missing bands {missing}; scene skipped.")
             return None
 
         # Optional QA mask. Conservative implementation: treat any non-zero
@@ -4619,6 +4778,7 @@ class AsterMosaic(object):
         if use_qa and any(qa in files for qa in _ASTER_QA_NAMES):
             qa_path = next((files[q] for q in _ASTER_QA_NAMES if q in files), None)
             if qa_path:
+                arcpy.AddMessage("      • QA Data Plane → 15m (NEAREST), non-zero pixels flagged")
                 try:
                     qa_raster = arcpy.sa.Raster(qa_path)
                     # Resample QA to 15m (NEAREST to preserve class codes).
@@ -4627,11 +4787,19 @@ class AsterMosaic(object):
                     qa_raster = arcpy.sa.Raster(qa_resampled)
                     qa_mask = qa_raster != 0  # non-zero == flagged
                 except Exception as e:
-                    arcpy.AddWarning(f"    QA mask build failed (continuing without): {e}")
+                    arcpy.AddWarning(f"      QA mask build failed (continuing without): {e}")
                     qa_mask = None
+        elif use_qa:
+            arcpy.AddMessage("      • QA mask requested but no QA Data Plane present; skipped")
 
         # Process each band: resample SWIR to 15m, scale to reflectance,
         # apply QA mask if present.
+        n_swir = sum(1 for b in _ASTER_STACK_ORDER if b not in _ASTER_NATIVE_15M)
+        n_vnir = len(_ASTER_STACK_ORDER) - n_swir
+        arcpy.AddMessage(
+            f"      • scale + mask {len(_ASTER_STACK_ORDER)} bands "
+            f"({n_vnir} VNIR @ 15m native, {n_swir} SWIR resampled 30m→15m)"
+        )
         masked_paths = []
         for band in _ASTER_STACK_ORDER:
             src = files[band]
@@ -4652,6 +4820,7 @@ class AsterMosaic(object):
             masked.save(out)
             masked_paths.append(out)
 
+        arcpy.AddMessage("      • composite 9 bands → scene stack")
         stacked = os.path.join(scratch_dir, f"{scene_id}_stack.tif")
         arcpy.management.CompositeBands(masked_paths, stacked)
         return stacked
@@ -4732,10 +4901,14 @@ class AsterMosaic(object):
             return stacked_paths  # not enough samples for robust statistics
 
         try:
+            arcpy.AddMessage(
+                f"    Pass 1/3 — loading B01+B02 brightness arrays from "
+                f"{n} scene stacks into memory..."
+            )
             # Compute B01+B02 brightness raster for each scene (band 1 + band 2).
             brightness_arrays = []
             ref_meta = None
-            for path in stacked_paths:
+            for bi, path in enumerate(stacked_paths, 1):
                 r = arcpy.Raster(path)
                 ext = r.extent
                 cell = (r.meanCellWidth, r.meanCellHeight)
@@ -4751,15 +4924,24 @@ class AsterMosaic(object):
                 brightness_arrays.append(brightness)
                 if ref_meta is None:
                     ref_meta = (ext, cell)
+                if bi % 10 == 0 or bi == n:
+                    arcpy.AddMessage(f"      loaded {bi}/{n}")
 
+            arcpy.AddMessage(
+                "    Pass 2/3 — computing per-pixel 75th-percentile brightness "
+                "threshold (× 1.5)..."
+            )
             stack = np.stack(brightness_arrays, axis=0)  # (n, h, w)
             # Per-pixel 75th percentile, ignoring NaN.
             percentile = np.nanpercentile(stack, 75, axis=0)
             threshold = percentile * 1.5
 
+            arcpy.AddMessage(
+                f"    Pass 3/3 — re-emitting {n} scenes with anomaly mask applied..."
+            )
             # Re-emit each scene with the temporal mask applied.
             refined_paths = []
-            for path, brightness in zip(stacked_paths, brightness_arrays):
+            for ri, (path, brightness) in enumerate(zip(stacked_paths, brightness_arrays), 1):
                 cloud_pixels = brightness > threshold  # (h, w) bool
                 # Load the full 9-band stack, apply mask to all bands.
                 r = arcpy.Raster(path)
@@ -4780,6 +4962,8 @@ class AsterMosaic(object):
                 )
                 refined.save(out_path)
                 refined_paths.append(out_path)
+                if ri % 10 == 0 or ri == n:
+                    arcpy.AddMessage(f"      refined {ri}/{n}")
 
             arcpy.AddMessage(
                 f"    Refined {len(refined_paths)} scenes "
@@ -5302,12 +5486,21 @@ class Transformations(object):
                 }
                         
                 # Load entire raster at once
-                arcpy.AddMessage("  Using whole-raster loading approach...")
-                
+                arcpy.AddMessage(
+                    "  Loading full raster into NumPy array via "
+                    "arcpy.RasterToNumPyArray (this step is silent until "
+                    "the array materialises in memory)..."
+                )
+                load_start = datetime.now()
+
                 try:
                     # Load the entire raster at once
                     data_array = arcpy.RasterToNumPyArray(raster_obj)
-                    arcpy.AddMessage(f"  Full array loaded, shape: {data_array.shape}")
+                    arcpy.AddMessage(
+                        f"  Full array loaded in "
+                        f"{(datetime.now() - load_start).total_seconds():.1f}s, "
+                        f"shape: {data_array.shape}"
+                    )
                     
                     # For multiband raster, the dimensions should be (bands, height, width)
                     # or (height, width, bands) depending on how ArcGIS returns it
@@ -5345,7 +5538,12 @@ class Transformations(object):
                     arcpy.AddMessage("Handled NoData values")
                     
                     # Perform transformation
-                    arcpy.AddMessage(f"\nPerforming {transform_type} transformation...")
+                    arcpy.AddMessage(
+                        f"\nPerforming {transform_type} transformation "
+                        f"(eigendecomposition + projection — duration scales "
+                        f"with valid-pixel count × band count²)..."
+                    )
+                    transform_start = datetime.now()
 
                     # ISS-010: warn before allocating the (n_pixels, n_bands)
                     # working matrix on country-scale rasters. Full chunked
@@ -5426,13 +5624,27 @@ class Transformations(object):
                             warning_callback=arcpy.AddWarning,
                         )
                     
+                    arcpy.AddMessage(
+                        f"  {transform_type} computed in "
+                        f"{(datetime.now() - transform_start).total_seconds():.1f}s."
+                    )
+
                     # Create multiband output
+                    arcpy.AddMessage(
+                        "\nWriting multiband output raster "
+                        "(NumPyArrayToRaster + CompositeBands per component)..."
+                    )
+                    output_start = datetime.now()
                     output_path = self._create_multiband_output(
                         transformed_data,
                         raster_info,
                         out_workspace,
                         out_name,
                         preserve_mask
+                    )
+                    arcpy.AddMessage(
+                        f"  Output written in "
+                        f"{(datetime.now() - output_start).total_seconds():.1f}s."
                     )
                     
                     # Define data_info for statistics files
@@ -6531,48 +6743,64 @@ class SpectralAngleMapper(object):
             out_sam_path = os.path.join(out_workspace, out_sam) if out_sam else None
             
             # Perform SAM calculation
-            arcpy.AddMessage("Performing SAM classification...")
-            
+            arcpy.AddMessage(
+                f"Building SAM map-algebra expressions for {len(ref_spectra)} "
+                f"reference spectra over {len(band_fields)} bands "
+                f"(expressions are lazy — pixels evaluate on .save below)..."
+            )
+            sam_build_start = datetime.now()
+
             # Create lists for map algebra expressions
             band_expressions = [f"Float('{bands[i+1]}')" for i in range(len(band_fields))]
-            
+
             # Create SAM rasters for each reference spectrum
             sam_rasters = {}
-            
+
             # 1. Compute normalization factor for pixel vectors
             norm_expr = " + ".join([f"Power({expr}, 2)" for expr in band_expressions])
             norm_raster = arcpy.sa.SquareRoot(arcpy.sa.Raster(arcpy.sa.Float(norm_expr)))
-            
+
             # 2. Compute SAM for each reference spectrum
-            for class_name, ref_vector in ref_spectra.items():
+            for ci, (class_name, ref_vector) in enumerate(ref_spectra.items(), 1):
+                arcpy.AddMessage(
+                    f"  [{ci}/{len(ref_spectra)}] SAM expression for class '{class_name}'"
+                )
                 # Calculate dot product
                 dot_expr = " + ".join([f"{expr} * {ref_vector[i]}" for i, expr in enumerate(band_expressions)])
                 dot_raster = arcpy.sa.Float(dot_expr)
-                
+
                 # Calculate SAM angle (arccos of dot product divided by magnitudes)
                 # Since reference vectors are already normalized, we only need to normalize the pixel vector
                 sam_angle = arcpy.sa.ACos(dot_raster / norm_raster)
-                
+
                 # Convert from radians to degrees
                 sam_angle_deg = sam_angle * (180.0 / math.pi)
-                
+
                 # Store the SAM raster
                 sam_rasters[class_name] = sam_angle_deg
-            
+            arcpy.AddMessage(
+                f"  Expression chain built in "
+                f"{(datetime.now() - sam_build_start).total_seconds():.1f}s."
+            )
+
             # 3. Create classification raster
-            arcpy.AddMessage("Creating final classification raster...")
-            
+            arcpy.AddMessage("Building final classification expression (per-class minimum-angle reduction)...")
+
             # Initialise the classification/min-angle rasters over valid pixels
             # only. SetNull(cond, false_val) returns NoData where `cond` is True
             # and `false_val` elsewhere; we want NoData on invalid pixels
             # (norm_raster <= 0) and a seed value on the valid ones.
             class_raster = arcpy.sa.SetNull(norm_raster <= 0, 0)
             min_angle_raster = arcpy.sa.SetNull(norm_raster <= 0, 90)
-            
+
             # Loop through classes to find minimum angle
             for idx, class_name in enumerate(class_names, 1):
+                arcpy.AddMessage(
+                    f"  [{idx}/{len(class_names)}] folding '{class_name}' into "
+                    f"min-angle reduction"
+                )
                 sam_raster = sam_rasters[class_name]
-                
+
                 # Update classification where this class has smaller angle
                 class_raster = arcpy.sa.Con(
                     arcpy.sa.BooleanAnd(
@@ -6582,22 +6810,39 @@ class SpectralAngleMapper(object):
                     idx,
                     class_raster
                 )
-                
+
                 # Update minimum angle raster
                 min_angle_raster = arcpy.sa.Con(
                     sam_raster < min_angle_raster,
                     sam_raster,
                     min_angle_raster
                 )
-            
-            # Save output classification raster
-            arcpy.AddMessage(f"Saving classification raster to: {out_class_path}")
+
+            # Save output classification raster — THIS is the moment the entire
+            # lazy expression chain is evaluated against pixels (read all bands,
+            # compute norm, dot products, ACos, minimum reduction). Expect this
+            # call to dominate the wall-clock time of the whole tool.
+            arcpy.AddMessage(
+                f"Materialising classification raster — this evaluates the "
+                f"entire SAM expression chain against every pixel. Save target: "
+                f"{out_class_path}"
+            )
+            save_start = datetime.now()
             class_raster.save(out_class_path)
-            
+            arcpy.AddMessage(
+                f"  Saved in "
+                f"{(datetime.now() - save_start).total_seconds():.1f}s."
+            )
+
             # Save SAM angle raster if requested
             if out_sam_path:
                 arcpy.AddMessage(f"Saving SAM angle raster to: {out_sam_path}")
+                sam_save_start = datetime.now()
                 min_angle_raster.save(out_sam_path)
+                arcpy.AddMessage(
+                    f"  Saved in "
+                    f"{(datetime.now() - sam_save_start).total_seconds():.1f}s."
+                )
             
             # Apply color map if requested
             if apply_color:
