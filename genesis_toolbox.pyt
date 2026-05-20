@@ -2155,6 +2155,7 @@ class LandsatMosaic(object):
                 f"_genesis_landsat_composites_{uuid.uuid4().hex[:8]}",
             )
             os.makedirs(scratch_dir, exist_ok=True)
+            arcpy.AddMessage(f"\n  Scratch folder: {scratch_dir}")
 
             # If env.mask is active, wrap each cleaned band with
             # ExtractByMask so its native extent IS the AOI extent.
