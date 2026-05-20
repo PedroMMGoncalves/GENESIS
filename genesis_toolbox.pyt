@@ -2225,6 +2225,37 @@ class LandsatMosaic(object):
             mask_feature = parameters[8].valueAsText
             save_stats = parameters[9].value
 
+            # ----------------------------------------------------------------
+            # AOI-first scoping. Set arcpy.env.mask + arcpy.env.extent BEFORE
+            # any raster work begins so every downstream operation (cloud
+            # mask via TransposeBits + Con, per-scene CompositeBands, the
+            # 20-iteration GeometricMedian, the inter-zone MosaicToNewRaster)
+            # is restricted to AOI pixels only.
+            #
+            # For Faial-sized AOIs vs. a full Landsat scene footprint this
+            # is roughly a 190x compute reduction on every per-pixel
+            # operation. The trailing _apply_mask call is left in place as
+            # defence-in-depth — it becomes a no-op when the env scope has
+            # already constrained the mosaic to the AOI.
+            #
+            # CRS mismatch (AOI in WGS84, scenes in UTM, etc.) is handled
+            # automatically by ArcGIS, paying a one-time projection cost
+            # the first time each scene's CRS is touched.
+            # ----------------------------------------------------------------
+            if mask_feature and arcpy.Exists(mask_feature):
+                arcpy.env.mask = mask_feature
+                arcpy.env.extent = mask_feature
+                arcpy.AddMessage(
+                    f"\nAOI scope active: arcpy.env.mask + arcpy.env.extent "
+                    f"set to {mask_feature}. All downstream raster operations "
+                    f"will be restricted to AOI pixels."
+                )
+            elif mask_feature:
+                arcpy.AddWarning(
+                    f"AOI mask {mask_feature!r} does not exist; processing "
+                    f"will run over the full scene footprint."
+                )
+
             # Initialize statistics
             stats = {
                 'start_time': datetime.now(),
@@ -3541,6 +3572,31 @@ class Sentinel2Mosaic(object):
             mask_feature = parameters[9].valueAsText
             save_stats = bool(parameters[10].value)
 
+            # ----------------------------------------------------------------
+            # AOI-first scoping. See LandsatMosaic.execute() for the full
+            # rationale. For Sentinel-2 specifically the win is significant:
+            # the per-band 20m→10m resample (the dominant cost per scene)
+            # now writes only AOI pixels, the per-band SCL cloud mask is
+            # only evaluated over the AOI, and GeometricMedian iterates
+            # over the AOI extent. For a Faial-sized AOI vs. a full S2
+            # tile (110×110 km) that's ~70x fewer pixels per scene through
+            # the JP2 decode pipeline.
+            # ----------------------------------------------------------------
+            if mask_feature and arcpy.Exists(mask_feature):
+                arcpy.env.mask = mask_feature
+                arcpy.env.extent = mask_feature
+                arcpy.AddMessage(
+                    f"\nAOI scope active: arcpy.env.mask + arcpy.env.extent "
+                    f"set to {mask_feature}. All downstream raster operations "
+                    f"(resample, SCL mask, composite, GeometricMedian, merge) "
+                    f"will be restricted to AOI pixels."
+                )
+            elif mask_feature:
+                arcpy.AddWarning(
+                    f"AOI mask {mask_feature!r} does not exist; processing "
+                    f"will run over the full tile footprint."
+                )
+
             arcpy.AddMessage("\nInitialising S2 mosaic processing:")
             arcpy.AddMessage(f"  Workspace:   {gdb_path}")
             arcpy.AddMessage(f"  Output name: {mosaic_name}")
@@ -4454,6 +4510,33 @@ class AsterMosaic(object):
             use_qa = bool(parameters[9].value)
             mask_feature = parameters[10].valueAsText
             save_stats = bool(parameters[11].value)
+
+            # ----------------------------------------------------------------
+            # AOI-first scoping. See LandsatMosaic.execute() for the full
+            # rationale. For ASTER the win includes: the SWIR 30m→15m
+            # resample for six bands per scene (the heaviest per-scene
+            # cost) now operates only on AOI pixels; the conservative QA
+            # Data Plane non-zero mask is only built over the AOI; the
+            # multitemporal anomaly refinement (which reads every scene's
+            # pixels into a NumPy stack for percentile computation) now
+            # loads only AOI pixels — a massive memory saving on top of
+            # the compute saving.
+            # ----------------------------------------------------------------
+            if mask_feature and arcpy.Exists(mask_feature):
+                arcpy.env.mask = mask_feature
+                arcpy.env.extent = mask_feature
+                arcpy.AddMessage(
+                    f"\nAOI scope active: arcpy.env.mask + arcpy.env.extent "
+                    f"set to {mask_feature}. All downstream raster operations "
+                    f"(SWIR resample, QA mask, scale, composite, temporal "
+                    f"refinement, GeometricMedian) will be restricted to AOI "
+                    f"pixels."
+                )
+            elif mask_feature:
+                arcpy.AddWarning(
+                    f"AOI mask {mask_feature!r} does not exist; processing "
+                    f"will run over the full scene footprint."
+                )
 
             arcpy.AddMessage("\nInitialising ASTER mosaic processing:")
             arcpy.AddMessage(f"  Workspace:   {gdb_path}")
