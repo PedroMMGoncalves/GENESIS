@@ -1893,9 +1893,18 @@ class LandsatMosaic(object):
                     years = set()
                     for root, _, files in os.walk(folder_path):
                         for fn in files:
-                            if not fn.endswith('_MTL.txt'):
+                            # Accept either extracted MTL filenames OR raw
+                            # EarthExplorer .tar archives. Both encode the
+                            # acquisition date in the 4th underscore-token
+                            # (LC08_L2SR_204032_20240215_..._MTL.txt or
+                            # LC08_L2SR_204032_20240215_..._T1.tar).
+                            fl = fn.lower()
+                            is_mtl = fn.endswith('_MTL.txt')
+                            is_landsat_tar = fl.endswith('.tar') and (
+                                fl.startswith('lc08_') or fl.startswith('lc09_')
+                            )
+                            if not (is_mtl or is_landsat_tar):
                                 continue
-                            # Filename format: LC08_L2SR_204032_20240215_...
                             parts = fn.split('_')
                             if len(parts) >= 4:
                                 try:
@@ -1969,22 +1978,38 @@ class LandsatMosaic(object):
                 except Exception as e:
                     parameters[0].setErrorMessage(f"Workspace validation error: {str(e)}")
 
-            # Validate data folder
+            # Validate data folder. Accept either:
+            #  (a) already-extracted scene folders with _MTL.txt files, OR
+            #  (b) EarthExplorer .tar archives (LC08_*, LC09_*) which
+            #      execute() will auto-extract before processing.
             if parameters[2].altered:
                 folder_path = parameters[2].valueAsText
                 if not os.path.exists(folder_path):
                     parameters[2].setErrorMessage("Data folder does not exist")
                     return
 
-                # Check for Landsat scenes
                 found_scene = False
                 for root, _, files in os.walk(folder_path):
-                    if any(f.endswith('_MTL.txt') for f in files):
-                        found_scene = True
+                    for f in files:
+                        if f.endswith('_MTL.txt'):
+                            found_scene = True
+                            break
+                        fl = f.lower()
+                        if fl.endswith('.tar') and (
+                            fl.startswith('lc08_') or fl.startswith('lc09_')
+                        ):
+                            found_scene = True
+                            break
+                    if found_scene:
                         break
 
                 if not found_scene:
-                    parameters[2].setErrorMessage("No Landsat scenes found in folder")
+                    parameters[2].setErrorMessage(
+                        "No Landsat scenes found in folder. Expected either "
+                        "extracted scene folders containing *_MTL.txt files, "
+                        "or EarthExplorer .tar archives (LC08_*.tar / "
+                        "LC09_*.tar)."
+                    )
                     
     def remove_cloud(self, scenes, stats):
         """Remove clouds from Landsat scenes"""
