@@ -2018,30 +2018,39 @@ class LandsatMosaic(object):
                     )
                     
     def remove_cloud(self, scenes, stats):
-        """Apply QA_PIXEL cloud masking to every scene.
+        """Validate scenes and pass band_paths through to the composite stage.
 
-        Each scene's bands come in via `scene['band_paths']`, a
-        `{role: path}` dict produced by `_find_scenes`. Paths are either:
+        Previously this method built lazy `Con(value_mask, band)` expressions
+        per scene and stored them on the scene dict for `_create_geometric_median_mosaic`
+        to materialise. That design had a hidden cost: each scene's
+        `value_mask = ~TransposeBits(qa_raster, ...)` was referenced
+        seven times (once per band Con), and arcpy's map-algebra evaluator
+        doesn't cache the result — so when CompositeBands later
+        evaluated the 7 lazy Cons it re-decoded the QA band from
+        /vsitar/ seven times per scene. On the 173-scene Faial run
+        that meant ~1200 redundant QA decodes.
 
-          * `/vsitar/.../scene.tar/scene_SR_B1.TIF` for archived scenes
-            (read on the fly through GDAL VSI — no extraction)
-          * `c:\\path\\to\\extracted\\scene_SR_B1.TIF` for already-extracted
-            scenes kept around for back-compat
+        The fix moved into `_create_geometric_median_mosaic`: materialise
+        the value_mask exactly once per scene as a scratch GeoTIFF, then
+        either reference it from 7 lazy Cons (no-AOI case) or materialise
+        each cleaned band individually at AOI extent (AOI-active case).
 
-        arcpy.Raster accepts both forms transparently; the rest of the
-        pipeline (TransposeBits / Con / GeometricMedian) sees ordinary
-        Raster objects and doesn't care where the pixels live.
+        This method now just validates band availability and forwards the
+        VSI band paths intact. No /vsitar/ opens happen here — those are
+        deferred to the composite phase where they happen exactly once
+        per band per scene.
         """
         try:
-            from arcpy.ia import TransposeBits
-            from arcpy.sa import Con  # More flexible than Clip
-
             start_time = datetime.now()
             self._update_processing_stats(stats, stage="cloud_removal")
             clean_scenes = []
             total_scenes = len(scenes)
 
-            arcpy.AddMessage(f"\nRemoving clouds from {total_scenes} scenes...")
+            arcpy.AddMessage(
+                f"\nValidating {total_scenes} scenes for cloud-mask "
+                f"compatibility (actual masking happens in the composite "
+                f"phase, where it can be materialised efficiently)..."
+            )
 
             required = ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "QA_PIXEL"]
 
@@ -2052,43 +2061,34 @@ class LandsatMosaic(object):
                         scene_path.rstrip(os.sep)
                     )
                     band_paths = scene.get('band_paths') or {}
-                    arcpy.AddMessage(f"\nProcessing scene {idx} of {total_scenes}")
-                    arcpy.AddMessage(
-                        f"Scene: {scene_id}"
-                        f"{' (archive)' if scene.get('is_archive') else ''}"
-                    )
 
                     missing = [k for k in required if k not in band_paths]
                     if missing:
                         arcpy.AddWarning(
-                            f"Incomplete scene data: missing {missing}"
+                            f"  [{idx}/{total_scenes}] {scene_id}: "
+                            f"missing {missing} — skipped"
                         )
                         stats['failed_scenes'] = stats.get('failed_scenes', 0) + 1
                         continue
 
-                    band_rasters = [arcpy.Raster(band_paths[f"B{n}"]) for n in range(1, 8)]
-                    qa_raster = arcpy.Raster(band_paths["QA_PIXEL"])
-
-                    # QA_PIXEL bits 0-4: fill / dilated cloud / cirrus /
-                    # cloud / cloud shadow. Anything set → mask out.
-                    cloud_mask = TransposeBits(qa_raster, [0, 1, 2, 3, 4], [0, 1, 2, 3, 4], 0, None)
-                    value_mask = ~cloud_mask
-                    clean_band_rasters = [Con(value_mask, r) for r in band_rasters]
-
                     clean_scenes.append({
                         'path': scene_path,
                         'scene_id': scene_id,
-                        'rasters': clean_band_rasters,
+                        'band_paths': band_paths,
                         'metadata': scene.get('metadata', {}),
                         'is_archive': scene.get('is_archive', False),
                     })
-                    arcpy.AddMessage(f"Cloud removal completed for scene {idx}")
 
                 except Exception as e:
-                    arcpy.AddWarning(f"Error processing scene {idx}: {str(e)}")
+                    arcpy.AddWarning(f"  [{idx}/{total_scenes}] Error: {str(e)}")
                     stats['failed_scenes'] = stats.get('failed_scenes', 0) + 1
                     stats['errors'].append(str(e))
                     continue
+
+            arcpy.AddMessage(
+                f"  {len(clean_scenes)}/{total_scenes} scenes validated "
+                f"in {(datetime.now() - start_time).total_seconds():.1f}s."
+            )
 
             stats['cloud_removal'] = {
                 'scenes_processed': total_scenes,
@@ -2097,12 +2097,12 @@ class LandsatMosaic(object):
             }
 
             if not clean_scenes:
-                arcpy.AddWarning("No scenes were successfully processed")
+                arcpy.AddWarning("No scenes were successfully validated")
                 return None
             return clean_scenes
 
         except Exception as e:
-            arcpy.AddError(f"Cloud removal failed: {str(e)}")
+            arcpy.AddError(f"Scene validation failed: {str(e)}")
             return None
 
     def _create_geometric_median_mosaic(self, clean_scenes, gdb_path, mosaic_name):
@@ -2124,31 +2124,20 @@ class LandsatMosaic(object):
         """
         multiband_rasters = []
         output_path = None
+        scratch_dir = None
         try:
+            from arcpy.ia import TransposeBits
+            from arcpy.sa import Con
+
             start_time = datetime.now()
             total = sum(
                 1 for s in clean_scenes
-                if 'rasters' in s and len(s['rasters']) == 7
+                if 'band_paths' in s and all(
+                    f"B{n}" in s['band_paths'] for n in range(1, 8)
+                ) and 'QA_PIXEL' in s['band_paths']
             )
 
-            # Temp composites go to a scratch folder as standalone .tif files,
-            # NOT into the production geodatabase. Previous behaviour put
-            # each composite in `gdb_path/temp_composite_<UUID>`, which
-            # caused per-scene CompositeBands time to grow monotonically
-            # over the run (10s → 40s on the 173-scene Faial run) because
-            # every CompositeBands call had to register the new raster
-            # in the GDB catalog, and the catalog walk gets slower with
-            # each addition. Scratch-folder .tif files have zero catalog
-            # overhead — each composite stays at its native ~10s.
-            #
-            # Scratch is pinned to the GDB's parent folder, NOT to
-            # arcpy.env.scratchFolder. Rationale: arcpy.env.scratchFolder
-            # defaults to the Pro project's Home folder, which is often
-            # a OneDrive-synced path (the case for this user). Writing
-            # hundreds of GeoTIFFs to a OneDrive folder triggers
-            # continuous sync uploads that slow every write. The user
-            # chose where to put their output GDB → that location is
-            # the right disk for the scratch folder as well.
+            # Scratch is pinned to the output GDB's parent folder.
             scratch_root = os.path.dirname(os.path.normpath(gdb_path))
             scratch_dir = os.path.join(
                 scratch_root,
@@ -2157,54 +2146,102 @@ class LandsatMosaic(object):
             os.makedirs(scratch_dir, exist_ok=True)
             arcpy.AddMessage(f"\n  Scratch folder: {scratch_dir}")
 
-            # If env.mask is active, wrap each cleaned band with
-            # ExtractByMask so its native extent IS the AOI extent.
-            # arcpy.management.CompositeBands ignores arcpy.env.extent
-            # (management tools use input-raster extent intersection),
-            # so without this wrapping the composite would materialise
-            # the full /vsitar/ scene extent regardless of AOI scope.
             aoi_active = bool(arcpy.env.mask)
             if aoi_active:
                 arcpy.AddMessage(
-                    f"\nAOI mask active: each cleaned band wrapped with "
-                    f"ExtractByMask before CompositeBands. Composites will "
-                    f"be sized to AOI extent, not full scene footprint."
+                    "\nAOI mask active. Each scene's value_mask is "
+                    "materialised once at AOI extent (vs. the previous "
+                    "7x QA decode per scene), and each of the 7 cleaned "
+                    "bands is materialised once at AOI extent before "
+                    "CompositeBands consumes them. Composites are AOI-sized."
+                )
+            else:
+                arcpy.AddMessage(
+                    "\nNo AOI mask. Each scene's value_mask is materialised "
+                    "once to scratch (kills the 7x QA decode redundancy), "
+                    "then 7 lazy Cons reference the materialised mask in "
+                    "the CompositeBands inputs. Composites are full-extent."
                 )
 
             arcpy.AddMessage(
                 f"\nBuilding {total} per-scene multi-band composites in "
-                f"scratch folder (cloud-masked stack per scene; expect "
-                f"several seconds per scene on archive inputs)..."
+                f"scratch folder..."
             )
 
             composite_idx = 0
             for scene in clean_scenes:
-                if 'rasters' in scene and len(scene['rasters']) == 7:
-                    composite_idx += 1
-                    scene_id = scene.get('scene_id') or os.path.basename(
-                        (scene.get('path') or '').rstrip(os.sep)
-                    ) or f"scene_{composite_idx}"
-                    scene_start = datetime.now()
-                    arcpy.AddMessage(
-                        f"  [{composite_idx}/{total}] composite for {scene_id}"
-                    )
+                band_paths = scene.get('band_paths') or {}
+                if not (all(f"B{n}" in band_paths for n in range(1, 8))
+                        and 'QA_PIXEL' in band_paths):
+                    continue
 
-                    if aoi_active:
-                        cleaned_inputs = [
-                            arcpy.sa.ExtractByMask(r, arcpy.env.mask)
-                            for r in scene['rasters']
-                        ]
-                    else:
-                        cleaned_inputs = scene['rasters']
+                composite_idx += 1
+                scene_id = scene.get('scene_id') or os.path.basename(
+                    (scene.get('path') or '').rstrip(os.sep)
+                ) or f"scene_{composite_idx}"
+                scene_start = datetime.now()
+                arcpy.AddMessage(
+                    f"  [{composite_idx}/{total}] composite for {scene_id}"
+                )
 
-                    temp_composite = os.path.join(
-                        scratch_dir, f"composite_{composite_idx:04d}.tif"
-                    )
-                    arcpy.management.CompositeBands(cleaned_inputs, temp_composite)
-                    multiband_rasters.append(temp_composite)
-                    arcpy.AddMessage(
-                        f"      done in {(datetime.now() - scene_start).total_seconds():.1f}s"
-                    )
+                # Per-scene subfolder so the intermediate value_mask + band
+                # TIFs don't collide with another scene's files of the same
+                # name (Bn.tif). One shutil.rmtree on scratch_dir at the
+                # end cleans up everything.
+                scene_scratch = os.path.join(
+                    scratch_dir, f"s{composite_idx:04d}"
+                )
+                os.makedirs(scene_scratch, exist_ok=True)
+
+                # 1. Materialise value_mask ONCE per scene. Previously the
+                #    lazy `value_mask = ~TransposeBits(qa, ...)` got re-
+                #    evaluated by every Con expression that referenced it
+                #    (7x per scene for the 7 SR bands). With env.mask +
+                #    env.extent active, .save() honours the AOI scope and
+                #    the on-disk value_mask.tif is AOI-sized.
+                qa_raster = arcpy.Raster(band_paths["QA_PIXEL"])
+                cloud_mask = TransposeBits(
+                    qa_raster, [0, 1, 2, 3, 4], [0, 1, 2, 3, 4], 0, None
+                )
+                value_mask = ~cloud_mask
+                value_mask_path = os.path.join(scene_scratch, "vmask.tif")
+                value_mask.save(value_mask_path)
+                value_mask_raster = arcpy.Raster(value_mask_path)
+
+                if aoi_active:
+                    # 2a. AOI active: materialise each cleaned band so its
+                    #     on-disk extent IS the AOI extent. CompositeBands
+                    #     (a management tool that ignores env.extent) then
+                    #     uses the input-extent intersection — all 7 inputs
+                    #     are AOI-sized, so the output composite is AOI-sized.
+                    cleaned_band_paths = []
+                    for n in range(1, 8):
+                        band_raster = arcpy.Raster(band_paths[f"B{n}"])
+                        cleaned = Con(value_mask_raster, band_raster)
+                        band_path = os.path.join(scene_scratch, f"B{n}.tif")
+                        cleaned.save(band_path)
+                        cleaned_band_paths.append(band_path)
+                    composite_inputs = cleaned_band_paths
+                else:
+                    # 2b. No AOI: keep the per-band Cons lazy (saving full-
+                    #     extent TIFs per band is wasteful disk I/O when
+                    #     they'd just be consumed once by CompositeBands).
+                    #     Reference the materialised value_mask so the QA
+                    #     decode still happens only once.
+                    composite_inputs = [
+                        Con(value_mask_raster, arcpy.Raster(band_paths[f"B{n}"]))
+                        for n in range(1, 8)
+                    ]
+
+                temp_composite = os.path.join(
+                    scratch_dir, f"composite_{composite_idx:04d}.tif"
+                )
+                arcpy.management.CompositeBands(composite_inputs, temp_composite)
+                multiband_rasters.append(temp_composite)
+                arcpy.AddMessage(
+                    f"      done in "
+                    f"{(datetime.now() - scene_start).total_seconds():.1f}s"
+                )
 
             composite_elapsed = (datetime.now() - start_time).total_seconds()
             arcpy.AddMessage(
