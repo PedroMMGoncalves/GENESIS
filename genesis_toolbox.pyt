@@ -1995,7 +1995,7 @@ class LandsatMosaic(object):
                             found_scene = True
                             break
                         fl = f.lower()
-                        if fl.endswith('.tar') and (
+                        if (fl.endswith('.tar') or fl.endswith('.zip')) and (
                             fl.startswith('lc08_') or fl.startswith('lc09_')
                         ):
                             found_scene = True
@@ -2006,97 +2006,95 @@ class LandsatMosaic(object):
                 if not found_scene:
                     parameters[2].setErrorMessage(
                         "No Landsat scenes found in folder. Expected either "
-                        "extracted scene folders containing *_MTL.txt files, "
-                        "or EarthExplorer .tar archives (LC08_*.tar / "
-                        "LC09_*.tar)."
+                        "EarthExplorer .tar / .zip archives (LC08_* / LC09_*) "
+                        "read on the fly via GDAL, or already-extracted scene "
+                        "folders containing *_MTL.txt files."
                     )
                     
     def remove_cloud(self, scenes, stats):
-        """Remove clouds from Landsat scenes"""
+        """Apply QA_PIXEL cloud masking to every scene.
+
+        Each scene's bands come in via `scene['band_paths']`, a
+        `{role: path}` dict produced by `_find_scenes`. Paths are either:
+
+          * `/vsitar/.../scene.tar/scene_SR_B1.TIF` for archived scenes
+            (read on the fly through GDAL VSI — no extraction)
+          * `c:\\path\\to\\extracted\\scene_SR_B1.TIF` for already-extracted
+            scenes kept around for back-compat
+
+        arcpy.Raster accepts both forms transparently; the rest of the
+        pipeline (TransposeBits / Con / GeometricMedian) sees ordinary
+        Raster objects and doesn't care where the pixels live.
+        """
         try:
             from arcpy.ia import TransposeBits
             from arcpy.sa import Con  # More flexible than Clip
-            
+
             start_time = datetime.now()
             self._update_processing_stats(stats, stage="cloud_removal")
             clean_scenes = []
             total_scenes = len(scenes)
-            
+
             arcpy.AddMessage(f"\nRemoving clouds from {total_scenes} scenes...")
-            
+
+            required = ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "QA_PIXEL"]
+
             for idx, scene in enumerate(scenes, 1):
                 try:
-                    scene_path = scene['path']
+                    scene_path = scene.get('path', '')
+                    scene_id = scene.get('scene_id') or os.path.basename(
+                        scene_path.rstrip(os.sep)
+                    )
+                    band_paths = scene.get('band_paths') or {}
                     arcpy.AddMessage(f"\nProcessing scene {idx} of {total_scenes}")
-                    arcpy.AddMessage(f"Scene path: {scene_path}")
-                    
-                    # List and check files
-                    files = os.listdir(scene_path)
-                    
-                    # Find spectral bands and QA band
-                    band_files = []
-                    qa_file = None
-                    
-                    for file in files:
-                        if '_SR_B' in file and file.endswith('.TIF'):
-                            band_number = int(file.split('_SR_B')[-1].split('.')[0])
-                            if 1 <= band_number <= 7:
-                                band_files.append(os.path.join(scene_path, file))
-                        
-                        if '_QA_PIXEL.TIF' in file:
-                            qa_file = os.path.join(scene_path, file)
-                    
-                    # Validate files
-                    if not band_files or not qa_file:
-                        arcpy.AddWarning(f"Incomplete scene data for {scene_path}")
+                    arcpy.AddMessage(
+                        f"Scene: {scene_id}"
+                        f"{' (archive)' if scene.get('is_archive') else ''}"
+                    )
+
+                    missing = [k for k in required if k not in band_paths]
+                    if missing:
+                        arcpy.AddWarning(
+                            f"Incomplete scene data: missing {missing}"
+                        )
+                        stats['failed_scenes'] = stats.get('failed_scenes', 0) + 1
                         continue
-                    
-                    # Sort band files to ensure correct order
-                    band_files.sort()
-                    
-                    # Create rasters
-                    band_rasters = [arcpy.Raster(f) for f in band_files]
-                    qa_raster = arcpy.Raster(qa_file)
-                    
-                    # Create cloud mask
-                    # Use the original TransposeBits signature
+
+                    band_rasters = [arcpy.Raster(band_paths[f"B{n}"]) for n in range(1, 8)]
+                    qa_raster = arcpy.Raster(band_paths["QA_PIXEL"])
+
+                    # QA_PIXEL bits 0-4: fill / dilated cloud / cirrus /
+                    # cloud / cloud shadow. Anything set → mask out.
                     cloud_mask = TransposeBits(qa_raster, [0, 1, 2, 3, 4], [0, 1, 2, 3, 4], 0, None)
-                    
-                    # Invert mask to keep clear pixels
                     value_mask = ~cloud_mask
-                    
-                    # Create clean rasters using Con (conditional) function
-                    # This keeps pixels where value_mask is True (clear pixels)
-                    clean_band_rasters = [Con(value_mask, raster) for raster in band_rasters]
-                    
-                    # Add processed scene to clean scenes
+                    clean_band_rasters = [Con(value_mask, r) for r in band_rasters]
+
                     clean_scenes.append({
                         'path': scene_path,
+                        'scene_id': scene_id,
                         'rasters': clean_band_rasters,
-                        'metadata': scene.get('metadata', {})
+                        'metadata': scene.get('metadata', {}),
+                        'is_archive': scene.get('is_archive', False),
                     })
-                    
                     arcpy.AddMessage(f"Cloud removal completed for scene {idx}")
-                    
+
                 except Exception as e:
                     arcpy.AddWarning(f"Error processing scene {idx}: {str(e)}")
                     stats['failed_scenes'] = stats.get('failed_scenes', 0) + 1
                     stats['errors'].append(str(e))
                     continue
-            
-            # Update cloud removal statistics
+
             stats['cloud_removal'] = {
                 'scenes_processed': total_scenes,
                 'scenes_cleaned': len(clean_scenes),
-                'processing_time': (datetime.now() - start_time).total_seconds()
+                'processing_time': (datetime.now() - start_time).total_seconds(),
             }
-            
+
             if not clean_scenes:
                 arcpy.AddWarning("No scenes were successfully processed")
                 return None
-                
             return clean_scenes
-            
+
         except Exception as e:
             arcpy.AddError(f"Cloud removal failed: {str(e)}")
             return None
@@ -2206,12 +2204,8 @@ class LandsatMosaic(object):
             temporal_filter = self._create_temporal_filter(time_type, year, month, season)
             region_info = self._get_region_info(region)
 
-            # Phase 3 addition: transparently extract any .tar archives in
-            # the data folder so users can drop EarthExplorer downloads
-            # directly without manual unpacking. No-op if scenes are
-            # already extracted.
-            arcpy.AddMessage("\nChecking for .tar archives to extract...")
-            self._extract_tar_archives(data_folder)
+            # Archives are read on the fly via GDAL VSI paths inside
+            # `_find_scenes` — no extraction step, no double disk usage.
 
             # Track scenes that actually fed the final mosaic so we can
             # write a provenance CSV at the end.
@@ -2782,11 +2776,23 @@ class LandsatMosaic(object):
             return None
             
     def _parse_metadata(self, mtl_path):
-        """Parse Landsat MTL file"""
+        """Parse Landsat MTL file from a filesystem path."""
         try:
             with open(mtl_path) as f:
                 content = f.read()
-                
+            return self._parse_metadata_content(content, mtl_path)
+        except Exception as e:
+            arcpy.AddWarning(f"Error parsing metadata {mtl_path}: {str(e)}")
+            return None
+
+    def _parse_metadata_content(self, content, source_label):
+        """Parse Landsat MTL content provided as a string.
+
+        Factored out of _parse_metadata so MTL text read from inside a
+        .tar / .zip archive (via _read_mtl_from_archive) can reuse the
+        same logic without first writing to disk.
+        """
+        try:
             # Extract key metadata. Each field is best-effort: a missing
             # tag is logged and left as None / 0, never propagated as an
             # IndexError. Pre-fix the `[0]` access would silently drop the
@@ -2837,63 +2843,169 @@ class LandsatMosaic(object):
 
             if scene_info['acquisition_date'] is None:
                 arcpy.AddWarning(
-                    f"  Scene {os.path.basename(mtl_path)} has no parseable "
+                    f"  Scene {os.path.basename(source_label)} has no parseable "
                     f"DATE_ACQUIRED; dropping."
                 )
                 return None
             return scene_info
-            
+
         except Exception as e:
-            arcpy.AddWarning(f"Error parsing metadata {mtl_path}: {str(e)}")
+            arcpy.AddWarning(f"Error parsing metadata {source_label}: {str(e)}")
             return None
         
     def _find_scenes(self, data_folder, utm_zone, temporal_filter, seasonal_pattern, stats):
-        """Find and validate Landsat scenes for specified UTM zone"""
+        """Discover Landsat scenes for the given UTM zone.
+
+        Two scene sources are accepted:
+
+          1. EarthExplorer **.tar / .zip archives** sitting directly in
+             `data_folder` (preferred). Band files are NEVER extracted —
+             we list members with the stdlib, then build GDAL VSI paths
+             (`/vsitar/...` or `/vsizip/...`) that arcpy.Raster can open
+             directly through the GDAL drivers.
+          2. **Already-extracted scene folders** (any depth under
+             `data_folder`) containing the `*_MTL.txt` sidecar. Kept for
+             back-compatibility with users who pre-extract.
+
+        Scenes from both sources are de-duplicated by scene_id — if both
+        an archive AND its extracted twin sit in the folder, the archive
+        wins (cheaper to re-open, no risk of a stale partial extract).
+        """
         try:
             scenes = []
             ls8_count = 0
             ls9_count = 0
+            seen_scene_ids = set()
             arcpy.AddMessage("\nScanning for Landsat scenes...")
-            
+
+            # ---- 1) Archives (.tar / .zip) at the top of data_folder ----
+            try:
+                entries = os.listdir(data_folder)
+            except OSError as e:
+                arcpy.AddWarning(f"Could not list data folder: {e}")
+                entries = []
+
+            archive_entries = [
+                fn for fn in entries
+                if (fn.lower().endswith('.tar') or fn.lower().endswith('.zip'))
+                and (fn.lower().startswith('lc08_') or fn.lower().startswith('lc09_'))
+            ]
+
+            for fn in archive_entries:
+                stats['total_scenes'] += 1
+                archive_path = os.path.join(data_folder, fn)
+                scene_id = fn[:-4]  # strip .tar / .zip
+                if scene_id in seen_scene_ids:
+                    continue
+
+                try:
+                    mtl_content = self._read_mtl_from_archive(archive_path, scene_id)
+                    if not mtl_content:
+                        arcpy.AddWarning(f"  No MTL found inside archive {fn}; skipping.")
+                        stats['failed_scenes'] += 1
+                        continue
+
+                    scene_info = self._parse_metadata_content(mtl_content, archive_path)
+                    if not scene_info:
+                        stats['failed_scenes'] += 1
+                        continue
+
+                    band_paths = self._find_band_files_vsi(archive_path, scene_id)
+                    if not band_paths or 'QA_PIXEL' not in band_paths:
+                        arcpy.AddWarning(
+                            f"  Archive {fn} is missing required bands "
+                            f"(found: {sorted((band_paths or {}).keys())}); skipping."
+                        )
+                        stats['failed_scenes'] += 1
+                        continue
+
+                    if scene_id.startswith('LC08'):
+                        ls8_count += 1
+                    elif scene_id.startswith('LC09'):
+                        ls9_count += 1
+
+                    if scene_info['utm_zone'] == utm_zone:
+                        if self._apply_temporal_filter(scene_info, temporal_filter, seasonal_pattern):
+                            scenes.append({
+                                'path': archive_path,
+                                'scene_id': scene_id,
+                                'band_paths': band_paths,
+                                'metadata': scene_info,
+                                'is_archive': True,
+                            })
+                            stats['cloud_coverage'].append(scene_info['cloud_cover'])
+                            seen_scene_ids.add(scene_id)
+                except Exception as e:
+                    stats['failed_scenes'] += 1
+                    stats['errors'].append(f"{fn}: {e}")
+                    continue
+
+            # ---- 2) Already-extracted scene folders (back-compat) ----
             for root, _, files in os.walk(data_folder):
                 for file in files:
-                    if file.endswith('_MTL.txt'):
-                        stats['total_scenes'] += 1
-                        
-                        try:
-                            # Parse metadata
-                            mtl_path = os.path.join(root, file)
-                            scene_info = self._parse_metadata(mtl_path)
-                            
-                            if scene_info:
-                                # Count Landsat 8 and 9 scenes
-                                if 'LC08' in file:
-                                    ls8_count += 1
-                                elif 'LC09' in file:
-                                    ls9_count += 1
-                                
-                                # Check UTM zone
-                                if scene_info['utm_zone'] == utm_zone:
-                                    # Apply temporal filter
-                                    if self._apply_temporal_filter(scene_info, temporal_filter, seasonal_pattern):
-                                        scenes.append({
-                                            'path': root,
-                                            'metadata': scene_info
-                                        })
-                                        stats['cloud_coverage'].append(scene_info['cloud_cover'])
-                                        
-                        except Exception as e:
+                    if not file.endswith('_MTL.txt'):
+                        continue
+                    scene_id = file[:-len('_MTL.txt')]
+                    if scene_id in seen_scene_ids:
+                        continue  # archive form already discovered
+
+                    stats['total_scenes'] += 1
+                    try:
+                        mtl_path = os.path.join(root, file)
+                        scene_info = self._parse_metadata(mtl_path)
+                        if not scene_info:
                             stats['failed_scenes'] += 1
-                            stats['errors'].append(str(e))
                             continue
-            
-            # Print Landsat 8 and 9 scene counts
+
+                        # Map filesystem band files by role.
+                        band_paths = {}
+                        for entry in os.listdir(root):
+                            if not entry.startswith(scene_id):
+                                continue
+                            matched = False
+                            for n in range(1, 8):
+                                if entry == f"{scene_id}_SR_B{n}.TIF":
+                                    band_paths[f"B{n}"] = os.path.join(root, entry)
+                                    matched = True
+                                    break
+                            if not matched and entry == f"{scene_id}_QA_PIXEL.TIF":
+                                band_paths["QA_PIXEL"] = os.path.join(root, entry)
+
+                        required = ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "QA_PIXEL"]
+                        if any(k not in band_paths for k in required):
+                            missing = [k for k in required if k not in band_paths]
+                            arcpy.AddWarning(
+                                f"  Extracted scene {scene_id} is missing {missing}; skipping."
+                            )
+                            stats['failed_scenes'] += 1
+                            continue
+
+                        if 'LC08' in file:
+                            ls8_count += 1
+                        elif 'LC09' in file:
+                            ls9_count += 1
+
+                        if scene_info['utm_zone'] == utm_zone:
+                            if self._apply_temporal_filter(scene_info, temporal_filter, seasonal_pattern):
+                                scenes.append({
+                                    'path': root,
+                                    'scene_id': scene_id,
+                                    'band_paths': band_paths,
+                                    'metadata': scene_info,
+                                    'is_archive': False,
+                                })
+                                stats['cloud_coverage'].append(scene_info['cloud_cover'])
+                                seen_scene_ids.add(scene_id)
+                    except Exception as e:
+                        stats['failed_scenes'] += 1
+                        stats['errors'].append(str(e))
+                        continue
+
             arcpy.AddMessage(f"Total Landsat 8 scenes: {ls8_count}")
             arcpy.AddMessage(f"Total Landsat 9 scenes: {ls9_count}")
             arcpy.AddMessage(f"Found {len(scenes)} valid scenes for UTM zone {utm_zone}")
-            
             return scenes
-            
+
         except Exception as e:
             arcpy.AddError(f"Error finding scenes: {str(e)}")
             return []
@@ -2964,131 +3076,135 @@ class LandsatMosaic(object):
         return date.month in season_months[pattern][season.lower()]
 
     # ------------------------------------------------------------------
-    # Phase 3 additions: tar extraction + provenance CSV
+    # Archive reading via GDAL Virtual File System (no extraction to disk)
     # ------------------------------------------------------------------
+    #
+    # EarthExplorer ships Landsat C2L2 scenes as multi-hundred-MB `.tar`
+    # archives. The old approach extracted each archive into a sibling
+    # folder before processing; the disk overhead doubled the data
+    # footprint and the cleanup story for stale extracts was fragile.
+    #
+    # The new approach reads bands directly from inside the archive via
+    # GDAL's virtual file system: `/vsitar/{path}/{member}` for tar and
+    # `/vsizip/{path}/{member}` for zip. arcpy.Raster opens these strings
+    # through GDAL's drivers — no extraction, no cleanup, no double disk.
+    # MTL.txt sidecars are read in-memory with the stdlib tarfile/zipfile
+    # modules.
 
     @staticmethod
-    def _is_safe_tar_member(member, target_dir):
-        """Decide whether a tar member is safe to extract into target_dir.
+    def _validate_tar_file(tar_path):
+        """Quick integrity check for a .tar archive.
 
-        Returns (ok: bool, reason: str). The "safe" criteria, in order:
-
-          1. Reject symlinks and hardlinks — they can point outside the
-             target directory and overwrite system files. Legit USGS tars
-             never contain links, so this is a hard reject.
-          2. Reject device files, FIFOs, and other special types — same
-             reasoning. Only regular files and directories are allowed.
-          3. Reject absolute paths (POSIX `/foo` or Windows `C:\\foo`).
-          4. Reject any path component equal to `..` (parent traversal).
-          5. After normalising the joined path, require that the resolved
-             location is inside target_dir. Catches anything the
-             component-level check missed (e.g. odd encodings, symlink
-             races during extraction).
-
-        This is the "safe-extract" pattern recommended for Python 3.11
-        and earlier (Python 3.12+ has the built-in `filter='data'`
-        option to `tarfile.extractall` that does roughly the same job).
+        Returns (is_valid, error_message). A tar is considered valid when
+        it exists, is non-empty, is recognised by `tarfile.is_tarfile`,
+        and can be walked to its first member without raising. We
+        intentionally do NOT decompress the whole archive — GDAL will do
+        that lazily, member-by-member, as bands are read.
         """
-        name = (member.name or "").replace("\\", "/")
-        if not name:
-            return False, "empty member name"
+        try:
+            if not os.path.isfile(tar_path):
+                return False, "file does not exist"
+            if os.path.getsize(tar_path) == 0:
+                return False, "file is empty"
+            if not tarfile.is_tarfile(tar_path):
+                return False, "not a valid tar archive"
+            with tarfile.open(tar_path, 'r') as tf:
+                # getmembers() walks the header chain; if any header is
+                # corrupt the call raises here rather than later inside
+                # the GDAL read path.
+                tf.getmembers()
+            return True, ""
+        except (tarfile.TarError, OSError) as e:
+            return False, str(e)
 
-        # 1. Reject links and special types.
-        if member.issym() or member.islnk():
-            return False, "symbolic/hard link"
-        if not (member.isfile() or member.isdir()):
-            return False, f"non-regular tar member type ({member.type!r})"
+    def _find_band_files_vsi(self, archive_path, scene_id):
+        """Build GDAL VSI paths for every required Landsat band inside an archive.
 
-        # 2. Reject absolute paths (POSIX or Windows drive-letter).
-        if name.startswith("/"):
-            return False, "absolute path"
-        if len(name) >= 2 and name[1] == ":":
-            return False, "absolute Windows path"
+        Lists members with the stdlib (tarfile / zipfile) — never
+        extracts — then maps each Landsat band filename to its VSI path.
+        Returns `{band_role: vsi_path}` on success, or None if the
+        archive is unreadable or holds none of the required bands.
 
-        # 3. Reject explicit parent-traversal components.
-        parts = name.split("/")
-        if ".." in parts:
-            return False, "parent-traversal component"
+        Band roles returned: 'B1'..'B7' (Surface Reflectance) and
+        'QA_PIXEL' (the bit-packed QA band used for cloud masking).
 
-        # 4. Resolved-path check — defence in depth, catches anything the
-        # component-level checks missed.
-        target_real = os.path.realpath(target_dir)
-        joined = os.path.realpath(os.path.join(target_dir, name))
-        if joined != target_real and not joined.startswith(target_real + os.sep):
-            return False, f"resolves outside target_dir ({joined!r})"
-
-        return True, ""
-
-    def _extract_tar_archives(self, data_folder):
-        """Find any `.tar` files in `data_folder` and extract each into a
-        same-named subfolder. Already-extracted folders are skipped.
-
-        EarthExplorer ships Landsat 8/9 C2L2 scenes as `.tar` archives
-        named like `LC08_L2SR_217033_20260502_20260514_02_T1.tar`; this
-        method makes the toolbox tolerant of that directly so users don't
-        have to extract manually.
-
-        Returns the list of extracted scene folders (relative paths under
-        data_folder) for downstream `_find_scenes` to discover via the
-        normal `_MTL.txt` glob.
+        Notes on path syntax:
+          * GDAL VSI uses forward slashes throughout. On Windows the
+            drive-letter form `/vsitar/C:/path/to/archive.tar/member`
+            is the supported convention — backslashes in the archive
+            path are normalised to '/' before prepending the VSI scheme.
+          * Members may include a leading directory (`{scene}/{band}.TIF`)
+            on some downloads and live at the archive root on others.
+            We match on basename so both layouts work.
         """
-        if not data_folder or not os.path.isdir(data_folder):
-            return []
-
-        extracted = []
-        tar_files = [
-            f for f in os.listdir(data_folder)
-            if f.lower().endswith(".tar") and not f.startswith(".")
-        ]
-        if not tar_files:
-            arcpy.AddMessage("  No .tar archives found; assuming scenes are pre-extracted.")
-            return []
-
-        arcpy.AddMessage(f"  Found {len(tar_files)} .tar archive(s) to inspect...")
-        for tar_name in tar_files:
-            tar_path = os.path.join(data_folder, tar_name)
-            scene_name = tar_name[:-4]  # strip ".tar"
-            target_dir = os.path.join(data_folder, scene_name)
-
-            if os.path.isdir(target_dir):
-                # Already extracted — verify by looking for an MTL.
-                mtls = [
-                    fn for fn in os.listdir(target_dir)
-                    if fn.endswith("_MTL.txt")
-                ]
-                if mtls:
-                    arcpy.AddMessage(f"    [skip] already extracted: {scene_name}")
-                    extracted.append(target_dir)
-                    continue
-                else:
-                    arcpy.AddMessage(
-                        f"    [re-extract] {scene_name} folder exists but has no MTL"
-                    )
-
-            arcpy.AddMessage(f"    [extract] {tar_name} → {scene_name}/")
+        sl = archive_path.lower()
+        if sl.endswith('.tar'):
+            ok, err = self._validate_tar_file(archive_path)
+            if not ok:
+                arcpy.AddWarning(f"  Invalid tar {archive_path}: {err}")
+                return None
             try:
-                os.makedirs(target_dir, exist_ok=True)
-                with tarfile.open(tar_path, "r") as tar:
-                    # Safe-extract: refuse any member with absolute or
-                    # parent-traversal paths (defensive against malicious
-                    # archives — defense in depth even for trusted USGS data).
-                    safe_members = []
-                    for member in tar.getmembers():
-                        ok, reason = self._is_safe_tar_member(member, target_dir)
-                        if not ok:
-                            arcpy.AddWarning(
-                                f"      skipped tar entry {member.name!r}: {reason}"
-                            )
-                            continue
-                        safe_members.append(member)
-                    tar.extractall(path=target_dir, members=safe_members)
-                extracted.append(target_dir)
+                with tarfile.open(archive_path, 'r') as tf:
+                    namelist = [m.name for m in tf.getmembers() if m.isfile()]
             except (tarfile.TarError, OSError) as e:
-                arcpy.AddWarning(f"    [fail] {tar_name}: {e}")
-                continue
+                arcpy.AddWarning(f"  Could not list tar {archive_path}: {e}")
+                return None
+            scheme = "vsitar"
+        elif sl.endswith('.zip'):
+            try:
+                with zipfile.ZipFile(archive_path, 'r') as zf:
+                    namelist = [n for n in zf.namelist() if not n.endswith('/')]
+            except (zipfile.BadZipFile, OSError) as e:
+                arcpy.AddWarning(f"  Could not list zip {archive_path}: {e}")
+                return None
+            scheme = "vsizip"
+        else:
+            return None
 
-        arcpy.AddMessage(f"  Tar handling complete: {len(extracted)} scene folder(s) ready.")
-        return extracted
+        base_path = f"/{scheme}/{archive_path.replace(os.sep, '/')}"
+        band_paths = {}
+        for member in namelist:
+            basename = member.rsplit('/', 1)[-1]
+            if not basename.startswith(scene_id):
+                continue
+            matched = False
+            for n in range(1, 8):
+                if basename == f"{scene_id}_SR_B{n}.TIF":
+                    band_paths[f"B{n}"] = f"{base_path}/{member}"
+                    matched = True
+                    break
+            if not matched and basename == f"{scene_id}_QA_PIXEL.TIF":
+                band_paths["QA_PIXEL"] = f"{base_path}/{member}"
+        return band_paths or None
+
+    def _read_mtl_from_archive(self, archive_path, scene_id):
+        """Read `{scene_id}_MTL.txt` content from inside a .tar or .zip.
+
+        Returns the MTL text as a string, or None if the file is absent
+        or the archive can't be opened. No disk extraction.
+        """
+        mtl_name = f"{scene_id}_MTL.txt"
+        sl = archive_path.lower()
+        try:
+            if sl.endswith('.tar'):
+                with tarfile.open(archive_path, 'r') as tf:
+                    for member in tf.getmembers():
+                        if not member.isfile():
+                            continue
+                        if member.name.rsplit('/', 1)[-1] == mtl_name:
+                            fobj = tf.extractfile(member)
+                            if fobj is None:
+                                return None
+                            return fobj.read().decode('utf-8', errors='replace')
+            elif sl.endswith('.zip'):
+                with zipfile.ZipFile(archive_path, 'r') as zf:
+                    for name in zf.namelist():
+                        if name.rsplit('/', 1)[-1] == mtl_name:
+                            with zf.open(name) as fobj:
+                                return fobj.read().decode('utf-8', errors='replace')
+        except (tarfile.TarError, zipfile.BadZipFile, OSError, UnicodeError) as e:
+            arcpy.AddWarning(f"  Could not read MTL from {archive_path}: {e}")
+        return None
 
     def _write_provenance_csv(self, output_raster_path, scenes_used, stats):
         """Write `{output_raster}_provenance.csv` documenting every scene
@@ -3119,8 +3235,15 @@ class LandsatMosaic(object):
                 for scene in scenes_used:
                     meta = scene.get("metadata", {}) or {}
                     scene_path = scene.get("path", "") or ""
-                    scene_id = os.path.basename(scene_path.rstrip(os.sep)) or ""
-                    sensor = "Landsat 9" if "LC09" in scene_path else "Landsat 8"
+                    # New scene dicts carry an explicit scene_id; older
+                    # ones derived it from the path basename (which for
+                    # archives includes the `.tar` / `.zip` suffix).
+                    scene_id = scene.get("scene_id") or os.path.basename(
+                        scene_path.rstrip(os.sep)
+                    ) or ""
+                    if scene_id.lower().endswith((".tar", ".zip")):
+                        scene_id = scene_id[:-4]
+                    sensor = "Landsat 9" if scene_id.startswith("LC09") else "Landsat 8"
                     writer.writerow([
                         scene_id,
                         sensor,
