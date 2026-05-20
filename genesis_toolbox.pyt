@@ -1478,12 +1478,13 @@ class IndicesComposites(object):
         rescale.value = False
 
         mask_feature = arcpy.Parameter(
-            displayName="Optional AOI Mask",
+            displayName="Optional AOI Mask (polygon)",
             name="mask_feature",
-            datatype=["DEFeatureClass", "DEShapefile"],
+            datatype="GPFeatureLayer",
             parameterType="Optional",
             direction="Input",
         )
+        mask_feature.filter.list = ["Polygon"]
 
         return [
             input_raster, sensor_type, indices, composites,
@@ -1850,12 +1851,17 @@ class LandsatMosaic(object):
 
         # Mask Feature
         mask = arcpy.Parameter(
-            displayName="Mask Feature (Optional)",
+            displayName="Mask Feature (Optional, polygon)",
             name="mask_feature",
-            datatype=["DEFeatureClass", "DEShapefile"],
+            datatype="GPFeatureLayer",
             parameterType="Optional",
             direction="Input"
         )
+        # Restrict to polygon layers/feature classes only. The
+        # GPFeatureLayer datatype renders as a dropdown of polygon
+        # layers currently in the map AND keeps the "Browse" button
+        # for navigating to a feature class on disk — best of both.
+        mask.filter.list = ["Polygon"]
 
         # Save Statistics
         save_stats = arcpy.Parameter(
@@ -2135,10 +2141,15 @@ class LandsatMosaic(object):
             # each addition. Scratch-folder .tif files have zero catalog
             # overhead — each composite stays at its native ~10s.
             #
-            # Scratch folder is created adjacent to the output GDB so the
-            # cleanup is local and reviewable; falls back to arcpy's
-            # scratchFolder if the GDB parent isn't writeable.
-            scratch_root = arcpy.env.scratchFolder or os.path.dirname(gdb_path)
+            # Scratch is pinned to the GDB's parent folder, NOT to
+            # arcpy.env.scratchFolder. Rationale: arcpy.env.scratchFolder
+            # defaults to the Pro project's Home folder, which is often
+            # a OneDrive-synced path (the case for this user). Writing
+            # hundreds of GeoTIFFs to a OneDrive folder triggers
+            # continuous sync uploads that slow every write. The user
+            # chose where to put their output GDB → that location is
+            # the right disk for the scratch folder as well.
+            scratch_root = os.path.dirname(os.path.normpath(gdb_path))
             scratch_dir = os.path.join(
                 scratch_root,
                 f"_genesis_landsat_composites_{uuid.uuid4().hex[:8]}",
@@ -3587,12 +3598,13 @@ class Sentinel2Mosaic(object):
         apply_temporal.value = False
 
         mask_feature = arcpy.Parameter(
-            displayName="Optional AOI Mask Feature",
+            displayName="Optional AOI Mask Feature (polygon)",
             name="mask_feature",
-            datatype=["DEFeatureClass", "DEShapefile"],
+            datatype="GPFeatureLayer",
             parameterType="Optional",
             direction="Input",
         )
+        mask_feature.filter.list = ["Polygon"]
 
         save_stats = arcpy.Parameter(
             displayName="Save Provenance CSV",
@@ -3693,8 +3705,13 @@ class Sentinel2Mosaic(object):
             arcpy.AddMessage(f"  Region:      {region}")
             arcpy.AddMessage(f"  Data folder: {data_folder}")
 
+            # Scratch is pinned to the output GDB's parent folder so it
+            # lives on the same disk the user already chose for outputs
+            # (typically a fast local drive) and avoids the OneDrive
+            # sync overhead that arcpy.env.scratchFolder would trigger
+            # when the Pro project Home folder is OneDrive-synced.
             scratch_dir = os.path.join(
-                arcpy.env.scratchFolder or data_folder,
+                os.path.dirname(os.path.normpath(gdb_path)),
                 f"_genesis_s2_scratch_{uuid.uuid4().hex[:8]}",
             )
             os.makedirs(scratch_dir, exist_ok=True)
@@ -4561,12 +4578,13 @@ class AsterMosaic(object):
         use_qa_planes.value = True
 
         mask_feature = arcpy.Parameter(
-            displayName="Optional AOI Mask Feature",
+            displayName="Optional AOI Mask Feature (polygon)",
             name="mask_feature",
-            datatype=["DEFeatureClass", "DEShapefile"],
+            datatype="GPFeatureLayer",
             parameterType="Optional",
             direction="Input",
         )
+        mask_feature.filter.list = ["Polygon"]
 
         save_stats = arcpy.Parameter(
             displayName="Save Provenance CSV",
@@ -4661,8 +4679,10 @@ class AsterMosaic(object):
             arcpy.AddMessage(f"  QA mask:     {use_qa}")
             arcpy.AddMessage(f"  Temporal:    {apply_temporal}")
 
+            # Scratch is pinned to the output GDB's parent folder
+            # (same-disk-as-output, avoids OneDrive sync overhead).
             scratch_dir = os.path.join(
-                arcpy.env.scratchFolder or data_folder,
+                os.path.dirname(os.path.normpath(gdb_path)),
                 f"_genesis_aster_scratch_{uuid.uuid4().hex[:8]}",
             )
             os.makedirs(scratch_dir, exist_ok=True)
@@ -5644,7 +5664,9 @@ class Transformations(object):
                     arcpy.AddMessage(
                         f"Combining {len(input_rasters)} input rasters via CompositeBands..."
                     )
-                    scratch_dir = arcpy.env.scratchFolder or os.path.dirname(input_rasters[0])
+                    # Scratch pinned to output workspace's parent (avoids
+                    # OneDrive sync overhead from arcpy.env.scratchFolder).
+                    scratch_dir = os.path.dirname(os.path.normpath(out_workspace))
                     composite_temp_path = os.path.join(
                         scratch_dir, f"_genesis_compose_{uuid.uuid4().hex}.tif"
                     )
@@ -6285,9 +6307,14 @@ class Transformations(object):
             
             # Paths for temporary component rasters
             temp_component_paths = []
-            
-            # Create output directory for temp files if needed
-            temp_dir = os.path.join(arcpy.env.scratchFolder, "temp_components")
+
+            # Scratch dir for per-component temp TIFFs lives next to the
+            # output workspace (same-disk-as-output, avoids OneDrive sync
+            # overhead from arcpy.env.scratchFolder).
+            temp_dir = os.path.join(
+                os.path.dirname(os.path.normpath(out_workspace)),
+                f"_genesis_components_{uuid.uuid4().hex[:8]}",
+            )
             if not os.path.exists(temp_dir):
                 os.makedirs(temp_dir)
             
