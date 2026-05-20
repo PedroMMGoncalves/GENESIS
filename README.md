@@ -19,8 +19,7 @@ sensors via a single sensor-aware design.
 Used to support analytical work for the **GENESIS Horizon Europe project** (grant agreement Nº 101157447)
 ([genesisnbs.eu](https://genesisnbs.eu)) — in particular for processing
 satellite imagery over the **Faial Island (Azores)** case study.
-Application areas include geological mapping, mineral exploration, and
-hydrothermal alteration detection, applicable across Portuguese and
+Applicable across Portuguese and
 African study areas (Iberian Peninsula, Azores, Madeira, Cape Verde,
 Angola, Mozambique).
 
