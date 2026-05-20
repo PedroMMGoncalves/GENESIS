@@ -3501,40 +3501,50 @@ class Sentinel2Mosaic(object):
             os.makedirs(scratch_dir, exist_ok=True)
             arcpy.AddMessage(f"  Scratch:     {scratch_dir}")
 
-            # Step 1: extract any .zip archives in the data folder.
-            arcpy.AddMessage("\nStep 1/6 — Checking for .zip archives...")
-            self._extract_zip_archives(data_folder)
-
-            # Step 2: discover all SAFE folders.
-            arcpy.AddMessage("\nStep 2/6 — Discovering SAFE folders...")
-            safe_folders = self._find_safe_scenes(data_folder)
-            if not safe_folders:
-                arcpy.AddError("No .SAFE folders found in the data folder.")
+            # Step 1: discover scene sources (.zip archives read on the
+            # fly via GDAL VSI, and any already-extracted .SAFE folders).
+            arcpy.AddMessage("\nStep 1/5 — Discovering S2 scenes...")
+            sources = self._find_safe_scenes(data_folder)
+            if not sources:
+                arcpy.AddError(
+                    "No Sentinel-2 scenes found. Expected Copernicus .zip "
+                    "archives (read on the fly) or already-extracted .SAFE "
+                    "folders in the data folder."
+                )
                 return None
-            arcpy.AddMessage(f"  Found {len(safe_folders)} SAFE folder(s).")
+            n_zip = sum(1 for _, k in sources if k == "zip")
+            n_safe = sum(1 for _, k in sources if k == "safe")
+            arcpy.AddMessage(
+                f"  Found {len(sources)} scene(s): {n_zip} archive(s), "
+                f"{n_safe} extracted SAFE folder(s)."
+            )
 
-            # Step 3: parse metadata + apply temporal filter.
-            arcpy.AddMessage("\nStep 3/6 — Filtering scenes by date/season...")
+            # Step 2: parse metadata + apply temporal filter.
+            arcpy.AddMessage("\nStep 2/5 — Filtering scenes by date/season...")
             seasonal_pattern = self._seasonal_pattern_for_region(region)
             temporal_filter = self._create_temporal_filter(
                 time_type, year, month, season,
             )
             kept_scenes = []
-            for safe in safe_folders:
-                meta = self._parse_safe_metadata(safe)
+            for path, kind in sources:
+                meta = self._parse_safe_metadata(path, kind)
                 if meta is None:
-                    arcpy.AddWarning(f"  Skipped (no metadata): {os.path.basename(safe)}")
+                    arcpy.AddWarning(f"  Skipped (no metadata): {os.path.basename(path)}")
                     continue
                 if not self._scene_passes_filter(meta, temporal_filter, seasonal_pattern):
                     continue
-                kept_scenes.append({"path": safe, "metadata": meta})
+                kept_scenes.append({
+                    "path": path,
+                    "source_kind": kind,
+                    "metadata": meta,
+                })
             if not kept_scenes:
                 arcpy.AddError("No scenes match the temporal filter.")
                 return None
             arcpy.AddMessage(f"  Kept {len(kept_scenes)} scenes after temporal filter.")
 
             # Step 4: process each scene (mask + scale + stack), grouped by tile.
-            arcpy.AddMessage("\nStep 4/6 — Cloud-masking and stacking scenes...")
+            arcpy.AddMessage("\nStep 3/5 — Cloud-masking and stacking scenes...")
             scenes_by_tile = {}
             all_scenes_used = []
             for scene in kept_scenes:
@@ -3561,9 +3571,9 @@ class Sentinel2Mosaic(object):
                 arcpy.AddError("No scenes survived cloud masking + stacking.")
                 return None
 
-            # Optional Step 4b: multitemporal cloud refinement layer.
+            # Optional Step 3b: multitemporal cloud refinement layer.
             if apply_temporal:
-                arcpy.AddMessage("\nStep 4b — Applying multitemporal cloud refinement...")
+                arcpy.AddMessage("\nStep 3b — Applying multitemporal cloud refinement...")
                 arcpy.AddWarning(
                     "  Multitemporal refinement is a stub in this build — "
                     "the per-scene SCL mask is already applied; an explicit "
@@ -3571,7 +3581,7 @@ class Sentinel2Mosaic(object):
                 )
 
             # Step 5: per-tile geometric median, then merge.
-            arcpy.AddMessage("\nStep 5/6 — Computing per-tile geometric median...")
+            arcpy.AddMessage("\nStep 4/5 — Computing per-tile geometric median...")
             tile_mosaics = []
             for tile, stacked_paths in scenes_by_tile.items():
                 arcpy.AddMessage(f"  [{tile}] {len(stacked_paths)} scenes")
@@ -3591,7 +3601,7 @@ class Sentinel2Mosaic(object):
                 return None
 
             # Merge multi-tile result.
-            arcpy.AddMessage("\nStep 6/6 — Finalising output...")
+            arcpy.AddMessage("\nStep 5/5 — Finalising output...")
             if len(tile_mosaics) > 1:
                 final_path = os.path.join(gdb_path, mosaic_name)
                 arcpy.AddMessage(f"  Merging {len(tile_mosaics)} tile mosaics...")
@@ -3646,72 +3656,89 @@ class Sentinel2Mosaic(object):
                 arcpy.CheckInExtension("Spatial")
 
     # ------------------------------------------------------------------
-    # ZIP extraction (parallel to LandsatMosaic's tar handling)
+    # Archive reading via GDAL Virtual File System (no extraction)
     # ------------------------------------------------------------------
+    #
+    # Copernicus L2A products ship as ~1 GB `.zip` archives. The previous
+    # implementation extracted each one into a sibling `.SAFE/` folder
+    # before processing — at the scale we work (hundreds of scenes)
+    # the disk doubling is prohibitive.
+    #
+    # The new approach reads JP2 bands and MTD_MSIL2A.xml directly from
+    # inside the zip via GDAL's `/vsizip/{path}/{member}` virtual file
+    # system. arcpy.Raster opens these strings through the GDAL JP2
+    # driver; XML is read in-memory with the stdlib `zipfile` module.
+    # No extraction step, no scratch SAFE folders, no cleanup.
 
     @staticmethod
-    def _is_safe_zip_member(name, target_dir):
-        """Same safe-extract pattern as the tar version."""
-        n = (name or "").replace("\\", "/")
-        if not n:
-            return False, "empty name"
-        if n.startswith("/"):
-            return False, "absolute path"
-        if len(n) >= 2 and n[1] == ":":
-            return False, "Windows drive-letter path"
-        parts = n.split("/")
-        if ".." in parts:
-            return False, "parent-traversal component"
-        target_real = os.path.realpath(target_dir)
-        joined = os.path.realpath(os.path.join(target_dir, n))
-        if joined != target_real and not joined.startswith(target_real + os.sep):
-            return False, f"resolves outside target_dir ({joined!r})"
-        return True, ""
+    def _list_zip_members(zip_path):
+        """List file-only members of a zip archive (skip directories).
 
-    def _extract_zip_archives(self, data_folder):
-        """Extract every `.zip` in data_folder. Skips zips whose .SAFE
-        contents are already extracted next to them."""
-        if not data_folder or not os.path.isdir(data_folder):
-            return []
+        Returns the member list, or None if the archive can't be opened
+        (corrupt download, empty file, etc.).
+        """
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                return [n for n in zf.namelist() if not n.endswith("/")]
+        except (zipfile.BadZipFile, OSError) as e:
+            arcpy.AddWarning(f"  Cannot open zip {zip_path}: {e}")
+            return None
 
-        zips = [
-            f for f in os.listdir(data_folder)
-            if f.lower().endswith(".zip") and not f.startswith(".")
-        ]
-        if not zips:
-            arcpy.AddMessage("  No .zip archives found; assuming .SAFE folders are extracted.")
-            return []
+    @staticmethod
+    def _read_safe_xml_from_zip(zip_path, xml_basename):
+        """Return the bytes of `xml_basename` (e.g., 'MTD_MSIL2A.xml') from
+        anywhere inside the zip, or None if absent / unreadable.
 
-        arcpy.AddMessage(f"  Found {len(zips)} .zip archive(s).")
-        extracted = []
-        for zname in zips:
-            zpath = os.path.join(data_folder, zname)
-            # Detect already-extracted by looking for a sibling .SAFE folder.
-            # Copernicus zips are named "<safe_basename>.zip" where the
-            # basename ALREADY ends with ".SAFE" — so just strip ".zip".
-            expected_safe = zname[:-4] if zname.lower().endswith(".zip") else None
-            if expected_safe and os.path.isdir(os.path.join(data_folder, expected_safe)):
-                arcpy.AddMessage(f"    [skip] already extracted: {expected_safe}")
-                extracted.append(zpath)
+        Match by basename so the Copernicus on-disk layout drift (different
+        baselines occasionally nest XML differently) is tolerated.
+        """
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                for name in zf.namelist():
+                    if name.rsplit("/", 1)[-1] == xml_basename:
+                        with zf.open(name) as fobj:
+                            return fobj.read()
+        except (zipfile.BadZipFile, OSError) as e:
+            arcpy.AddWarning(f"  Cannot read {xml_basename} from {zip_path}: {e}")
+        return None
+
+    @staticmethod
+    def _locate_band_files_vsi(zip_path, member_names):
+        """Build GDAL VSI band paths from a Copernicus L2A zip's member list.
+
+        Mirrors the shape of `_locate_band_files` (SAFE-folder variant):
+        returns `{band_name: vsi_path}` for the 10 stack bands + SCL,
+        each path of the form
+        `/vsizip/{zip_path}/{SAFE}/GRANULE/L2A_*/IMG_DATA/R{10,20}m/...jp2`.
+        Returns None if no recognisable bands are found.
+
+        Resolution is inferred from the filename suffix (`_10m.jp2` vs
+        `_20m.jp2`), not the folder name — that lets us tolerate the
+        occasional Copernicus zip that ships without the R10m/R20m
+        subfolders.
+        """
+        base = f"/vsizip/{zip_path.replace(os.sep, '/')}"
+        out = {}
+        for member in member_names:
+            basename = member.rsplit("/", 1)[-1]
+            matched = False
+            for band in ("B02", "B03", "B04", "B08"):
+                if basename.endswith(f"_{band}_10m.jp2"):
+                    out[band] = f"{base}/{member}"
+                    matched = True
+                    break
+            if matched:
                 continue
-            arcpy.AddMessage(f"    [extract] {zname}")
-            try:
-                with zipfile.ZipFile(zpath, "r") as zf:
-                    safe_names = []
-                    for info in zf.infolist():
-                        ok, reason = self._is_safe_zip_member(info.filename, data_folder)
-                        if not ok:
-                            arcpy.AddWarning(
-                                f"      skipped zip entry {info.filename!r}: {reason}"
-                            )
-                            continue
-                        safe_names.append(info.filename)
-                    zf.extractall(path=data_folder, members=safe_names)
-                extracted.append(zpath)
-            except (zipfile.BadZipFile, OSError) as e:
-                arcpy.AddWarning(f"    [fail] {zname}: {e}")
+            for band in ("B05", "B06", "B07", "B8A", "B11", "B12"):
+                if basename.endswith(f"_{band}_20m.jp2"):
+                    out[band] = f"{base}/{member}"
+                    matched = True
+                    break
+            if matched:
                 continue
-        return extracted
+            if basename.endswith("_SCL_20m.jp2"):
+                out["SCL"] = f"{base}/{member}"
+        return out if out else None
 
     # ------------------------------------------------------------------
     # SAFE discovery + metadata
@@ -3719,14 +3746,54 @@ class Sentinel2Mosaic(object):
 
     @staticmethod
     def _find_safe_scenes(data_folder):
-        """Return list of absolute paths to .SAFE folders in data_folder."""
+        """Return a list of scene sources discovered in data_folder.
+
+        Two source types, both treated uniformly downstream:
+
+          * `(path, 'zip')` — a Copernicus `.zip` archive sitting at the
+            top of data_folder. Bands and metadata are read via GDAL VSI
+            (`/vsizip/...`) — no extraction.
+          * `(path, 'safe')` — an already-extracted `.SAFE` folder
+            (kept for users who pre-extract).
+
+        A zip wins over an extracted twin with the same basename — the
+        zip is always a complete product, while a `.SAFE/` next to it
+        could be a stale partial extract from a previous run.
+        """
         if not data_folder or not os.path.isdir(data_folder):
             return []
-        return sorted(
-            os.path.join(data_folder, e)
-            for e in os.listdir(data_folder)
-            if e.endswith(".SAFE") and os.path.isdir(os.path.join(data_folder, e))
-        )
+        try:
+            entries = os.listdir(data_folder)
+        except OSError as e:
+            arcpy.AddWarning(f"  Cannot list data folder: {e}")
+            return []
+
+        sources = []
+        seen_safe_basenames = set()
+
+        # Pass 1: zip archives.
+        for e in sorted(entries):
+            if not e.lower().endswith(".zip"):
+                continue
+            # Copernicus convention: "<safe_basename>.zip" where
+            # safe_basename ends with ".SAFE". Tolerate the rare cases
+            # where the .zip wraps a SAFE differently named — the
+            # metadata reader handles both.
+            safe_basename = e[:-4]
+            sources.append((os.path.join(data_folder, e), "zip"))
+            seen_safe_basenames.add(safe_basename)
+
+        # Pass 2: extracted SAFE folders not already covered by a zip.
+        for e in sorted(entries):
+            if not e.endswith(".SAFE"):
+                continue
+            if e in seen_safe_basenames:
+                continue
+            full = os.path.join(data_folder, e)
+            if os.path.isdir(full):
+                sources.append((full, "safe"))
+
+        return sources
 
     _SAFE_NAME_RE = re.compile(
         # Note the captured tile group includes the "T" prefix so callers
@@ -3735,16 +3802,27 @@ class Sentinel2Mosaic(object):
     )
 
     @classmethod
-    def _parse_safe_metadata(cls, safe_folder):
-        """Extract acquisition date, tile ID, and cloud cover (best-effort)
-        for a SAFE folder. Falls back to filename parsing if XML metadata
-        is unavailable.
+    def _parse_safe_metadata(cls, source_path, source_kind="safe"):
+        """Extract acquisition date, tile ID, and cloud cover for a scene.
+
+        `source_kind` selects how MTD_MSIL2A.xml is read:
+          * 'safe' — disk path to an extracted `.SAFE/` folder
+          * 'zip'  — disk path to a Copernicus `.zip` archive (XML is
+                     read in-memory via the stdlib `zipfile`).
 
         Returns dict with keys: date_acquired (date), tile_id, cloud_cover,
-        product_uri. Returns None if even the filename doesn't parse.
+        product_uri. Falls back to filename parsing if XML is missing or
+        unparseable (only `cloud_cover` is XML-derived). Returns None if
+        even the filename doesn't match the canonical S2 L2A pattern.
         """
-        basename = os.path.basename(safe_folder.rstrip(os.sep))
-        m = cls._SAFE_NAME_RE.match(basename)
+        raw_basename = os.path.basename(source_path.rstrip(os.sep))
+        # For zip we want the SAFE basename (strip .zip).
+        if source_kind == "zip" and raw_basename.lower().endswith(".zip"):
+            safe_basename = raw_basename[:-4]
+        else:
+            safe_basename = raw_basename
+
+        m = cls._SAFE_NAME_RE.match(safe_basename)
         if not m:
             return None
         date_str, _, tile_id = m.groups()
@@ -3757,19 +3835,30 @@ class Sentinel2Mosaic(object):
             "date_acquired": acquired,
             "tile_id": tile_id,
             "cloud_cover": None,
-            "product_uri": basename,
+            "product_uri": safe_basename,
         }
 
-        # Try to read cloud-cover from MTD_MSIL2A.xml. Namespaces in this
-        # XML are unstable across processing baselines, so we use a
-        # wildcard XPath ('{*}TAG') and don't fail if the tag is missing.
-        mtd_path = os.path.join(safe_folder, "MTD_MSIL2A.xml")
-        if os.path.isfile(mtd_path):
+        # Read MTD_MSIL2A.xml. Namespaces drift across baselines, so we
+        # match tag names by local name only and don't fail if the tag
+        # is missing.
+        xml_bytes = None
+        if source_kind == "zip":
+            xml_bytes = cls._read_safe_xml_from_zip(source_path, "MTD_MSIL2A.xml")
+        else:
+            mtd_path = os.path.join(source_path, "MTD_MSIL2A.xml")
+            if os.path.isfile(mtd_path):
+                try:
+                    with open(mtd_path, "rb") as fh:
+                        xml_bytes = fh.read()
+                except OSError:
+                    xml_bytes = None
+
+        if xml_bytes:
             try:
-                root = ET.parse(mtd_path).getroot()
+                root = ET.fromstring(xml_bytes)
                 for elem in root.iter():
                     tag = elem.tag.split("}", 1)[-1] if "}" in elem.tag else elem.tag
-                    if tag == "Cloud_Coverage_Assessment" or tag == "CLOUDY_PIXEL_PERCENTAGE":
+                    if tag in ("Cloud_Coverage_Assessment", "CLOUDY_PIXEL_PERCENTAGE"):
                         try:
                             meta["cloud_cover"] = float(elem.text)
                         except (TypeError, ValueError):
@@ -3783,14 +3872,26 @@ class Sentinel2Mosaic(object):
     # Per-scene processing
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _locate_band_files(safe_folder):
-        """Find the JP2 file for each band + SCL within a SAFE folder.
+    @classmethod
+    def _locate_band_files(cls, source_path, source_kind="safe"):
+        """Find the JP2 file (or VSI path) for each band + SCL.
 
-        Returns dict {band_name: jp2_path} including all 10 stack bands
-        and the SCL. Returns None on missing GRANULE structure.
+        `source_kind`:
+          * 'safe' — disk paths under {source_path}/GRANULE/L2A_*/IMG_DATA/...
+          * 'zip'  — `/vsizip/...` paths into the Copernicus archive
+
+        Returns dict {band_name: path} including all 10 stack bands and
+        the SCL. Returns None on missing GRANULE structure or an
+        unreadable zip.
         """
-        granule_dirs = glob.glob(os.path.join(safe_folder, "GRANULE", "L2A_*"))
+        if source_kind == "zip":
+            members = cls._list_zip_members(source_path)
+            if members is None:
+                return None
+            return cls._locate_band_files_vsi(source_path, members)
+
+        # Extracted SAFE folder.
+        granule_dirs = glob.glob(os.path.join(source_path, "GRANULE", "L2A_*"))
         if not granule_dirs:
             return None
         img_data = os.path.join(granule_dirs[0], "IMG_DATA")
@@ -3815,15 +3916,17 @@ class Sentinel2Mosaic(object):
         """Apply SCL mask + scale + resample-to-10m + stack into a single
         10-band float32 raster. Returns the saved raster path or None.
 
-        Implementation note: rather than build a giant single map-algebra
-        expression, we save each band as a temp raster (already masked
-        and scaled), then CompositeBands them into the 10-band stack.
-        This trades disk I/O for memory headroom — well-suited to the
-        ArcGIS Pro raster pipeline.
+        Reads bands from either an extracted `.SAFE/` folder (disk JP2)
+        or a Copernicus `.zip` archive via GDAL VSI (`/vsizip/...`).
+        Either way, the per-band resample step writes a 10 m GeoTIFF to
+        `scratch_dir`, so the (relatively expensive) JP2 decode is paid
+        exactly once per band — downstream operations (mask, scale,
+        composite, GeometricMedian) read from the cheap scratch GeoTIFFs.
         """
-        safe_folder = scene["path"]
+        source_path = scene["path"]
+        source_kind = scene.get("source_kind", "safe")
         scene_id = scene["metadata"]["product_uri"]
-        bands = self._locate_band_files(safe_folder)
+        bands = self._locate_band_files(source_path, source_kind)
         if not bands or "SCL" not in bands:
             arcpy.AddWarning("    Missing SCL or band data; scene skipped.")
             return None
