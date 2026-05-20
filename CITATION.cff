@@ -13,8 +13,9 @@ abstract: >
   composites (~25 indices + ~8 composites covering vegetation, water,
   built-up, and mineralogical / hydrothermal alteration targets),
   PCA / MNF / ICA statistical transformations, and Spectral Angle Mapper
-  classification. Designed for geological mapping at LNEG (Laboratório
-  Nacional de Energia e Geologia, Portugal).
+  classification. Used to support analytical work for the GENESIS
+  Horizon 2020 project (genesisnbs.eu), in particular processing
+  satellite imagery over the Faial Island (Azores) case study.
 type: software
 version: "1.0.0"
 date-released: "2026-05-20"
@@ -45,3 +46,12 @@ identifiers:
   - type: doi
     value: "10.5281/zenodo.PLACEHOLDER"
     description: "Concept DOI (latest release, via Zenodo)"
+
+references:
+  - type: website
+    title: "GENESIS — Nature-based Solutions for sustainable cities (Horizon 2020 project)"
+    url: "https://genesisnbs.eu"
+    notes: >
+      Parent research context. This toolbox is independently authored work
+      used in support of GENESIS NBS analytical tasks (Faial Island case
+      study). It is not an official project deliverable.

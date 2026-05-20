@@ -16,10 +16,13 @@ folders to cloud-removed multi-band mosaics, spectral indices, PCA/MNF/ICA
 transforms, and Spectral Angle Mapper classification — across all three
 sensors via a single sensor-aware design.
 
-Developed at **LNEG** (Laboratório Nacional de Energia e Geologia) for
-geological mapping, mineral exploration, and hydrothermal alteration
-detection across Portuguese and African study areas (Iberian Peninsula,
-Azores, Madeira, Cape Verde, Angola, Mozambique).
+Used to support analytical work for the **GENESIS Horizon 2020 project**
+([genesisnbs.eu](https://genesisnbs.eu)) — in particular for processing
+satellite imagery over the **Faial Island (Azores)** case study.
+Application areas include geological mapping, mineral exploration, and
+hydrothermal alteration detection, applicable across Portuguese and
+African study areas (Iberian Peninsula, Azores, Madeira, Cape Verde,
+Angola, Mozambique).
 
 ---
 
@@ -111,7 +114,9 @@ patent grant and patent-retaliation clauses apply per the Apache 2.0 terms.
 
 ## Acknowledgements
 
-- Developed at **LNEG** (Laboratório Nacional de Energia e Geologia)
+- Used to support analytical work within the **GENESIS** Horizon 2020 project ([genesisnbs.eu](https://genesisnbs.eu)) — particularly the Faial Island case study
 - Spectral index formulations from the published remote-sensing literature; mineral indices for ASTER follow Cudahy (alteration), Mars & Rowan (clays), and Sabins (iron oxides)
 - PCA / MNF / ICA implementations follow Green et al. (1988) for MNF and use scikit-learn's FastICA
 - Cloud-masking conventions: Landsat C2L2 QA_PIXEL (Vermote et al.), Sentinel-2 SCL (Sen2Cor), ASTER QA Data Plane (LP DAAC)
+
+> Note: this toolbox is independently authored work used in support of GENESIS NBS analytical tasks. It is not an official deliverable of the GENESIS Horizon 2020 consortium. For formal project deliverables, see [genesisnbs.eu](https://genesisnbs.eu).
