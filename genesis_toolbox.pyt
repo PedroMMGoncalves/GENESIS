@@ -5243,6 +5243,35 @@ class AsterMosaic(object):
                     "per-scene stacks from previous runs will be reused"
                 )
 
+            # Snap raster anchors every per-scene Resample to a single
+            # 15m pixel grid covering the AOI. Without it, scenes from
+            # different overpasses drift by a fraction of a cell on
+            # save, and Phase 4's _apply_multitemporal_refinement fails
+            # when np.stack(brightness_arrays) sees off-by-one shapes.
+            # Only set when an AOI is active — without env.extent the
+            # constant-raster anchor has nothing to cover.
+            if arcpy.env.mask:
+                try:
+                    snap_anchor = os.path.join(scratch_dir, "_snap_anchor.tif")
+                    if not os.path.exists(snap_anchor):
+                        prev_cell = arcpy.env.cellSize
+                        arcpy.env.cellSize = 15
+                        arcpy.sa.CreateConstantRaster(
+                            1, "INTEGER", 15
+                        ).save(snap_anchor)
+                        arcpy.env.cellSize = prev_cell
+                    arcpy.env.snapRaster = snap_anchor
+                    arcpy.AddMessage(
+                        "  Snap:       15m grid anchored to AOI "
+                        "(eliminates per-scene cell drift)"
+                    )
+                except Exception as e:
+                    arcpy.AddWarning(
+                        f"  Snap raster setup failed ({e}); Phase 4 "
+                        "temporal refinement may be skipped due to "
+                        "shape mismatch"
+                    )
+
             # Phase 1 — discover scenes (TIFF and HDF)
             arcpy.AddMessage("\n▶ Phase 1 — Scene discovery")
             scenes = self._find_aster_scenes(data_folder)
