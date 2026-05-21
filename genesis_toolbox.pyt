@@ -137,6 +137,72 @@ def _apply_aoi_mask_and_save(unmasked_path, mask_feature, gdb_path,
 
 
 # ---------------------------------------------------------------------------
+# Phase-logging context manager
+# ---------------------------------------------------------------------------
+
+class phase:
+    """Context manager that wraps a phase of work with start/end markers.
+
+    Standardises the ``▶ Phase N — ...`` / ``✓ Phase N in Xs`` /
+    ``✗ Phase N failed after Xs`` logging idiom that previously lived
+    open-coded in every mosaic tool, and exposes the elapsed time as
+    ``.elapsed`` so callers can fold it into a richer close-line.
+
+    Two usage modes:
+
+      Auto-close (simple sites, prints "✓ {label} in {t:.1f}s" on
+      successful exit)::
+
+          with phase("Phase 5 — Merge / mask / cleanup"):
+              ...
+
+      Quiet-close (sites that want to print their own enriched close
+      line — averaged per-scene timings, scene-count breakdowns, etc.
+      The context manager still prints the ▶ entry line and the ✗
+      failure line, just suppresses its own ✓ close)::
+
+          with phase("Phase 3 — Per-scene processing", count=n,
+                     quiet_close=True) as p:
+              ... work ...
+              arcpy.AddMessage(f"  ✓ {n} scenes in {p.elapsed:.1f}s "
+                               f"(avg {avg:.1f}s/scene)")
+
+    On exception the context manager prints ``✗ {label} failed after
+    Xs`` as a warning and re-raises, so phase failures stay visible in
+    the GP dialog without callers needing a separate try/except just
+    for logging.
+    """
+
+    def __init__(self, label, count=None, quiet_close=False,
+                 message_callback=None):
+        self.label = label
+        self.count = count
+        self.quiet_close = quiet_close
+        self._msg = message_callback or arcpy.AddMessage
+        self._start = None
+        self.elapsed = 0.0
+
+    def __enter__(self):
+        line = f"\n▶ {self.label}"
+        if self.count is not None:
+            line += f" ({self.count} scene{'s' if self.count != 1 else ''})"
+        self._msg(line)
+        self._start = datetime.now()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.elapsed = (datetime.now() - self._start).total_seconds()
+        if exc_type is None:
+            if not self.quiet_close:
+                self._msg(f"  ✓ {self.label} in {self.elapsed:.1f}s")
+        else:
+            arcpy.AddWarning(
+                f"  ✗ {self.label} failed after {self.elapsed:.1f}s: {exc_val}"
+            )
+        return False  # never suppress — exceptions propagate normally
+
+
+# ---------------------------------------------------------------------------
 # Output sanity check
 # ---------------------------------------------------------------------------
 
@@ -2604,26 +2670,25 @@ class LandsatMosaic(object):
 
             # Phase 4 — GeometricMedian
             output_path = os.path.join(gdb_path, f"{mosaic_name}_Geomedian")
-            median_start = datetime.now()
+            with phase(
+                f"Phase 4 — GeometricMedian over {len(multiband_rasters)} stacks",
+                quiet_close=True,
+            ) as ph:
+                arcpy.AddMessage(
+                    "  Silent phase (arcpy.ia.GeometricMedian has no per-iteration hook)."
+                )
+                arcpy.SetProgressor("default", "Computing GeometricMedian...")
+                geomedian = arcpy.ia.GeometricMedian(
+                    multiband_rasters,
+                    epsilon=0.001,
+                    max_iteration=20,
+                    extent_type="UnionOf",
+                    cellsize_type="FirstOf",
+                )
+                geomedian.save(output_path)
+                arcpy.ResetProgressor()
             arcpy.AddMessage(
-                f"\n▶ Phase 4 — GeometricMedian over {len(multiband_rasters)} stacks"
-            )
-            arcpy.AddMessage(
-                "  Silent phase (arcpy.ia.GeometricMedian has no per-iteration hook)."
-            )
-            arcpy.SetProgressor("default", "Computing GeometricMedian...")
-            geomedian = arcpy.ia.GeometricMedian(
-                multiband_rasters,
-                epsilon=0.001,
-                max_iteration=20,
-                extent_type="UnionOf",
-                cellsize_type="FirstOf",
-            )
-            geomedian.save(output_path)
-            arcpy.ResetProgressor()
-            median_elapsed = (datetime.now() - median_start).total_seconds()
-            arcpy.AddMessage(
-                f"  ✓ GeometricMedian complete in {median_elapsed:.1f}s "
+                f"  ✓ GeometricMedian complete in {ph.elapsed:.1f}s "
                 f"→ {os.path.basename(output_path)}"
             )
 
@@ -4421,48 +4486,48 @@ class Sentinel2Mosaic(object):
                 )
 
             # Step 4: per-tile geometric median.
-            arcpy.AddMessage(
-                f"\n▶ Phase 4 — GeometricMedian over {len(scenes_by_tile)} tile(s)"
-            )
             tile_mosaics = []
-            median_phase_start = datetime.now()
-            arcpy.SetProgressor(
-                "step", "Per-tile GeometricMedian", 0, len(scenes_by_tile), 1
-            )
-            for ti, (tile, stacked_paths) in enumerate(scenes_by_tile.items(), 1):
-                if arcpy.env.isCancelled:
-                    arcpy.ResetProgressor()
-                    arcpy.AddWarning(
-                        f"  ✗ Cancelled after {ti-1}/{len(scenes_by_tile)} tiles."
-                    )
-                    return None
-                arcpy.SetProgressorLabel(
-                    f"[{ti}/{len(scenes_by_tile)}] {tile} ({len(stacked_paths)} scenes)"
+            with phase(
+                f"Phase 4 — GeometricMedian over {len(scenes_by_tile)} tile(s)",
+                quiet_close=True,
+            ) as ph:
+                arcpy.SetProgressor(
+                    "step", "Per-tile GeometricMedian", 0, len(scenes_by_tile), 1
                 )
-                tile_start = datetime.now()
-                try:
-                    tile_mosaic_name = f"{mosaic_name}_{tile}"
-                    tile_mosaic_path = os.path.join(gdb_path, tile_mosaic_name)
-                    median = arcpy.ia.GeometricMedian(
-                        stacked_paths,
-                        epsilon=0.001,
-                        max_iteration=20,
-                        extent_type="UnionOf",
-                        cellsize_type="FirstOf",
+                for ti, (tile, stacked_paths) in enumerate(scenes_by_tile.items(), 1):
+                    if arcpy.env.isCancelled:
+                        arcpy.ResetProgressor()
+                        arcpy.AddWarning(
+                            f"  ✗ Cancelled after {ti-1}/{len(scenes_by_tile)} tiles."
+                        )
+                        return None
+                    arcpy.SetProgressorLabel(
+                        f"[{ti}/{len(scenes_by_tile)}] {tile} ({len(stacked_paths)} scenes)"
                     )
-                    median.save(tile_mosaic_path)
-                    tile_mosaics.append(tile_mosaic_path)
-                    arcpy.AddMessage(
-                        f"  ✓ [{tile}] {len(stacked_paths)} scenes → "
-                        f"{(datetime.now() - tile_start).total_seconds():.1f}s"
-                    )
-                except Exception as e:
-                    arcpy.AddError(f"  ✗ [{tile}] GeometricMedian failed: {e}")
-                    continue
-                arcpy.SetProgressorPosition(ti)
-            arcpy.ResetProgressor()
+                    tile_start = datetime.now()
+                    try:
+                        tile_mosaic_name = f"{mosaic_name}_{tile}"
+                        tile_mosaic_path = os.path.join(gdb_path, tile_mosaic_name)
+                        median = arcpy.ia.GeometricMedian(
+                            stacked_paths,
+                            epsilon=0.001,
+                            max_iteration=20,
+                            extent_type="UnionOf",
+                            cellsize_type="FirstOf",
+                        )
+                        median.save(tile_mosaic_path)
+                        tile_mosaics.append(tile_mosaic_path)
+                        arcpy.AddMessage(
+                            f"  ✓ [{tile}] {len(stacked_paths)} scenes → "
+                            f"{(datetime.now() - tile_start).total_seconds():.1f}s"
+                        )
+                    except arcpy.ExecuteError as e:
+                        arcpy.AddError(f"  ✗ [{tile}] GeometricMedian failed: {e}")
+                        continue
+                    arcpy.SetProgressorPosition(ti)
+                arcpy.ResetProgressor()
             arcpy.AddMessage(
-                f"  ✓ Phase 4 in {(datetime.now() - median_phase_start).total_seconds():.1f}s "
+                f"  ✓ Phase 4 in {ph.elapsed:.1f}s "
                 f"({len(tile_mosaics)} tile mosaic(s))"
             )
 
@@ -5615,24 +5680,24 @@ class AsterMosaic(object):
             )
 
         # Phase 5 — GeometricMedian
-        arcpy.AddMessage(
-            f"\n▶ Phase 5 [{label}] — GeometricMedian over {len(stacked_paths)} stacks"
-        )
-        arcpy.SetProgressor("default", f"Computing GeometricMedian [{label}]...")
-        median_start = datetime.now()
         output_path = os.path.join(gdb_path, output_name)
+        arcpy.SetProgressor("default", f"Computing GeometricMedian [{label}]...")
         try:
-            median = arcpy.ia.GeometricMedian(
-                stacked_paths,
-                epsilon=0.001,
-                max_iteration=20,
-                extent_type="UnionOf",
-                cellsize_type="FirstOf",
-            )
-            median.save(output_path)
-            arcpy.ResetProgressor()
+            with phase(
+                f"Phase 5 [{label}] — GeometricMedian over {len(stacked_paths)} stacks",
+                quiet_close=True,
+            ) as ph:
+                median = arcpy.ia.GeometricMedian(
+                    stacked_paths,
+                    epsilon=0.001,
+                    max_iteration=20,
+                    extent_type="UnionOf",
+                    cellsize_type="FirstOf",
+                )
+                median.save(output_path)
+                arcpy.ResetProgressor()
             arcpy.AddMessage(
-                f"  ✓ GeometricMedian in {(datetime.now() - median_start).total_seconds():.1f}s "
+                f"  ✓ GeometricMedian in {ph.elapsed:.1f}s "
                 f"→ {os.path.basename(output_path)}"
             )
             _sanity_check_output(
