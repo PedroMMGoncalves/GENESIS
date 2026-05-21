@@ -3562,13 +3562,37 @@ class LandsatMosaic(object):
 # ---------------------------------------------------------------------------
 
 
-# SCL classes to mask (Sen2Cor Scene Classification Layer):
-#   3 = Cloud shadows
-#   8 = Cloud medium probability
-#   9 = Cloud high probability
+# Sen2Cor Scene Classification Layer (SCL) class meanings:
+#   0  = No data           (NoData already)
+#   1  = Saturated/defective
+#   2  = Dark area pixels  (can be legitimate dark terrain — e.g. basalt)
+#   3  = Cloud shadow
+#   4  = Vegetation        (keep)
+#   5  = Bare soil         (keep)
+#   6  = Water             (keep)
+#   7  = Unclassified      (Sen2Cor often catches cloud edges here)
+#   8  = Cloud medium probability
+#   9  = Cloud high probability
 #   10 = Thin cirrus
-# (Class 11 = snow/ice is kept — relevant signal for some terrestrial work.)
-_S2_SCL_CLOUD_CLASSES = (3, 8, 9, 10)
+#   11 = Snow / ice        (false-positive over terrain without permanent snow)
+_S2_SCL_PRESETS = {
+    # Original Sen2Cor default — leaves unclassified pixels and any snow
+    # misclassifications in the output. Misses cloud edges Sen2Cor doesn't
+    # tag.
+    "Standard": (3, 8, 9, 10),
+    # Recommended for most AOIs: adds saturated, unclassified (cloud edges),
+    # and snow/ice (false positives anywhere without permanent snow). Used
+    # by default.
+    "Aggressive": (1, 3, 7, 8, 9, 10, 11),
+    # Adds dark-area pixels — useful where cloud shadows aren't fully
+    # tagged, but can over-mask legitimate dark terrain (volcanic basalt,
+    # burned areas). Use with care.
+    "Maximum": (1, 2, 3, 7, 8, 9, 10, 11),
+}
+# Backwards compatibility — kept so tests/scripts referencing the old name
+# don't break. The active mask is now selected by the GP parameter and
+# defaults to Aggressive.
+_S2_SCL_CLOUD_CLASSES = _S2_SCL_PRESETS["Aggressive"]
 
 # Sentinel-2 L2A scale factor: DN * 0.0001 = surface reflectance.
 _S2_REFLECTANCE_SCALE = 0.0001
@@ -3717,6 +3741,36 @@ class Sentinel2Mosaic(object):
         )
         apply_temporal.value = False
 
+        # SCL aggressiveness preset. The Aggressive default (1, 3, 7, 8,
+        # 9, 10, 11) catches the cloud-edge halo Sen2Cor leaves as
+        # "Unclassified" + the snow/ice false positives the original
+        # default (3, 8, 9, 10) missed. See _S2_SCL_PRESETS docstring
+        # near the top of this file for the full class table.
+        cloud_aggressiveness = arcpy.Parameter(
+            displayName="Cloud Mask Aggressiveness",
+            name="cloud_aggressiveness",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input",
+        )
+        cloud_aggressiveness.filter.list = list(_S2_SCL_PRESETS.keys())
+        cloud_aggressiveness.value = "Aggressive"
+
+        # Cloud-mask buffer — dilates the SCL mask by N pixels via
+        # FocalStatistics MAXIMUM. Catches the 1-2 pixel halo around
+        # clouds that Sen2Cor classifies as Vegetation/Bare-soil but is
+        # in fact thin cloud / partial cover.
+        cloud_buffer = arcpy.Parameter(
+            displayName="Cloud Mask Buffer (pixels)",
+            name="cloud_buffer_pixels",
+            datatype="GPLong",
+            parameterType="Optional",
+            direction="Input",
+        )
+        cloud_buffer.value = 2
+        cloud_buffer.filter.type = "Range"
+        cloud_buffer.filter.list = [0, 10]
+
         mask_feature = arcpy.Parameter(
             displayName="Optional AOI Mask Feature (polygon)",
             name="mask_feature",
@@ -3737,7 +3791,9 @@ class Sentinel2Mosaic(object):
 
         return [
             gdb, mosaic_name, data_folder, region, time_type,
-            year, month, season, apply_temporal, mask_feature, save_stats,
+            year, month, season, apply_temporal,
+            cloud_aggressiveness, cloud_buffer,
+            mask_feature, save_stats,
         ]
 
     def updateParameters(self, parameters):
@@ -3798,8 +3854,17 @@ class Sentinel2Mosaic(object):
             month = parameters[6].value
             season = parameters[7].valueAsText
             apply_temporal = bool(parameters[8].value)
-            mask_feature = parameters[9].valueAsText
-            save_stats = bool(parameters[10].value)
+            cloud_aggressiveness = parameters[9].valueAsText or "Aggressive"
+            cloud_buffer_pixels = parameters[10].value if parameters[10].value is not None else 2
+            mask_feature = parameters[11].valueAsText
+            save_stats = bool(parameters[12].value)
+
+            # Resolve aggressiveness preset → SCL class tuple. The dropdown
+            # constrains the value to the preset keys; fall back defensively
+            # to Aggressive if somehow null.
+            scl_classes = _S2_SCL_PRESETS.get(
+                cloud_aggressiveness, _S2_SCL_PRESETS["Aggressive"]
+            )
 
             # ----------------------------------------------------------------
             # AOI-first scoping. See LandsatMosaic.execute() for the full
@@ -3817,6 +3882,10 @@ class Sentinel2Mosaic(object):
             arcpy.AddMessage("=" * 60)
             arcpy.AddMessage(f"  Output:     {gdb_path}\\{mosaic_name}")
             arcpy.AddMessage(f"  Source:     {data_folder}")
+            arcpy.AddMessage(
+                f"  Cloud mask: {cloud_aggressiveness} "
+                f"(SCL classes {list(scl_classes)}, buffer {cloud_buffer_pixels}px)"
+            )
 
             if mask_feature and arcpy.Exists(mask_feature):
                 arcpy.env.mask = mask_feature
@@ -3914,7 +3983,9 @@ class Sentinel2Mosaic(object):
                 )
                 scene_start = datetime.now()
                 try:
-                    stacked_path = self._process_scene(scene, scratch_dir)
+                    stacked_path = self._process_scene(
+                        scene, scratch_dir, scl_classes, cloud_buffer_pixels,
+                    )
                 except Exception as e:
                     arcpy.AddWarning(f"  ✗ {os.path.basename(scene['path'])}: {e}")
                     continue
@@ -4373,7 +4444,8 @@ class Sentinel2Mosaic(object):
             out["SCL"] = scl[0]
         return out
 
-    def _process_scene(self, scene, scratch_dir):
+    def _process_scene(self, scene, scratch_dir,
+                       scl_classes=None, buffer_pixels=0):
         """Apply SCL mask + scale + resample-to-10m + stack into a single
         10-band float32 raster. Returns the saved raster path or None.
 
@@ -4383,7 +4455,19 @@ class Sentinel2Mosaic(object):
         `scratch_dir`, so the (relatively expensive) JP2 decode is paid
         exactly once per band — downstream operations (mask, scale,
         composite, GeometricMedian) read from the cheap scratch GeoTIFFs.
+
+        Args:
+            scl_classes: Tuple of SCL class integers to mask. Defaults
+                to the Aggressive preset (saturated + cloud shadow +
+                unclassified + medium/high cloud + cirrus + snow/ice).
+            buffer_pixels: Dilate the cloud mask by N pixels via
+                FocalStatistics MAXIMUM. Catches the 1-2 pixel halo
+                around clouds that Sen2Cor misclassifies as Vegetation
+                or Bare-soil. 0 = no dilation.
         """
+        if scl_classes is None:
+            scl_classes = _S2_SCL_CLOUD_CLASSES  # back-compat default
+
         source_path = scene["path"]
         source_kind = scene.get("source_kind", "safe")
         scene_id = scene["metadata"]["product_uri"]
@@ -4401,9 +4485,27 @@ class Sentinel2Mosaic(object):
         arcpy.management.Resample(bands["SCL"], scl_10m_path, 10, "NEAREST")
         scl_10m = arcpy.sa.Raster(scl_10m_path)
         cloud_expr = None
-        for klass in _S2_SCL_CLOUD_CLASSES:
+        for klass in scl_classes:
             term = (scl_10m == klass)
             cloud_expr = term if cloud_expr is None else (cloud_expr | term)
+
+        # Optional buffer: dilate the SCL cloud mask so the 1-2 pixel
+        # halo Sen2Cor misclassifies as Vegetation/Bare-soil also gets
+        # masked. Implemented via FocalStatistics MAXIMUM over a
+        # circular neighbourhood; the binary mask treats any non-zero
+        # focal max as "near cloud" → mask.
+        if buffer_pixels and buffer_pixels > 0:
+            buffered_path = os.path.join(
+                scratch_dir, f"{scene_id}_cloud_buffer.tif"
+            )
+            buffered = arcpy.sa.FocalStatistics(
+                cloud_expr,
+                arcpy.sa.NbrCircle(buffer_pixels, "CELL"),
+                "MAXIMUM",
+                "DATA",
+            )
+            buffered.save(buffered_path)
+            cloud_expr = arcpy.sa.Raster(buffered_path) > 0
 
         # Process each band: resample if 20m, scale to reflectance,
         # apply cloud mask, save.
