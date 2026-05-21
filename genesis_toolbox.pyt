@@ -41,6 +41,9 @@
 
 import arcpy
 import os
+import gc
+import shutil
+import time
 from datetime import datetime
 import arcpy.sa
 import arcpy.ia
@@ -59,6 +62,72 @@ from arcpy.sa import Float, Divide, Times, Con, SetNull, Plus, Minus
 from arcpy.management import CompositeBands
 
 TOOLBOX_VERSION = "1.0.0-phase3"
+
+
+# ---------------------------------------------------------------------------
+# Scratch folder cleanup
+# ---------------------------------------------------------------------------
+
+def _cleanup_scratch_folder(scratch_dir):
+    """Robust per-file cleanup of a scratch folder.
+
+    ArcGIS Pro / GDAL drivers (JP2, GeoTIFF, /vsitar/, /vsizip/) cache
+    file handles for tens of seconds to minutes after the rasters that
+    used them go out of scope. A single `shutil.rmtree(..., ignore_errors=True)`
+    at the end of a run frequently leaves leftover files behind.
+
+    Strategy: walk the folder, retry per file with growing delays. Each
+    retry pass calls gc.collect() to drop Python references and
+    arcpy.management.ClearWorkspaceCache() to flush arcpy's internal
+    raster cache. Per-file (rather than per-folder) so partial release
+    is still useful — files that ARE unlocked get deleted on each pass.
+
+    Sequence: 0.5 s pre-sleep → try-all → 1 s sleep → retry → 2 s →
+    retry → 3 s → final pass. Total max ~6.5 s. Files still locked
+    after that are reported with a single warning; never raises.
+    """
+    if not scratch_dir or not os.path.isdir(scratch_dir):
+        return
+
+    # Pre-release window: drop refs + flush arcpy cache + give Windows
+    # a moment to release handles.
+    gc.collect()
+    try:
+        arcpy.management.ClearWorkspaceCache()
+    except Exception:
+        pass
+    time.sleep(0.5)
+
+    # Collect all files (recursive).
+    all_files = []
+    for root, _, files in os.walk(scratch_dir):
+        all_files.extend(os.path.join(root, f) for f in files)
+
+    failed = list(all_files)
+    for attempt in range(3):
+        still_failed = []
+        for path in failed:
+            try:
+                os.remove(path)
+            except (PermissionError, OSError):
+                still_failed.append(path)
+        failed = still_failed
+        if not failed:
+            break
+        time.sleep(1.0 * (attempt + 1))  # 1 s, 2 s, 3 s
+        gc.collect()
+
+    # Tear down the (hopefully empty) directory tree.
+    try:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+    if failed or os.path.isdir(scratch_dir):
+        arcpy.AddWarning(
+            f"  Scratch folder partially retained ({len(failed)} file(s) "
+            f"still locked by Pro/GDAL). Safe to delete manually: {scratch_dir}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2194,7 +2263,7 @@ class LandsatMosaic(object):
                 scene_start = datetime.now()
 
                 # Per-scene subfolder so vmask.tif + Bn.tif don't collide
-                # between scenes. shutil.rmtree(scratch_dir) cleans the lot.
+                # between scenes. _cleanup_scratch_folder() handles the lot.
                 scene_scratch = os.path.join(
                     scratch_dir, f"s{composite_idx:04d}"
                 )
@@ -2296,42 +2365,15 @@ class LandsatMosaic(object):
             return None
 
         finally:
-            # Cleanup with a two-pass retry. The first pass usually works,
-            # but on Windows Pro sometimes holds a file lock on a temp
-            # composite even after .save() / GeometricMedian return —
-            # gc.collect() + clearing the arcpy workspace cache + a brief
-            # sleep typically releases them. If files survive both passes
-            # we report them as a warning rather than fail the run.
             if multiband_rasters:
                 arcpy.AddMessage(
                     f"  Cleaning up scratch folder "
                     f"({len(multiband_rasters)} composite(s))..."
                 )
-            try:
-                import shutil
-                if 'scratch_dir' in locals() and os.path.isdir(scratch_dir):
-                    shutil.rmtree(scratch_dir, ignore_errors=True)
-                    if os.path.isdir(scratch_dir):
-                        # First pass left files locked — force GC, clear
-                        # arcpy raster cache, brief sleep, try again.
-                        import gc
-                        import time as _time
-                        gc.collect()
-                        try:
-                            arcpy.management.ClearWorkspaceCache()
-                        except Exception:
-                            pass
-                        _time.sleep(1.0)
-                        shutil.rmtree(scratch_dir, ignore_errors=True)
-                        if os.path.isdir(scratch_dir):
-                            arcpy.AddWarning(
-                                f"  Scratch folder {scratch_dir} could not "
-                                f"be fully removed (file locks held by Pro). "
-                                f"It is safe to delete manually."
-                            )
-            except Exception as e:
-                arcpy.AddWarning(f"  Scratch cleanup failed (non-fatal): {e}")
-                    
+            if 'scratch_dir' in locals():
+                _cleanup_scratch_folder(scratch_dir)
+
+
     def execute(self, parameters, messages):
         try:
             # Check out necessary extensions
@@ -4155,33 +4197,7 @@ class Sentinel2Mosaic(object):
             return None
 
         finally:
-            # Cleanup scratch.
-            if scratch_dir and os.path.isdir(scratch_dir):
-                # Two-pass retry — Pro sometimes holds file locks on
-                # scratch GeoTIFFs after .save() returns. gc.collect()
-                # + ClearWorkspaceCache + brief sleep usually releases
-                # them. Survivors are warned, not silently leaked.
-                try:
-                    import shutil
-                    shutil.rmtree(scratch_dir, ignore_errors=True)
-                    if os.path.isdir(scratch_dir):
-                        import gc
-                        import time as _time
-                        gc.collect()
-                        try:
-                            arcpy.management.ClearWorkspaceCache()
-                        except Exception:
-                            pass
-                        _time.sleep(1.0)
-                        shutil.rmtree(scratch_dir, ignore_errors=True)
-                        if os.path.isdir(scratch_dir):
-                            arcpy.AddWarning(
-                                f"  Scratch folder {scratch_dir} could not "
-                                f"be fully removed (file locks held by Pro). "
-                                f"It is safe to delete manually."
-                            )
-                except Exception:
-                    pass
+            _cleanup_scratch_folder(scratch_dir)
             if arcpy.CheckExtension("Spatial") == "Available":
                 arcpy.CheckInExtension("Spatial")
 
@@ -5126,32 +5142,7 @@ class AsterMosaic(object):
             return None
 
         finally:
-            if scratch_dir and os.path.isdir(scratch_dir):
-                # Two-pass retry — Pro sometimes holds file locks on
-                # scratch GeoTIFFs after .save() returns. gc.collect()
-                # + ClearWorkspaceCache + brief sleep usually releases
-                # them. Survivors are warned, not silently leaked.
-                try:
-                    import shutil
-                    shutil.rmtree(scratch_dir, ignore_errors=True)
-                    if os.path.isdir(scratch_dir):
-                        import gc
-                        import time as _time
-                        gc.collect()
-                        try:
-                            arcpy.management.ClearWorkspaceCache()
-                        except Exception:
-                            pass
-                        _time.sleep(1.0)
-                        shutil.rmtree(scratch_dir, ignore_errors=True)
-                        if os.path.isdir(scratch_dir):
-                            arcpy.AddWarning(
-                                f"  Scratch folder {scratch_dir} could not "
-                                f"be fully removed (file locks held by Pro). "
-                                f"It is safe to delete manually."
-                            )
-                except Exception:
-                    pass
+            _cleanup_scratch_folder(scratch_dir)
             if arcpy.CheckExtension("Spatial") == "Available":
                 arcpy.CheckInExtension("Spatial")
 
