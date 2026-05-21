@@ -55,8 +55,12 @@ import tarfile
 import xml.etree.ElementTree as ET
 import zipfile
 import numpy as np
-from sklearn.decomposition import FastICA
 import scipy.stats
+# scikit-learn is intentionally NOT a dependency. The Noise Transform
+# tool's ICA pass uses a pure-numpy FastICA (Hyvärinen parallel /
+# logcosh) defined as _fast_ica_numpy below — no external ML stack
+# required, so the toolbox loads on a stock ArcGIS Pro Python
+# environment without any conda customisation.
 from arcpy.ia import ExtractBand
 from arcpy.sa import Float, Divide, Times, Con, SetNull, Plus, Minus
 from arcpy.management import CompositeBands
@@ -6219,6 +6223,67 @@ class AsterMosaic(object):
             return date.month in season_months[pattern][season.lower()]
         except KeyError:
             return False
+
+
+# ---------------------------------------------------------------------------
+# Pure-numpy FastICA (Hyvärinen parallel algorithm, symmetric
+# decorrelation, ``logcosh`` non-linearity). Replaces the previous
+# ``sklearn.decomposition.FastICA`` dependency so the toolbox loads on
+# Pro environments that don't have ``scikit-learn`` installed.
+#
+# Matches the sklearn API the Noise Transform tool relies on:
+#   - Input ``X`` is shape ``(n_samples, n_features)`` and assumed
+#     already whitened (the caller does the MNF whitening upstream).
+#   - Returns ``(S, W, n_iter)`` where ``S`` has shape
+#     ``(n_samples, n_features)`` (all components — caller truncates
+#     to the requested ``n_components``), ``W`` has shape
+#     ``(n_features, n_features)`` (unmixing matrix), and ``n_iter``
+#     is the iteration count at convergence (for logging).
+# ---------------------------------------------------------------------------
+
+def _sym_decorrelation(W):
+    """Symmetric decorrelation: ``W' = (W W^T)^(-1/2) W``."""
+    s, u = np.linalg.eigh(W @ W.T)
+    return (u * (1.0 / np.sqrt(s))) @ u.T @ W
+
+
+def _fast_ica_numpy(X, max_iter=1000, tol=1e-4, random_state=None):
+    """FastICA (Hyvärinen, parallel) on already-whitened ``X``.
+
+    Drop-in replacement for ``sklearn.decomposition.FastICA`` with
+    ``whiten=False``, ``algorithm='parallel'``, and the default
+    ``logcosh`` non-linearity. No external dependencies.
+    """
+    rng = np.random.RandomState(random_state)
+    n_samples, n_features = X.shape
+    X_T = X.T  # (n_features, n_samples) — Hyvärinen convention
+
+    W = rng.normal(size=(n_features, n_features)).astype(X.dtype, copy=False)
+    W = _sym_decorrelation(W)
+
+    n_iter = 0
+    for n_iter in range(1, max_iter + 1):
+        # g(u) = tanh(u), g'(u) = 1 - tanh(u)^2  (logcosh non-linearity)
+        WX = W @ X_T
+        g_wx = np.tanh(WX)
+        gp_mean = (1.0 - g_wx ** 2).mean(axis=1)
+
+        # FastICA update: W_new = E[X g(W X)^T] - diag(E[g'(W X)]) W
+        W_new = (g_wx @ X_T.T) / n_samples - gp_mean[:, None] * W
+        W_new = _sym_decorrelation(W_new)
+
+        # Convergence: each row of W_new should be parallel (cos=1 or -1)
+        # to the corresponding row of W. ``np.diag(W_new @ W.T)`` gives
+        # the per-row cosines.
+        delta = float(np.max(np.abs(np.abs(np.diag(W_new @ W.T)) - 1.0)))
+        W = W_new
+        if delta < tol:
+            break
+
+    S = (W @ X_T).T  # (n_samples, n_features)
+    return S, W, n_iter
+
+
 class Transformations(object):
     """Tool 05 — Statistical transformations (PCA / MNF / ICA).
 
@@ -7078,8 +7143,6 @@ class Transformations(object):
         """
         log = message_callback or (lambda msg: None)
         try:
-            from sklearn.decomposition import FastICA
-
             ica_stats = ICAStatistics()
 
             shape = data.shape
@@ -7107,20 +7170,17 @@ class Transformations(object):
 
             log(f"Performing FastICA (random_state={random_state})...")
 
-            ica = FastICA(
-                n_components=n_components,
-                whiten=False,
+            # Pure-numpy FastICA (logcosh, parallel, symmetric decorrelation).
+            # Returns all components; we truncate to n_components below so
+            # downstream shapes match the original sklearn-based path.
+            transformed_valid, W_full, ica_n_iter = _fast_ica_numpy(
+                whitened,
                 max_iter=1000,
                 tol=1e-4,
                 random_state=random_state,
             )
-            transformed_valid = ica.fit_transform(whitened)
-            # FastICA with whiten=False ignores the n_components argument and
-            # returns one component per input band. Truncate post-hoc so
-            # downstream shapes (transformed_data reshape, unmixing matrix,
-            # kurtosis_values) all agree with the requested n_components.
             transformed_valid = transformed_valid[:, :n_components]
-            W = ica.components_[:n_components, :]
+            W = W_full[:n_components, :]
 
             # Kurtosis (peakedness) per component — high |kurtosis| ≈ more
             # independent / non-Gaussian, used by select_by_kurtosis.
@@ -7148,24 +7208,18 @@ class Transformations(object):
             ica_stats.unmixing_matrix = unmixing
             ica_stats.whitening_matrix = whitening
             ica_stats.dewhitening_matrix = dewhitening
-            ica_stats.n_iterations = ica.n_iter_
+            ica_stats.n_iterations = ica_n_iter
             ica_stats.random_state = random_state
 
             transformed_data = np.zeros((flat_data.shape[0], n_components))
             transformed_data[is_not_nan] = transformed_valid
 
-            log(f"ICA completed in {ica.n_iter_} iterations")
+            log(f"ICA completed in {ica_n_iter} iterations")
 
             transformed_data = transformed_data.reshape(shape[0], shape[1], n_components)
 
             return transformed_data, ica_stats
 
-        except ImportError:
-            # AddError stays inline: this branch fires before any callback is
-            # used and surfaces a runtime-dependency problem to the GP dialog.
-            arcpy.AddError("scikit-learn is not available. Please install scikit-learn to use ICA")
-            stats['errors'].append("scikit-learn is not available")
-            raise
         except Exception as e:
             stats['errors'].append(f"ICA Error: {str(e)}")
             raise
