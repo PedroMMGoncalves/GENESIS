@@ -2158,8 +2158,8 @@ class LandsatMosaic(object):
             arcpy.AddMessage(f"\n▶ Phase 3 — Per-scene composites ({total} scenes)")
             arcpy.AddMessage(f"  Scratch: {scratch_dir}")
             arcpy.AddMessage(
-                f"  Mode: {'AOI-extent' if aoi_active else 'full scene extent'} "
-                f"(value_mask materialised once per scene to avoid 7× QA decode)"
+                "  Mode: lazy Cons → CompositeBands (full-scene); value_mask "
+                "materialised once per scene to avoid 7× QA decode"
             )
 
             arcpy.SetProgressor(
@@ -2212,26 +2212,27 @@ class LandsatMosaic(object):
                 value_mask.save(value_mask_path)
                 value_mask_raster = arcpy.Raster(value_mask_path)
 
-                if aoi_active:
-                    # AOI: materialise each cleaned band so its on-disk
-                    # extent IS the AOI extent. arcpy.management.CompositeBands
-                    # ignores env.extent, so it must see AOI-sized inputs.
-                    cleaned_band_paths = []
-                    for n in range(1, 8):
-                        band_raster = arcpy.Raster(band_paths[f"B{n}"])
-                        cleaned = Con(value_mask_raster, band_raster)
-                        band_path = os.path.join(scene_scratch, f"B{n}.tif")
-                        cleaned.save(band_path)
-                        cleaned_band_paths.append(band_path)
-                    composite_inputs = cleaned_band_paths
-                else:
-                    # No AOI: keep per-band Cons lazy (avoid wasteful
-                    # full-extent disk writes) but reference the
-                    # materialised value_mask so QA decode is still 1×.
-                    composite_inputs = [
-                        Con(value_mask_raster, arcpy.Raster(band_paths[f"B{n}"]))
-                        for n in range(1, 8)
-                    ]
+                # Lazy Con chain — same logic that produced the clean
+                # `Landsat_Masked` output in earlier runs. The per-band
+                # `.save()` materialisation introduced in commit 4f4728b
+                # was reverted (2026-05-21) because it produced visible
+                # dark blobs over high-cloud areas like Caldeira do
+                # Cabeço Gordo: when `.save()` ran with env.mask active,
+                # NoData semantics on cloudy pixels were lost (cloudy
+                # ended up as zero, not NoData), and GeometricMedian
+                # pulled the median down to zero-ish values.
+                #
+                # Cost of going lazy: CompositeBands ignores env.extent,
+                # so the per-scene composite is full-scene-extent (~33k
+                # km² for Landsat at Faial), not AOI-extent. The win we
+                # kept: value_mask is still materialised once per scene
+                # above, so QA decode is 1× not 7×. GeometricMedian
+                # still honours env.extent for its OUTPUT, so the heavy
+                # median phase remains fast (~60s vs the pre-AOI 18 min).
+                composite_inputs = [
+                    Con(value_mask_raster, arcpy.Raster(band_paths[f"B{n}"]))
+                    for n in range(1, 8)
+                ]
 
                 temp_composite = os.path.join(
                     scratch_dir, f"composite_{composite_idx:04d}.tif"
