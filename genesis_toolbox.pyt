@@ -65,6 +65,88 @@ TOOLBOX_VERSION = "1.0.0-phase3"
 
 
 # ---------------------------------------------------------------------------
+# Output sanity check
+# ---------------------------------------------------------------------------
+
+# Sensor-specific lower bound on the per-band mean. Bands whose mean
+# falls below this threshold across the whole output have almost always
+# collapsed to near-zero — never a real signal at typical land-surface
+# reflectance. Used by _sanity_check_output to flag silent-correctness
+# regressions (e.g. the May 2026 ASTER dark-blob bug where Con().save()
+# stripped NoData and the temporal median was pulled toward zero).
+#   - Landsat Collection 2 L2 SR is stored as DN (1-65454 valid); typical
+#     B5 (NIR) over vegetated land sits in the 8 000-25 000 range, so 500
+#     is comfortably below any plausible mosaic.
+#   - Sentinel-2 L2A and ASTER AST_07XT are converted to reflectance
+#     [0, 1] inside their per-scene processors; typical land mean is
+#     ~0.05-0.30, so 0.01 is well under any real signal.
+_SANITY_MIN_MEAN = {
+    "landsat": 500.0,
+    "sentinel-2": 0.01,
+    "aster": 0.01,
+}
+
+
+def _sanity_check_output(raster_path, sensor_hint=None, label=None,
+                         message_callback=None):
+    """Per-band stats canary for newly-saved median outputs.
+
+    Reads MIN/MEAN/MAX for each band and logs a one-line summary so the
+    user can spot obvious anomalies (all-zero bands, saturated bands)
+    in the messages tab. If a sensor_hint is supplied and any band's
+    mean falls below the expected lower bound for that sensor, a
+    warning is emitted pointing at the suspicious bands.
+
+    This is a fast post-save sniff test — not a correctness proof.
+    Visual inspection of the output is still required for publication.
+
+    Args:
+        raster_path: Path to the saved raster to inspect.
+        sensor_hint: One of "landsat", "sentinel-2", "aster" to enable
+            sensor-specific mean checks. None disables them (stats are
+            still logged).
+        label: Display name shown in the messages tab. Defaults to
+            the raster's basename.
+        message_callback: Optional logging callback. Defaults to
+            ``arcpy.AddMessage``.
+    """
+    msg = message_callback or arcpy.AddMessage
+    label = label or os.path.basename(raster_path)
+    try:
+        band_count = int(arcpy.Raster(raster_path).bandCount)
+    except Exception as e:
+        arcpy.AddWarning(f"  Sanity check [{label}]: cannot open ({e})")
+        return
+
+    threshold = _SANITY_MIN_MEAN.get(sensor_hint)
+    msg(f"  Sanity check [{label}]: {band_count} band(s)")
+    suspicious = []
+    for i in range(1, band_count + 1):
+        band_ref = f"{raster_path}/Band_{i}"
+        try:
+            min_v = float(arcpy.management.GetRasterProperties(
+                band_ref, "MINIMUM").getOutput(0).replace(",", "."))
+            mean_v = float(arcpy.management.GetRasterProperties(
+                band_ref, "MEAN").getOutput(0).replace(",", "."))
+            max_v = float(arcpy.management.GetRasterProperties(
+                band_ref, "MAXIMUM").getOutput(0).replace(",", "."))
+            msg(f"    Band {i}: mean={mean_v:.4g}, min={min_v:.4g}, max={max_v:.4g}")
+            if threshold is not None and mean_v < threshold:
+                suspicious.append(i)
+        except Exception as e:
+            arcpy.AddWarning(f"    Band {i}: stats unavailable ({e})")
+
+    if suspicious:
+        arcpy.AddWarning(
+            f"  Sanity check: band(s) {suspicious} have a mean below "
+            f"{threshold} for sensor {sensor_hint!r}. This is the signature "
+            "of a NoData-handling regression in the compositing step "
+            "(values pulled toward zero). Verify the output visually "
+            "before publishing."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Arcpy-safe identifier sanitisation
 # ---------------------------------------------------------------------------
 
@@ -2481,6 +2563,11 @@ class LandsatMosaic(object):
                 f"→ {os.path.basename(output_path)}"
             )
 
+            _sanity_check_output(
+                output_path, sensor_hint="landsat",
+                label=os.path.basename(output_path),
+            )
+
             return output_path
 
         except Exception as e:
@@ -4391,6 +4478,11 @@ class Sentinel2Mosaic(object):
             if save_stats:
                 self._write_provenance_csv(final_mosaic, all_scenes_used)
 
+            _sanity_check_output(
+                final_mosaic, sensor_hint="sentinel-2",
+                label=os.path.basename(final_mosaic),
+            )
+
             total_elapsed = (datetime.now() - stack_start).total_seconds()
             mins, secs = divmod(int(total_elapsed), 60)
             hrs, mins = divmod(mins, 60)
@@ -5504,6 +5596,10 @@ class AsterMosaic(object):
             arcpy.AddMessage(
                 f"  ✓ GeometricMedian in {(datetime.now() - median_start).total_seconds():.1f}s "
                 f"→ {os.path.basename(output_path)}"
+            )
+            _sanity_check_output(
+                output_path, sensor_hint="aster",
+                label=f"{os.path.basename(output_path)} [{label}]",
             )
         except Exception as e:
             arcpy.ResetProgressor()
