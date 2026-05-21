@@ -4720,6 +4720,12 @@ _ASTER_STACK_ORDER = _ASTER_VNIR_BANDS + _ASTER_SWIR_BANDS  # 9-band stack
 _ASTER_NATIVE_15M = set(_ASTER_VNIR_BANDS)
 _ASTER_QA_NAMES = ["VNIR_QA_DataPlane", "SWIR_QA_DataPlane"]
 
+# Per-scene processing modes — the tool can build either a full 9-band stack
+# (only viable for pre-Apr-2008 scenes that still carry SWIR) or a 3-band
+# VNIR-only stack (works for the full archive, since VNIR has never failed).
+_ASTER_MODE_FULL = "vnir_swir"
+_ASTER_MODE_VNIR = "vnir_only"
+
 # Filename pattern for AST_07XT V004 TIFF exports:
 #   AST_07XT_<17-char-sceneID>_<14-char-procDT>_SRF_<VNIR|SWIR>_<band-or-QA>.tif
 # The sceneID encodes the acquisition date as <3-digit-pass><MM><DD><YYYY><HHMMSS>
@@ -5018,143 +5024,59 @@ class AsterMosaic(object):
                 f"({temporal_filter.get('type', 'all_images')})"
             )
 
-            # Phase 3 — per-scene processing (scale, SWIR resample, QA mask, stack)
+            # Classify scenes by available SWIR coverage. Scenes acquired
+            # before April 2008 carry the full nine bands; post-failure
+            # scenes are VNIR-only. We always emit both products so the
+            # full archive contributes to vegetation/water indices while
+            # the pre-failure subset still yields a mineral-grade 9-band
+            # mosaic.
+            full_scenes = [s for s in kept_scenes if self._has_swir_bands(s)]
+            vnir_only_count = len(kept_scenes) - len(full_scenes)
             arcpy.AddMessage(
-                f"\n▶ Phase 3 — Per-scene processing ({len(kept_scenes)} scenes)"
-            )
-            stacked_paths = []
-            scenes_used = []
-            stack_phase_start = datetime.now()
-            for idx, scene in enumerate(kept_scenes, 1):
-                if arcpy.env.isCancelled:
-                    arcpy.ResetProgressor()
-                    arcpy.AddWarning(
-                        f"  ✗ Cancelled after {idx-1}/{len(kept_scenes)} scenes."
-                    )
-                    return None
-                if idx == 1:
-                    arcpy.SetProgressor(
-                        "step", "ASTER per-scene processing",
-                        0, len(kept_scenes), 1
-                    )
-                    log_every = max(1, len(kept_scenes) // 10)
-                    scene_times = []
-
-                arcpy.SetProgressorLabel(
-                    f"[{idx}/{len(kept_scenes)}] [{scene.get('format','?')}] "
-                    f"{scene['scene_id']}"
-                )
-                scene_start = datetime.now()
-                try:
-                    stacked = self._process_scene(scene, scratch_dir, use_qa)
-                except Exception as e:
-                    arcpy.AddWarning(f"  ✗ {scene['scene_id']}: {e}")
-                    arcpy.SetProgressorPosition(idx)
-                    continue
-                if stacked:
-                    stacked_paths.append(stacked)
-                    scenes_used.append(scene)
-                    scene_times.append(
-                        (datetime.now() - scene_start).total_seconds()
-                    )
-                arcpy.SetProgressorPosition(idx)
-                if idx % log_every == 0 or idx == len(kept_scenes):
-                    if scene_times:
-                        avg = sum(scene_times) / len(scene_times)
-                        pct = 100.0 * idx / len(kept_scenes)
-                        arcpy.AddMessage(
-                            f"  [{idx}/{len(kept_scenes)}] {pct:.0f}% — "
-                            f"avg {avg:.1f}s/scene"
-                        )
-
-            arcpy.ResetProgressor()
-            if not stacked_paths:
-                arcpy.AddError("  ✗ No scenes survived per-scene processing.")
-                return None
-            stack_phase_elapsed = (datetime.now() - stack_phase_start).total_seconds()
-            arcpy.AddMessage(
-                f"  ✓ {len(stacked_paths)} scenes in {stack_phase_elapsed:.1f}s "
-                f"({stack_phase_elapsed/max(1,len(stacked_paths)):.1f}s/scene)"
+                f"  Scene split: {len(full_scenes)} VNIR+SWIR "
+                f"(pre-Apr-2008) + {vnir_only_count} VNIR-only "
+                f"(post-Apr-2008 SWIR failure)"
             )
 
-            # Phase 4 — optional multitemporal anomaly refinement
-            if apply_temporal and len(stacked_paths) >= 5:
-                arcpy.AddMessage(
-                    f"\n▶ Phase 4 — Multitemporal cloud refinement ({len(stacked_paths)} scenes)"
+            outputs = []
+            total_start = datetime.now()
+
+            # Mosaic 1 — 9-band VNIR+SWIR from pre-failure scenes only.
+            if full_scenes:
+                output_full = self._run_mosaic_pipeline(
+                    full_scenes, gdb_path, f"{mosaic_name}_VnirSwir",
+                    scratch_dir, use_qa, apply_temporal, mask_feature,
+                    save_stats, _ASTER_MODE_FULL, "VNIR+SWIR (9-band)",
                 )
-                temporal_start = datetime.now()
-                stacked_paths = self._apply_multitemporal_refinement(
-                    stacked_paths, scratch_dir,
-                )
-                arcpy.AddMessage(
-                    f"  ✓ Phase 4 in {(datetime.now() - temporal_start).total_seconds():.1f}s"
-                )
-            elif apply_temporal:
+                if output_full:
+                    outputs.append(output_full)
+            else:
                 arcpy.AddWarning(
-                    f"\n▶ Phase 4 — Skipped (only {len(stacked_paths)} scenes; need ≥5)"
+                    "\n  ✗ No pre-Apr-2008 scenes — skipping VNIR+SWIR (9-band) mosaic"
                 )
 
-            # Phase 5 — GeometricMedian
-            arcpy.AddMessage(f"\n▶ Phase 5 — GeometricMedian over {len(stacked_paths)} stacks")
-            arcpy.SetProgressor("default", "Computing GeometricMedian...")
-            median_start = datetime.now()
-            output_path = os.path.join(gdb_path, mosaic_name)
-            try:
-                median = arcpy.sa.GeometricMedian(stacked_paths)
-                median.save(output_path)
-                arcpy.ResetProgressor()
-                arcpy.AddMessage(
-                    f"  ✓ GeometricMedian in {(datetime.now() - median_start).total_seconds():.1f}s "
-                    f"→ {os.path.basename(output_path)}"
-                )
-            except Exception as e:
-                arcpy.ResetProgressor()
-                arcpy.AddError(f"  ✗ GeometricMedian failed: {e}")
-                return None
+            # Mosaic 2 — 3-band VNIR-only from the full archive (post-
+            # failure scenes contribute here; pre-failure scenes also
+            # contribute their VNIR bands for a longer temporal stack).
+            output_vnir = self._run_mosaic_pipeline(
+                kept_scenes, gdb_path, f"{mosaic_name}_Vnir",
+                scratch_dir, use_qa, apply_temporal, mask_feature,
+                save_stats, _ASTER_MODE_VNIR, "VNIR-only (3-band)",
+            )
+            if output_vnir:
+                outputs.append(output_vnir)
 
-            # Phase 6 — AOI mask + provenance
-            arcpy.AddMessage("\n▶ Phase 6 — Mask / cleanup / provenance")
-            final_path = output_path
-            unmasked_to_delete = None
-            if mask_feature and arcpy.Exists(mask_feature):
-                mask_start = datetime.now()
-                masked = arcpy.sa.ExtractByMask(output_path, mask_feature)
-                masked_path = os.path.join(gdb_path, f"{mosaic_name}_Masked")
-                masked.save(masked_path)
-                unmasked_to_delete = output_path
-                final_path = masked_path
-                arcpy.AddMessage(
-                    f"  ✓ AOI mask applied in "
-                    f"{(datetime.now() - mask_start).total_seconds():.1f}s "
-                    f"→ {os.path.basename(masked_path)}"
-                )
-            elif mask_feature:
-                arcpy.AddWarning(f"  ✗ AOI mask {mask_feature!r} not found — output is unmasked.")
-
-            if unmasked_to_delete and unmasked_to_delete != final_path:
-                try:
-                    if arcpy.Exists(unmasked_to_delete):
-                        arcpy.management.Delete(unmasked_to_delete)
-                        arcpy.AddMessage(
-                            f"  ✓ Removed intermediate: {os.path.basename(unmasked_to_delete)}"
-                        )
-                except Exception as e:
-                    arcpy.AddWarning(
-                        f"  Could not delete intermediate {unmasked_to_delete}: {e}"
-                    )
-
-            if save_stats:
-                self._write_provenance_csv(final_path, scenes_used)
-
-            total_elapsed = (datetime.now() - stack_phase_start).total_seconds()
+            total_elapsed = (datetime.now() - total_start).total_seconds()
             mins, secs = divmod(int(total_elapsed), 60)
             hrs, mins = divmod(mins, 60)
             time_str = f"{hrs}h {mins}m {secs}s" if hrs else f"{mins}m {secs}s"
             arcpy.AddMessage("\n" + "=" * 60)
-            arcpy.AddMessage(f"DONE — {os.path.basename(final_path)}")
-            arcpy.AddMessage(f"Total: {time_str}  |  Scenes: {len(scenes_used)}")
+            arcpy.AddMessage(f"DONE — {len(outputs)} mosaic(s) written")
+            for p in outputs:
+                arcpy.AddMessage(f"  • {os.path.basename(p)}")
+            arcpy.AddMessage(f"Total: {time_str}")
             arcpy.AddMessage("=" * 60)
-            return final_path
+            return outputs[0] if outputs else None
 
         except Exception as e:
             arcpy.AddError(f"Tool 03 failed: {e}")
@@ -5166,6 +5088,151 @@ class AsterMosaic(object):
             _cleanup_scratch_folder(scratch_dir)
             if arcpy.CheckExtension("Spatial") == "Available":
                 arcpy.CheckInExtension("Spatial")
+
+    # ------------------------------------------------------------------
+    # Per-mosaic pipeline (Phases 3-6 for one mode + scene subset)
+    # ------------------------------------------------------------------
+
+    def _run_mosaic_pipeline(
+        self, scenes, gdb_path, output_name, scratch_dir,
+        use_qa, apply_temporal, mask_feature, save_stats, mode, label,
+    ):
+        """Run Phases 3-6 over a scene list in one of the supported modes.
+
+        Returns the final raster path on success, or None if no scenes
+        survived per-scene processing (in which case a warning has
+        already been emitted).
+        """
+        n_scenes = len(scenes)
+        arcpy.AddMessage(
+            f"\n▶ Phase 3 [{label}] — Per-scene processing ({n_scenes} scenes)"
+        )
+        stacked_paths = []
+        scenes_used = []
+        stack_phase_start = datetime.now()
+        log_every = max(1, n_scenes // 10)
+        scene_times = []
+        arcpy.SetProgressor("step", f"ASTER per-scene [{label}]", 0, n_scenes, 1)
+
+        for idx, scene in enumerate(scenes, 1):
+            if arcpy.env.isCancelled:
+                arcpy.ResetProgressor()
+                arcpy.AddWarning(
+                    f"  ✗ Cancelled after {idx-1}/{n_scenes} scenes."
+                )
+                return None
+            arcpy.SetProgressorLabel(
+                f"[{idx}/{n_scenes}] [{scene.get('format','?')}] "
+                f"{scene['scene_id']}"
+            )
+            scene_start = datetime.now()
+            try:
+                stacked = self._process_scene(scene, scratch_dir, use_qa, mode)
+            except Exception as e:
+                arcpy.AddWarning(f"  ✗ {scene['scene_id']}: {e}")
+                arcpy.SetProgressorPosition(idx)
+                continue
+            if stacked:
+                stacked_paths.append(stacked)
+                scenes_used.append(scene)
+                scene_times.append((datetime.now() - scene_start).total_seconds())
+            arcpy.SetProgressorPosition(idx)
+            if idx % log_every == 0 or idx == n_scenes:
+                if scene_times:
+                    avg = sum(scene_times) / len(scene_times)
+                    pct = 100.0 * idx / n_scenes
+                    arcpy.AddMessage(
+                        f"  [{idx}/{n_scenes}] {pct:.0f}% — avg {avg:.1f}s/scene"
+                    )
+
+        arcpy.ResetProgressor()
+        if not stacked_paths:
+            arcpy.AddWarning(
+                f"  ✗ [{label}] No scenes survived per-scene processing."
+            )
+            return None
+        stack_phase_elapsed = (datetime.now() - stack_phase_start).total_seconds()
+        arcpy.AddMessage(
+            f"  ✓ {len(stacked_paths)} scenes in {stack_phase_elapsed:.1f}s "
+            f"({stack_phase_elapsed/max(1,len(stacked_paths)):.1f}s/scene)"
+        )
+
+        # Phase 4 — multitemporal anomaly refinement
+        if apply_temporal and len(stacked_paths) >= 5:
+            arcpy.AddMessage(
+                f"\n▶ Phase 4 [{label}] — Multitemporal cloud refinement "
+                f"({len(stacked_paths)} scenes)"
+            )
+            temporal_start = datetime.now()
+            stacked_paths = self._apply_multitemporal_refinement(
+                stacked_paths, scratch_dir,
+            )
+            arcpy.AddMessage(
+                f"  ✓ Phase 4 in {(datetime.now() - temporal_start).total_seconds():.1f}s"
+            )
+        elif apply_temporal:
+            arcpy.AddWarning(
+                f"\n▶ Phase 4 [{label}] — Skipped "
+                f"(only {len(stacked_paths)} scenes; need ≥5)"
+            )
+
+        # Phase 5 — GeometricMedian
+        arcpy.AddMessage(
+            f"\n▶ Phase 5 [{label}] — GeometricMedian over {len(stacked_paths)} stacks"
+        )
+        arcpy.SetProgressor("default", f"Computing GeometricMedian [{label}]...")
+        median_start = datetime.now()
+        output_path = os.path.join(gdb_path, output_name)
+        try:
+            median = arcpy.sa.GeometricMedian(stacked_paths)
+            median.save(output_path)
+            arcpy.ResetProgressor()
+            arcpy.AddMessage(
+                f"  ✓ GeometricMedian in {(datetime.now() - median_start).total_seconds():.1f}s "
+                f"→ {os.path.basename(output_path)}"
+            )
+        except Exception as e:
+            arcpy.ResetProgressor()
+            arcpy.AddError(f"  ✗ [{label}] GeometricMedian failed: {e}")
+            return None
+
+        # Phase 6 — AOI mask + provenance
+        arcpy.AddMessage(f"\n▶ Phase 6 [{label}] — Mask / cleanup / provenance")
+        final_path = output_path
+        unmasked_to_delete = None
+        if mask_feature and arcpy.Exists(mask_feature):
+            mask_start = datetime.now()
+            masked = arcpy.sa.ExtractByMask(output_path, mask_feature)
+            masked_path = os.path.join(gdb_path, f"{output_name}_Masked")
+            masked.save(masked_path)
+            unmasked_to_delete = output_path
+            final_path = masked_path
+            arcpy.AddMessage(
+                f"  ✓ AOI mask applied in "
+                f"{(datetime.now() - mask_start).total_seconds():.1f}s "
+                f"→ {os.path.basename(masked_path)}"
+            )
+        elif mask_feature:
+            arcpy.AddWarning(
+                f"  ✗ AOI mask {mask_feature!r} not found — output is unmasked."
+            )
+
+        if unmasked_to_delete and unmasked_to_delete != final_path:
+            try:
+                if arcpy.Exists(unmasked_to_delete):
+                    arcpy.management.Delete(unmasked_to_delete)
+                    arcpy.AddMessage(
+                        f"  ✓ Removed intermediate: {os.path.basename(unmasked_to_delete)}"
+                    )
+            except Exception as e:
+                arcpy.AddWarning(
+                    f"  Could not delete intermediate {unmasked_to_delete}: {e}"
+                )
+
+        if save_stats:
+            self._write_provenance_csv(final_path, scenes_used)
+
+        return final_path
 
     # ------------------------------------------------------------------
     # Scene discovery (TIFF + HDF)
@@ -5303,8 +5370,30 @@ class AsterMosaic(object):
     # Per-scene processing
     # ------------------------------------------------------------------
 
-    def _process_scene(self, scene, scratch_dir, use_qa):
-        """Apply scale + resample + QA mask + stack → single 9-band raster.
+    @staticmethod
+    def _has_swir_bands(scene):
+        """True if the scene has all six SWIR bands B04..B09.
+
+        ASTER's SWIR detector failed in April 2008; scenes acquired after
+        that date arrive as VNIR-only TIFF sets and lack any of B04..B09.
+        HDF granules always carry the full subdataset table (any missing
+        SWIR planes inside the HDF are detected later, on read).
+        """
+        if scene.get("format") == "hdf":
+            return True
+        files = scene.get("files") or {}
+        return all(b in files for b in _ASTER_SWIR_BANDS)
+
+    def _process_scene(self, scene, scratch_dir, use_qa, mode):
+        """Apply scale + resample + QA mask + stack → single multi-band raster.
+
+        Parameters
+        ----------
+        mode : str
+            "vnir_swir" — build the full 9-band stack (B01, B02, B03N,
+            B04..B09). Requires all six SWIR bands.
+            "vnir_only" — build the 3-band VNIR stack (B01, B02, B03N).
+            Skips SWIR resample entirely; usable for post-Apr-2008 scenes.
 
         Returns the stacked raster path, or None on failure (missing bands,
         unreadable QA, etc.).
@@ -5332,10 +5421,26 @@ class AsterMosaic(object):
         files = scene["files"]
         scene_id = scene["scene_id"]
 
-        # Verify we have all 9 image bands.
-        missing = [b for b in _ASTER_STACK_ORDER if b not in files]
+        if mode == _ASTER_MODE_VNIR:
+            required_bands = _ASTER_VNIR_BANDS
+            preferred_qa = ["VNIR_QA_DataPlane"]
+            stack_suffix = "_stack_vnir.tif"
+        else:
+            required_bands = _ASTER_STACK_ORDER
+            preferred_qa = _ASTER_QA_NAMES
+            stack_suffix = "_stack.tif"
+
+        missing = [b for b in required_bands if b not in files]
         if missing:
-            arcpy.AddWarning(f"  ✗ {scene_id}: missing bands {missing}")
+            if mode == _ASTER_MODE_FULL and any(
+                b in _ASTER_SWIR_BANDS for b in missing
+            ):
+                arcpy.AddWarning(
+                    f"  ✗ {scene_id}: VNIR-only scene "
+                    f"(post-Apr-2008 SWIR failure) — skipped from 9-band mosaic"
+                )
+            else:
+                arcpy.AddWarning(f"  ✗ {scene_id}: missing bands {missing}")
             return None
 
         # Optional QA mask. Conservative implementation: treat any non-zero
@@ -5345,12 +5450,10 @@ class AsterMosaic(object):
         # specific — this conservative choice errs on the side of dropping
         # uncertain pixels, which is fine for a temporal median.
         qa_mask = None
-        if use_qa and any(qa in files for qa in _ASTER_QA_NAMES):
-            qa_path = next((files[q] for q in _ASTER_QA_NAMES if q in files), None)
+        if use_qa and any(qa in files for qa in preferred_qa):
+            qa_path = next((files[q] for q in preferred_qa if q in files), None)
             if qa_path:
                 try:
-                    qa_raster = arcpy.sa.Raster(qa_path)
-                    # Resample QA to 15m (NEAREST to preserve class codes).
                     qa_resampled = os.path.join(scratch_dir, f"{scene_id}_QA_15m.tif")
                     arcpy.management.Resample(qa_path, qa_resampled, 15, "NEAREST")
                     qa_raster = arcpy.sa.Raster(qa_resampled)
@@ -5362,7 +5465,7 @@ class AsterMosaic(object):
         # Process each band: resample SWIR to 15m, scale to reflectance,
         # apply QA mask if present.
         masked_paths = []
-        for band in _ASTER_STACK_ORDER:
+        for band in required_bands:
             src = files[band]
             if band not in _ASTER_NATIVE_15M:
                 # SWIR (30m) → 15m via BILINEAR (continuous reflectance).
@@ -5381,7 +5484,7 @@ class AsterMosaic(object):
             masked.save(out)
             masked_paths.append(out)
 
-        stacked = os.path.join(scratch_dir, f"{scene_id}_stack.tif")
+        stacked = os.path.join(scratch_dir, f"{scene_id}{stack_suffix}")
         arcpy.management.CompositeBands(masked_paths, stacked)
         return stacked
 
@@ -5498,6 +5601,11 @@ class AsterMosaic(object):
             return stacked_paths  # not enough samples for robust statistics
 
         try:
+            # All stacks in a single pipeline run share the same band count
+            # (either 9 for VNIR+SWIR or 3 for VNIR-only). Detect once from
+            # the first stack; brightness is always B01+B02 (channels 0+1).
+            n_bands = int(arcpy.Raster(stacked_paths[0]).bandCount)
+
             arcpy.AddMessage(
                 f"    Pass 1/3 — loading B01+B02 brightness arrays from "
                 f"{n} scene stacks into memory..."
@@ -5514,7 +5622,7 @@ class AsterMosaic(object):
                 ).astype(np.float64)
                 # arr shape: (n_bands, h, w) or (h, w, n_bands) depending on arcpy version.
                 # Normalise to (n_bands, h, w).
-                if arr.ndim == 3 and arr.shape[-1] in (9, 9):
+                if arr.ndim == 3 and arr.shape[-1] == n_bands:
                     arr = np.transpose(arr, (2, 0, 1))
                 # Brightness = B01 + B02 (channels 0 + 1).
                 brightness = arr[0] + arr[1]
@@ -5540,14 +5648,18 @@ class AsterMosaic(object):
             refined_paths = []
             for ri, (path, brightness) in enumerate(zip(stacked_paths, brightness_arrays), 1):
                 cloud_pixels = brightness > threshold  # (h, w) bool
-                # Load the full 9-band stack, apply mask to all bands.
+                # Load the full stack, apply mask to all bands.
                 r = arcpy.Raster(path)
                 arr = arcpy.RasterToNumPyArray(r, nodata_to_value=np.nan).astype(np.float64)
-                if arr.ndim == 3 and arr.shape[-1] == 9:
+                if arr.ndim == 3 and arr.shape[-1] == n_bands:
                     arr = np.transpose(arr, (2, 0, 1))
                 arr[:, cloud_pixels] = np.nan
-                # Save back as a refined stack.
-                out_path = path.replace("_stack.tif", "_stack_refined.tif")
+                # Save back as a refined stack — preserve the _stack or
+                # _stack_vnir suffix the upstream helper chose.
+                if path.endswith("_stack_vnir.tif"):
+                    out_path = path.replace("_stack_vnir.tif", "_stack_vnir_refined.tif")
+                else:
+                    out_path = path.replace("_stack.tif", "_stack_refined.tif")
                 # NumPyArrayToRaster wants (n_bands, h, w) → (h, w, n_bands)
                 arr_hwc = np.transpose(arr, (1, 2, 0)).astype(np.float32)
                 ext, cell = ref_meta
