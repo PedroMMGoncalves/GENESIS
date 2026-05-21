@@ -2283,11 +2283,12 @@ class LandsatMosaic(object):
             return None
 
         finally:
-            # Cleanup is trivial now that composites live in a scratch
-            # folder instead of the production GDB: one shutil.rmtree
-            # tears the whole directory down. No GDB catalog locks, no
-            # retry dance, no chance of orphan rasters in the user's
-            # output geodatabase.
+            # Cleanup with a two-pass retry. The first pass usually works,
+            # but on Windows Pro sometimes holds a file lock on a temp
+            # composite even after .save() / GeometricMedian return —
+            # gc.collect() + clearing the arcpy workspace cache + a brief
+            # sleep typically releases them. If files survive both passes
+            # we report them as a warning rather than fail the run.
             if multiband_rasters:
                 arcpy.AddMessage(
                     f"  Cleaning up scratch folder "
@@ -2298,11 +2299,23 @@ class LandsatMosaic(object):
                 if 'scratch_dir' in locals() and os.path.isdir(scratch_dir):
                     shutil.rmtree(scratch_dir, ignore_errors=True)
                     if os.path.isdir(scratch_dir):
-                        arcpy.AddWarning(
-                            f"  Scratch folder {scratch_dir} could not be "
-                            f"fully removed (likely a file lock). It is "
-                            f"safe to delete manually."
-                        )
+                        # First pass left files locked — force GC, clear
+                        # arcpy raster cache, brief sleep, try again.
+                        import gc
+                        import time as _time
+                        gc.collect()
+                        try:
+                            arcpy.management.ClearWorkspaceCache()
+                        except Exception:
+                            pass
+                        _time.sleep(1.0)
+                        shutil.rmtree(scratch_dir, ignore_errors=True)
+                        if os.path.isdir(scratch_dir):
+                            arcpy.AddWarning(
+                                f"  Scratch folder {scratch_dir} could not "
+                                f"be fully removed (file locks held by Pro). "
+                                f"It is safe to delete manually."
+                            )
             except Exception as e:
                 arcpy.AddWarning(f"  Scratch cleanup failed (non-fatal): {e}")
                     
@@ -3599,10 +3612,18 @@ class Sentinel2Mosaic(object):
             parameterType="Required",
             direction="Input",
         )
+        # `all_images` (default) processes every scene that parsed,
+        # matching the behaviour of LandsatMosaic. The previous default
+        # of `year_month` silently required year+month to be filled in
+        # for any scene to pass the filter — a usability footgun that
+        # produced an immediate "No scenes match" crash when the user
+        # accepted defaults.
         time_type.filter.list = [
+            "all_images",
             "year_month", "month_all_years",
             "season_in_year", "season_all_years",
         ]
+        time_type.value = "all_images"
 
         year = arcpy.Parameter(
             displayName="Year (when applicable)",
@@ -3665,7 +3686,11 @@ class Sentinel2Mosaic(object):
             year = parameters[5]
             month = parameters[6]
             season = parameters[7]
-            if time_type.valueAsText == "year_month":
+            if time_type.valueAsText == "all_images":
+                year.enabled = False
+                month.enabled = False
+                season.enabled = False
+            elif time_type.valueAsText == "year_month":
                 year.enabled = True
                 month.enabled = True
                 season.enabled = False
@@ -4135,7 +4160,10 @@ class Sentinel2Mosaic(object):
     _SAFE_NAME_RE = re.compile(
         # Note the captured tile group includes the "T" prefix so callers
         # get the canonical MGRS tile ID (e.g., "T29SQB", not "29SQB").
-        r"^S2[AB]_MSIL2A_(\d{8})T(\d{6})_N\d{4}_R\d{3}_(T\w{5})_",
+        # S2A (launched 2015), S2B (2017), S2C (2024 — adds C to the
+        # platform code). Future S2D would need extending; for now S2[ABC]
+        # covers everything Copernicus is currently flying.
+        r"^S2[ABC]_MSIL2A_(\d{8})T(\d{6})_N\d{4}_R\d{3}_(T\w{5})_",
     )
 
     @classmethod
@@ -4396,6 +4424,8 @@ class Sentinel2Mosaic(object):
         if d is None:
             return False
         ftype = temporal_filter.get("type")
+        if ftype == "all_images":
+            return True
         try:
             if ftype == "year_month":
                 return (
@@ -4570,10 +4600,18 @@ class AsterMosaic(object):
             parameterType="Required",
             direction="Input",
         )
+        # `all_images` (default) processes every scene that parsed,
+        # matching the behaviour of LandsatMosaic. The previous default
+        # of `year_month` silently required year+month to be filled in
+        # for any scene to pass the filter — a usability footgun that
+        # produced an immediate "No scenes match" crash when the user
+        # accepted defaults.
         time_type.filter.list = [
+            "all_images",
             "year_month", "month_all_years",
             "season_in_year", "season_all_years",
         ]
+        time_type.value = "all_images"
 
         year = arcpy.Parameter(
             displayName="Year (when applicable)",
@@ -4645,7 +4683,9 @@ class AsterMosaic(object):
             year = parameters[5]
             month = parameters[6]
             season = parameters[7]
-            if time_type.valueAsText == "year_month":
+            if time_type.valueAsText == "all_images":
+                year.enabled = False; month.enabled = False; season.enabled = False
+            elif time_type.valueAsText == "year_month":
                 year.enabled = True; month.enabled = True; season.enabled = False
             elif time_type.valueAsText == "month_all_years":
                 year.enabled = False; month.enabled = True; season.enabled = False
@@ -5328,6 +5368,8 @@ class AsterMosaic(object):
         if d is None:
             return False
         ftype = temporal_filter.get("type")
+        if ftype == "all_images":
+            return True
         try:
             if ftype == "year_month":
                 return d.year == temporal_filter["year"] and d.month == temporal_filter["month"]
