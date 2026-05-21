@@ -65,6 +65,30 @@ TOOLBOX_VERSION = "1.0.0-phase3"
 
 
 # ---------------------------------------------------------------------------
+# Arcpy-safe identifier sanitisation
+# ---------------------------------------------------------------------------
+
+_ARCPY_NAME_TRANSLATIONS = {ord(c): "_" for c in " ()[]{}'\";,$@#!%^&*+=<>?|"}
+
+
+def _sanitize_arcpy_name(name):
+    """Strip filesystem/arcpy-hostile characters from a scene identifier.
+
+    arcpy.management.Resample (and several other GP tools) rejects output
+    dataset names that contain spaces, parentheses, or other punctuation
+    with ERROR 000354. This bites scenes whose archives were renamed by
+    the OS to dedupe downloads (e.g., Windows ``Foo (1).zip``).
+
+    The replacement uses ``_`` rather than removal so two distinct scenes
+    can never collapse to the same id by accident. Empty/None input
+    returns an empty string.
+    """
+    if not name:
+        return ""
+    return str(name).translate(_ARCPY_NAME_TRANSLATIONS)
+
+
+# ---------------------------------------------------------------------------
 # Scratch folder cleanup
 # ---------------------------------------------------------------------------
 
@@ -3684,7 +3708,7 @@ class Sentinel2Mosaic(object):
     the 0.0001 factor.
 
     The cloud-masked, scaled 10-band stack from each scene is then fed
-    to arcpy.sa.GeometricMedian per MGRS tile. Multi-tile regions are
+    to arcpy.ia.GeometricMedian per MGRS tile. Multi-tile regions are
     merged after per-tile median composites are built. A provenance CSV
     is written alongside the output documenting every contributing scene.
     """
@@ -3992,6 +4016,8 @@ class Sentinel2Mosaic(object):
             )
             kept_scenes = []
             skipped_no_meta = 0
+            seen_product_uris = set()
+            duplicate_sources = []
             for path, kind in sources:
                 meta = self._parse_safe_metadata(path, kind)
                 if meta is None:
@@ -4000,11 +4026,25 @@ class Sentinel2Mosaic(object):
                     continue
                 if not self._scene_passes_filter(meta, temporal_filter, seasonal_pattern):
                     continue
+                product_uri = meta.get("product_uri")
+                # Drop duplicate downloads ("Foo.zip" + "Foo (1).zip" both
+                # resolve to the same PRODUCT_URI). Keeping both costs ~10
+                # minutes per scene and produces redundant scratch outputs.
+                if product_uri in seen_product_uris:
+                    duplicate_sources.append(os.path.basename(path))
+                    continue
+                seen_product_uris.add(product_uri)
                 kept_scenes.append({
                     "path": path,
                     "source_kind": kind,
                     "metadata": meta,
                 })
+            if duplicate_sources:
+                arcpy.AddMessage(
+                    f"  ✓ {len(duplicate_sources)} duplicate download(s) "
+                    f"dropped: {', '.join(duplicate_sources[:5])}"
+                    + ("..." if len(duplicate_sources) > 5 else "")
+                )
             if not kept_scenes:
                 arcpy.AddError("  ✗ No scenes match the temporal filter.")
                 return None
@@ -4114,7 +4154,13 @@ class Sentinel2Mosaic(object):
                 try:
                     tile_mosaic_name = f"{mosaic_name}_{tile}"
                     tile_mosaic_path = os.path.join(gdb_path, tile_mosaic_name)
-                    median = arcpy.sa.GeometricMedian(stacked_paths)
+                    median = arcpy.ia.GeometricMedian(
+                        stacked_paths,
+                        epsilon=0.001,
+                        max_iteration=20,
+                        extent_type="UnionOf",
+                        cellsize_type="FirstOf",
+                    )
                     median.save(tile_mosaic_path)
                     tile_mosaics.append(tile_mosaic_path)
                     arcpy.AddMessage(
@@ -4433,9 +4479,25 @@ class Sentinel2Mosaic(object):
                             meta["cloud_cover"] = float(elem.text)
                         except (TypeError, ValueError):
                             pass
-                        break
+                    # PRODUCT_URI inside the XML is the canonical SAFE name
+                    # without the Windows "(1)" rename suffix that browsers
+                    # apply to duplicate downloads. Prefer this over the
+                    # filename whenever it's present.
+                    elif tag == "PRODUCT_URI" and elem.text:
+                        canonical = elem.text.strip()
+                        if canonical.lower().endswith(".safe"):
+                            canonical = canonical[:-5]
+                        if canonical:
+                            meta["product_uri"] = canonical
             except ET.ParseError:
                 pass
+
+        # Defensive sanitisation: arcpy.management.Resample rejects spaces
+        # and parentheses in output dataset names (ERROR 000354). If the
+        # canonical PRODUCT_URI wasn't available, strip the offending
+        # characters from the filename-derived id so the scratch paths we
+        # build downstream don't trip the validator.
+        meta["product_uri"] = _sanitize_arcpy_name(meta["product_uri"])
         return meta
 
     # ------------------------------------------------------------------
@@ -4760,7 +4822,7 @@ class AsterMosaic(object):
          stack — recommended for cloud-prone regions like Faial.
       5. Stack into a 9-band float32 raster.
 
-    Mosaicking: Esri arcpy.sa.GeometricMedian across the cloud-masked
+    Mosaicking: Esri arcpy.ia.GeometricMedian across the cloud-masked
     stack, then optional AOI clip and provenance CSV.
     """
 
@@ -5184,7 +5246,13 @@ class AsterMosaic(object):
         median_start = datetime.now()
         output_path = os.path.join(gdb_path, output_name)
         try:
-            median = arcpy.sa.GeometricMedian(stacked_paths)
+            median = arcpy.ia.GeometricMedian(
+                stacked_paths,
+                epsilon=0.001,
+                max_iteration=20,
+                extent_type="UnionOf",
+                cellsize_type="FirstOf",
+            )
             median.save(output_path)
             arcpy.ResetProgressor()
             arcpy.AddMessage(
