@@ -9,19 +9,19 @@
 <!-- Once the Zenodo DOI is minted, replace the badge above with:
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.PLACEHOLDER.svg)](https://doi.org/10.5281/zenodo.PLACEHOLDER) -->
 
-GENESIS is a unified ArcGIS Pro Python Toolbox for remote-sensing analysis
-of **Sentinel-2 L2A**, **Landsat 8/9 Collection 2 Level 2**, and **ASTER L2
-AST_07XT** imagery. Six tools cover the full workflow — from raw scene
-folders to cloud-removed multi-band mosaics, spectral indices, PCA/MNF/ICA
-transforms, and Spectral Angle Mapper classification — across all three
-sensors via a single sensor-aware design.
+GENESIS is an ArcGIS Pro toolbox for analysing **Sentinel-2 L2A**,
+**Landsat 8/9 Collection 2 Level 2**, and **ASTER L2 (AST_07XT)** imagery.
+It has six tools: a cloud-removed mosaicker for each sensor, plus three
+sensor-agnostic tools for spectral indices and composites, PCA / MNF / ICA
+statistical transformations, and Spectral Angle Mapper classification.
+A `Sensor Type` parameter on the analysis tools selects the correct band
+roles, indices, and reflectance scaling for the input data.
 
-Used to support analytical work for the **GENESIS Horizon Europe project** (grant agreement Nº 101157447)
-([genesisnbs.eu](https://genesisnbs.eu)) — in particular for processing
-satellite imagery over the **Faial Island (Azores)** case study.
-Applicable across Portuguese and
-African study areas (Iberian Peninsula, Azores, Madeira, Cape Verde,
-Angola, Mozambique).
+The toolbox was developed during the author's work on the **GENESIS**
+Horizon Europe project (grant 101157447,
+[genesisnbs.eu](https://genesisnbs.eu/faial/)) to produce cloud-removed
+multisensor satellite mosaics for the **Faial Island** demonstrator site
+in the Azores.
 
 ---
 
