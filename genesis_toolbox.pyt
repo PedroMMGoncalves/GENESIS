@@ -2046,20 +2046,19 @@ class LandsatMosaic(object):
             clean_scenes = []
             total_scenes = len(scenes)
 
-            arcpy.AddMessage(
-                f"\nValidating {total_scenes} scenes for cloud-mask "
-                f"compatibility (actual masking happens in the composite "
-                f"phase, where it can be materialised efficiently)..."
-            )
+            arcpy.AddMessage(f"\n▶ Phase 2 — Validating {total_scenes} scenes")
 
             required = ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "QA_PIXEL"]
+            arcpy.SetProgressor(
+                "step", "Validating scenes", 0, total_scenes, 1
+            )
 
             for idx, scene in enumerate(scenes, 1):
-                # Validation is fast (~10ms per scene), so checking every
-                # 25 scenes is responsive enough without burning cycles.
+                # Validation is fast (~10ms); check cancel every 25.
                 if idx % 25 == 0 and arcpy.env.isCancelled:
+                    arcpy.ResetProgressor()
                     arcpy.AddWarning(
-                        f"Cancelled by user after validating {idx-1}/{total_scenes} scenes."
+                        f"  ✗ Cancelled by user after {idx-1}/{total_scenes} scenes."
                     )
                     return None
                 try:
@@ -2069,11 +2068,12 @@ class LandsatMosaic(object):
                     )
                     band_paths = scene.get('band_paths') or {}
 
+                    arcpy.SetProgressorLabel(f"[{idx}/{total_scenes}] {scene_id}")
+
                     missing = [k for k in required if k not in band_paths]
                     if missing:
                         arcpy.AddWarning(
-                            f"  [{idx}/{total_scenes}] {scene_id}: "
-                            f"missing {missing} — skipped"
+                            f"  ✗ {scene_id}: missing {missing}"
                         )
                         stats['failed_scenes'] = stats.get('failed_scenes', 0) + 1
                         continue
@@ -2085,16 +2085,18 @@ class LandsatMosaic(object):
                         'metadata': scene.get('metadata', {}),
                         'is_archive': scene.get('is_archive', False),
                     })
+                    arcpy.SetProgressorPosition(idx)
 
                 except Exception as e:
-                    arcpy.AddWarning(f"  [{idx}/{total_scenes}] Error: {str(e)}")
+                    arcpy.AddWarning(f"  ✗ {scene.get('scene_id', '?')}: {str(e)}")
                     stats['failed_scenes'] = stats.get('failed_scenes', 0) + 1
                     stats['errors'].append(str(e))
                     continue
 
+            arcpy.ResetProgressor()
             arcpy.AddMessage(
-                f"  {len(clean_scenes)}/{total_scenes} scenes validated "
-                f"in {(datetime.now() - start_time).total_seconds():.1f}s."
+                f"  ✓ {len(clean_scenes)}/{total_scenes} ready "
+                f"({(datetime.now() - start_time).total_seconds():.1f}s)"
             )
 
             stats['cloud_removal'] = {
@@ -2151,38 +2153,31 @@ class LandsatMosaic(object):
                 f"_genesis_landsat_composites_{uuid.uuid4().hex[:8]}",
             )
             os.makedirs(scratch_dir, exist_ok=True)
-            arcpy.AddMessage(f"\n  Scratch folder: {scratch_dir}")
 
             aoi_active = bool(arcpy.env.mask)
-            if aoi_active:
-                arcpy.AddMessage(
-                    "\nAOI mask active. Each scene's value_mask is "
-                    "materialised once at AOI extent (vs. the previous "
-                    "7x QA decode per scene), and each of the 7 cleaned "
-                    "bands is materialised once at AOI extent before "
-                    "CompositeBands consumes them. Composites are AOI-sized."
-                )
-            else:
-                arcpy.AddMessage(
-                    "\nNo AOI mask. Each scene's value_mask is materialised "
-                    "once to scratch (kills the 7x QA decode redundancy), "
-                    "then 7 lazy Cons reference the materialised mask in "
-                    "the CompositeBands inputs. Composites are full-extent."
-                )
-
+            arcpy.AddMessage(f"\n▶ Phase 3 — Per-scene composites ({total} scenes)")
+            arcpy.AddMessage(f"  Scratch: {scratch_dir}")
             arcpy.AddMessage(
-                f"\nBuilding {total} per-scene multi-band composites in "
-                f"scratch folder..."
+                f"  Mode: {'AOI-extent' if aoi_active else 'full scene extent'} "
+                f"(value_mask materialised once per scene to avoid 7× QA decode)"
             )
 
+            arcpy.SetProgressor(
+                "step", "Building per-scene composites", 0, total, 1
+            )
+            # Periodic Messages-tab update: ~10 lines for the whole phase,
+            # whatever the scene count. Per-scene progress is on the GP
+            # dialog progress bar (SetProgressorLabel/Position).
+            log_every = max(1, total // 10)
+            scene_times = []
             composite_idx = 0
+
             for scene in clean_scenes:
-                # Each composite is ~30s+; checking every iteration keeps
-                # the Cancel button responsive without measurable overhead.
+                # Cancel check every iteration — each composite is ~30s+.
                 if arcpy.env.isCancelled:
+                    arcpy.ResetProgressor()
                     arcpy.AddWarning(
-                        f"Cancelled by user after {composite_idx}/{total} composites. "
-                        f"Scratch folder will be cleaned up; GeometricMedian skipped."
+                        f"  ✗ Cancelled by user after {composite_idx}/{total} composites."
                     )
                     return None
 
@@ -2195,26 +2190,19 @@ class LandsatMosaic(object):
                 scene_id = scene.get('scene_id') or os.path.basename(
                     (scene.get('path') or '').rstrip(os.sep)
                 ) or f"scene_{composite_idx}"
+                arcpy.SetProgressorLabel(f"[{composite_idx}/{total}] {scene_id}")
                 scene_start = datetime.now()
-                arcpy.AddMessage(
-                    f"  [{composite_idx}/{total}] composite for {scene_id}"
-                )
 
-                # Per-scene subfolder so the intermediate value_mask + band
-                # TIFs don't collide with another scene's files of the same
-                # name (Bn.tif). One shutil.rmtree on scratch_dir at the
-                # end cleans up everything.
+                # Per-scene subfolder so vmask.tif + Bn.tif don't collide
+                # between scenes. shutil.rmtree(scratch_dir) cleans the lot.
                 scene_scratch = os.path.join(
                     scratch_dir, f"s{composite_idx:04d}"
                 )
                 os.makedirs(scene_scratch, exist_ok=True)
 
-                # 1. Materialise value_mask ONCE per scene. Previously the
-                #    lazy `value_mask = ~TransposeBits(qa, ...)` got re-
-                #    evaluated by every Con expression that referenced it
-                #    (7x per scene for the 7 SR bands). With env.mask +
-                #    env.extent active, .save() honours the AOI scope and
-                #    the on-disk value_mask.tif is AOI-sized.
+                # 1. value_mask materialised ONCE per scene → kills the
+                #    7× QA decode redundancy of the previous lazy chain.
+                #    Honours env.mask + env.extent when AOI is active.
                 qa_raster = arcpy.Raster(band_paths["QA_PIXEL"])
                 cloud_mask = TransposeBits(
                     qa_raster, [0, 1, 2, 3, 4], [0, 1, 2, 3, 4], 0, None
@@ -2225,11 +2213,9 @@ class LandsatMosaic(object):
                 value_mask_raster = arcpy.Raster(value_mask_path)
 
                 if aoi_active:
-                    # 2a. AOI active: materialise each cleaned band so its
-                    #     on-disk extent IS the AOI extent. CompositeBands
-                    #     (a management tool that ignores env.extent) then
-                    #     uses the input-extent intersection — all 7 inputs
-                    #     are AOI-sized, so the output composite is AOI-sized.
+                    # AOI: materialise each cleaned band so its on-disk
+                    # extent IS the AOI extent. arcpy.management.CompositeBands
+                    # ignores env.extent, so it must see AOI-sized inputs.
                     cleaned_band_paths = []
                     for n in range(1, 8):
                         band_raster = arcpy.Raster(band_paths[f"B{n}"])
@@ -2239,11 +2225,9 @@ class LandsatMosaic(object):
                         cleaned_band_paths.append(band_path)
                     composite_inputs = cleaned_band_paths
                 else:
-                    # 2b. No AOI: keep the per-band Cons lazy (saving full-
-                    #     extent TIFs per band is wasteful disk I/O when
-                    #     they'd just be consumed once by CompositeBands).
-                    #     Reference the materialised value_mask so the QA
-                    #     decode still happens only once.
+                    # No AOI: keep per-band Cons lazy (avoid wasteful
+                    # full-extent disk writes) but reference the
+                    # materialised value_mask so QA decode is still 1×.
                     composite_inputs = [
                         Con(value_mask_raster, arcpy.Raster(band_paths[f"B{n}"]))
                         for n in range(1, 8)
@@ -2254,26 +2238,41 @@ class LandsatMosaic(object):
                 )
                 arcpy.management.CompositeBands(composite_inputs, temp_composite)
                 multiband_rasters.append(temp_composite)
+
+                scene_times.append(
+                    (datetime.now() - scene_start).total_seconds()
+                )
+                arcpy.SetProgressorPosition(composite_idx)
+
+                # Periodic Messages-tab update — ~10 lines for the phase.
+                if composite_idx % log_every == 0 or composite_idx == total:
+                    avg = sum(scene_times) / len(scene_times)
+                    pct = 100.0 * composite_idx / total
+                    arcpy.AddMessage(
+                        f"  [{composite_idx}/{total}] {pct:.0f}% — "
+                        f"avg {avg:.1f}s/scene"
+                    )
+
+            arcpy.ResetProgressor()
+
+            # Phase 3 summary with min/max/avg for outlier debuggability.
+            if scene_times:
                 arcpy.AddMessage(
-                    f"      done in "
-                    f"{(datetime.now() - scene_start).total_seconds():.1f}s"
+                    f"  ✓ {len(scene_times)} composites in {sum(scene_times):.1f}s "
+                    f"(avg {sum(scene_times)/len(scene_times):.1f}s, "
+                    f"min {min(scene_times):.1f}s, max {max(scene_times):.1f}s)"
                 )
 
-            composite_elapsed = (datetime.now() - start_time).total_seconds()
-            arcpy.AddMessage(
-                f"\nAll {len(multiband_rasters)} composites materialised in "
-                f"{composite_elapsed:.1f}s ({composite_elapsed/max(1,len(multiband_rasters)):.1f}s/scene)."
-            )
-
+            # Phase 4 — GeometricMedian
             output_path = os.path.join(gdb_path, f"{mosaic_name}_Geomedian")
             median_start = datetime.now()
             arcpy.AddMessage(
-                f"\nStarting GeometricMedian over {len(multiband_rasters)} "
-                f"stacks (max 20 iterations, epsilon=0.001). This phase "
-                f"is silent — arcpy.ia.GeometricMedian does not expose "
-                f"per-iteration progress. Memory and disk activity will "
-                f"continue; please wait for completion."
+                f"\n▶ Phase 4 — GeometricMedian over {len(multiband_rasters)} stacks"
             )
+            arcpy.AddMessage(
+                "  Silent phase (arcpy.ia.GeometricMedian has no per-iteration hook)."
+            )
+            arcpy.SetProgressor("default", "Computing GeometricMedian...")
             geomedian = arcpy.ia.GeometricMedian(
                 multiband_rasters,
                 epsilon=0.001,
@@ -2282,16 +2281,13 @@ class LandsatMosaic(object):
                 cellsize_type="FirstOf",
             )
             geomedian.save(output_path)
+            arcpy.ResetProgressor()
+            median_elapsed = (datetime.now() - median_start).total_seconds()
             arcpy.AddMessage(
-                f"GeometricMedian complete in "
-                f"{(datetime.now() - median_start).total_seconds():.1f}s."
+                f"  ✓ GeometricMedian complete in {median_elapsed:.1f}s "
+                f"→ {os.path.basename(output_path)}"
             )
 
-            arcpy.AddMessage(f"Multi-band geometric median created: {output_path}")
-            arcpy.AddMessage(
-                f"  Total {len(multiband_rasters)} scenes in "
-                f"{(datetime.now() - start_time).total_seconds():.1f}s."
-            )
             return output_path
 
         except Exception as e:
@@ -2382,20 +2378,6 @@ class LandsatMosaic(object):
             # automatically by ArcGIS, paying a one-time projection cost
             # the first time each scene's CRS is touched.
             # ----------------------------------------------------------------
-            if mask_feature and arcpy.Exists(mask_feature):
-                arcpy.env.mask = mask_feature
-                arcpy.env.extent = mask_feature
-                arcpy.AddMessage(
-                    f"\nAOI scope active: arcpy.env.mask + arcpy.env.extent "
-                    f"set to {mask_feature}. All downstream raster operations "
-                    f"will be restricted to AOI pixels."
-                )
-            elif mask_feature:
-                arcpy.AddWarning(
-                    f"AOI mask {mask_feature!r} does not exist; processing "
-                    f"will run over the full scene footprint."
-                )
-
             # Initialize statistics
             stats = {
                 'start_time': datetime.now(),
@@ -2406,45 +2388,49 @@ class LandsatMosaic(object):
                 'processing_time': [],
                 'errors': []
             }
-
-            # Prepare stats for cloud removal and geometric median
             stats['cloud_removal'] = {
-                'scenes_processed': 0,
-                'scenes_cleaned': 0,
-                'processing_time': 0
+                'scenes_processed': 0, 'scenes_cleaned': 0, 'processing_time': 0
             }
             stats['geometric_median'] = {
-                'batches_processed': 0,
-                'total_batches': 0,
-                'processing_time': 0
+                'batches_processed': 0, 'total_batches': 0, 'processing_time': 0
             }
 
-            arcpy.AddMessage("\nInitializing processing:")
-            arcpy.AddMessage(f"Workspace: {gdb_path}")
-            arcpy.AddMessage(f"Output name: {mosaic_name}")
-            arcpy.AddMessage(f"Region: {region}")
+            # Header — one block of run context, no more "Initializing
+            # processing:" prefix on every line.
+            arcpy.AddMessage("=" * 60)
+            arcpy.AddMessage(f"LANDSAT 8/9 MOSAIC — {region}")
+            arcpy.AddMessage("=" * 60)
+            arcpy.AddMessage(f"  Output:     {gdb_path}\\{mosaic_name}")
+            arcpy.AddMessage(f"  Source:     {data_folder}")
+
+            if mask_feature and arcpy.Exists(mask_feature):
+                arcpy.env.mask = mask_feature
+                arcpy.env.extent = mask_feature
+                arcpy.AddMessage(f"  AOI:        {mask_feature} (env.mask + env.extent active)")
+            elif mask_feature:
+                arcpy.AddWarning(
+                    f"  AOI:        {mask_feature!r} NOT FOUND — running over full scene footprint"
+                )
 
             # Create temporal filter and get region info
             temporal_filter = self._create_temporal_filter(time_type, year, month, season)
             region_info = self._get_region_info(region)
+            arcpy.AddMessage(f"  UTM zones:  {region_info['utm_zones']}")
 
-            # Archives are read on the fly via GDAL VSI paths inside
-            # `_find_scenes` — no extraction step, no double disk usage.
-
-            # Track scenes that actually fed the final mosaic so we can
-            # write a provenance CSV at the end.
+            # Track scenes that actually fed the final mosaic for provenance.
             all_scenes_used = []
 
             # Process each UTM zone
             final_mosaics = []
             for utm_zone in region_info['utm_zones']:
                 if arcpy.env.isCancelled:
-                    arcpy.AddWarning("Cancelled by user between UTM zones.")
+                    arcpy.AddWarning("\n✗ Cancelled by user between UTM zones.")
                     return None
                 try:
-                    arcpy.AddMessage(f"\nProcessing UTM zone {utm_zone}{region_info['hemisphere']}")
-                    
-                    # Find scenes for this zone
+                    arcpy.AddMessage(
+                        f"\n▶ Phase 1 — UTM zone {utm_zone}{region_info['hemisphere']}: scene discovery"
+                    )
+
                     scenes = self._find_scenes(
                         data_folder=data_folder,
                         utm_zone=utm_zone,
@@ -2452,20 +2438,19 @@ class LandsatMosaic(object):
                         seasonal_pattern=region_info['seasonal_pattern'],
                         stats=stats
                     )
-                    
+
                     if not scenes:
-                        arcpy.AddWarning(f"No scenes found for UTM zone {utm_zone}")
+                        arcpy.AddWarning(f"  ✗ No scenes for UTM {utm_zone}")
                         continue
 
-                    # Remove clouds from scenes
-                    arcpy.AddMessage("\nRemoving clouds from scenes...")
                     clean_scenes = self.remove_cloud(scenes, stats)
-                    
+
                     if not clean_scenes:
-                        arcpy.AddWarning(f"No valid scenes after cloud removal for UTM zone {utm_zone}")
+                        arcpy.AddWarning(
+                            f"  ✗ No valid scenes after validation for UTM {utm_zone}"
+                        )
                         continue
 
-                    # Create geometric median mosaic
                     zone_mosaic = self._create_geometric_median_mosaic(
                         clean_scenes,
                         gdb_path,
@@ -2474,11 +2459,10 @@ class LandsatMosaic(object):
 
                     if zone_mosaic:
                         final_mosaics.append(zone_mosaic)
-                        # Phase 3 addition: accumulate scenes for provenance
                         all_scenes_used.extend(clean_scenes)
 
                 except Exception as e:
-                    arcpy.AddWarning(f"Error processing UTM zone {utm_zone}: {str(e)}")
+                    arcpy.AddWarning(f"  ✗ UTM {utm_zone}: {str(e)}")
                     stats['errors'].append(f"Zone {utm_zone} error: {str(e)}")
                     continue
 
@@ -2493,78 +2477,71 @@ class LandsatMosaic(object):
             # pre-mask intermediates.
             intermediates_to_delete = []
 
+            arcpy.AddMessage("\n▶ Phase 5 — Merge / mask / cleanup")
+
             # Merge zones if needed
             if len(final_mosaics) > 1:
-                arcpy.AddMessage("\nMerging UTM zones...")
                 merged = self._merge_zone_mosaics(
                     gdb_path, mosaic_name, final_mosaics, region_info
                 )
                 if merged:
-                    # The per-zone Geomedian rasters are now superseded
-                    # by the merge — queue them for cleanup.
                     intermediates_to_delete.extend(final_mosaics)
                     final_mosaic = merged
+                    arcpy.AddMessage(f"  ✓ Merged {len(final_mosaics)} zones → {os.path.basename(merged)}")
                 else:
-                    # Merge failed; fall back to the single-zone path
                     final_mosaic = final_mosaics[0]
+                    arcpy.AddWarning("  ✗ Merge failed; keeping single-zone output")
             else:
                 final_mosaic = final_mosaics[0]
 
             # Apply mask if specified
             if final_mosaic and mask_feature:
-                arcpy.AddMessage("\nApplying mask...")
                 masked = self._apply_mask(
                     final_mosaic, mask_feature, gdb_path, mosaic_name
                 )
                 if masked and masked != final_mosaic:
-                    # The unmasked mosaic is now superseded by the masked
-                    # version — queue it for cleanup.
                     intermediates_to_delete.append(final_mosaic)
                     final_mosaic = masked
+                    arcpy.AddMessage(f"  ✓ AOI mask applied → {os.path.basename(masked)}")
 
-            # Clean up superseded intermediates (per-zone Geomedians +
-            # the unmasked mosaic). Done before the success report so the
-            # final log line accurately reflects what's left in the GDB.
+            # Clean up superseded intermediates so the GDB ends with
+            # one raster, not a trail.
+            cleaned_count = 0
             for path in intermediates_to_delete:
                 if path and path != final_mosaic:
                     try:
                         if arcpy.Exists(path):
                             arcpy.management.Delete(path)
-                            arcpy.AddMessage(
-                                f"  Removed intermediate: {os.path.basename(path)}"
-                            )
+                            cleaned_count += 1
                     except Exception as e:
-                        arcpy.AddWarning(
-                            f"  Could not delete intermediate {path}: {e}"
-                        )
+                        arcpy.AddWarning(f"  Could not delete {os.path.basename(path)}: {e}")
+            if cleaned_count:
+                arcpy.AddMessage(f"  ✓ Cleaned up {cleaned_count} intermediate(s)")
 
             # Save statistics
             if save_stats:
-                # Populate additional statistics. The previous implementation
-                # read `clean_scenes` from the last loop iteration only — that
-                # silently dropped earlier zones' counts in multi-zone regions
-                # (e.g., Portugal mainland, Mozambique). Use the accumulated
-                # list we maintain for provenance instead.
                 stats['processed_scenes'] = len(all_scenes_used)
                 stats['failed_scenes'] = stats.get('failed_scenes', 0)
-                
                 stats['end_time'] = datetime.now()
                 stats['total_duration'] = stats['end_time'] - stats['start_time']
-                
-                # Save both regular and enhanced statistics
                 self._save_statistics(gdb_path, mosaic_name, stats)
                 self._save_enhanced_statistics(gdb_path, mosaic_name, stats)
 
             if final_mosaic:
-                # Phase 3 addition: provenance CSV documenting every scene
-                # that contributed to the mosaic.
                 try:
                     self._write_provenance_csv(final_mosaic, all_scenes_used, stats)
                 except Exception as e:
-                    arcpy.AddWarning(f"Provenance CSV write failed (non-fatal): {e}")
+                    arcpy.AddWarning(f"  Provenance CSV write failed (non-fatal): {e}")
 
-                arcpy.AddMessage(f"\nProcessing completed successfully!")
-                arcpy.AddMessage(f"Output mosaic: {final_mosaic}")
+                total_elapsed = (datetime.now() - stats['start_time']).total_seconds()
+                mins, secs = divmod(int(total_elapsed), 60)
+                hrs, mins = divmod(mins, 60)
+                time_str = f"{hrs}h {mins}m {secs}s" if hrs else f"{mins}m {secs}s"
+
+                arcpy.AddMessage("\n" + "=" * 60)
+                arcpy.AddMessage(f"DONE — {os.path.basename(final_mosaic)}")
+                arcpy.AddMessage(f"Total: {time_str}  |  Scenes: {len(all_scenes_used)}")
+                arcpy.AddMessage("=" * 60)
                 return final_mosaic
             else:
                 arcpy.AddError("Failed to create final mosaic")
@@ -3834,68 +3811,59 @@ class Sentinel2Mosaic(object):
             # tile (110×110 km) that's ~70x fewer pixels per scene through
             # the JP2 decode pipeline.
             # ----------------------------------------------------------------
+            # Header — one block of run context.
+            arcpy.AddMessage("=" * 60)
+            arcpy.AddMessage(f"SENTINEL-2 L2A MOSAIC — {region}")
+            arcpy.AddMessage("=" * 60)
+            arcpy.AddMessage(f"  Output:     {gdb_path}\\{mosaic_name}")
+            arcpy.AddMessage(f"  Source:     {data_folder}")
+
             if mask_feature and arcpy.Exists(mask_feature):
                 arcpy.env.mask = mask_feature
                 arcpy.env.extent = mask_feature
-                arcpy.AddMessage(
-                    f"\nAOI scope active: arcpy.env.mask + arcpy.env.extent "
-                    f"set to {mask_feature}. All downstream raster operations "
-                    f"(resample, SCL mask, composite, GeometricMedian, merge) "
-                    f"will be restricted to AOI pixels."
-                )
+                arcpy.AddMessage(f"  AOI:        {mask_feature} (env.mask + env.extent active)")
             elif mask_feature:
                 arcpy.AddWarning(
-                    f"AOI mask {mask_feature!r} does not exist; processing "
-                    f"will run over the full tile footprint."
+                    f"  AOI:        {mask_feature!r} NOT FOUND — running over full tile footprint"
                 )
 
-            arcpy.AddMessage("\nInitialising S2 mosaic processing:")
-            arcpy.AddMessage(f"  Workspace:   {gdb_path}")
-            arcpy.AddMessage(f"  Output name: {mosaic_name}")
-            arcpy.AddMessage(f"  Region:      {region}")
-            arcpy.AddMessage(f"  Data folder: {data_folder}")
-
-            # Scratch is pinned to the output GDB's parent folder so it
-            # lives on the same disk the user already chose for outputs
-            # (typically a fast local drive) and avoids the OneDrive
-            # sync overhead that arcpy.env.scratchFolder would trigger
-            # when the Pro project Home folder is OneDrive-synced.
+            # Scratch is pinned to the output GDB's parent folder
+            # (same-disk-as-output, avoids OneDrive sync overhead).
             scratch_dir = os.path.join(
                 os.path.dirname(os.path.normpath(gdb_path)),
                 f"_genesis_s2_scratch_{uuid.uuid4().hex[:8]}",
             )
             os.makedirs(scratch_dir, exist_ok=True)
-            arcpy.AddMessage(f"  Scratch:     {scratch_dir}")
+            arcpy.AddMessage(f"  Scratch:    {scratch_dir}")
 
-            # Step 1: discover scene sources (.zip archives read on the
-            # fly via GDAL VSI, and any already-extracted .SAFE folders).
-            arcpy.AddMessage("\nStep 1/5 — Discovering S2 scenes...")
+            # Phase 1 — discover scenes
+            arcpy.AddMessage("\n▶ Phase 1 — Scene discovery")
             sources = self._find_safe_scenes(data_folder)
             if not sources:
                 arcpy.AddError(
-                    "No Sentinel-2 scenes found. Expected Copernicus .zip "
-                    "archives (read on the fly) or already-extracted .SAFE "
-                    "folders in the data folder."
+                    "  ✗ No Sentinel-2 scenes found. Expected Copernicus .zip "
+                    "archives or extracted .SAFE folders."
                 )
                 return None
             n_zip = sum(1 for _, k in sources if k == "zip")
             n_safe = sum(1 for _, k in sources if k == "safe")
             arcpy.AddMessage(
-                f"  Found {len(sources)} scene(s): {n_zip} archive(s), "
-                f"{n_safe} extracted SAFE folder(s)."
+                f"  ✓ {len(sources)} scene(s) — {n_zip} archive(s), {n_safe} SAFE folder(s)"
             )
 
-            # Step 2: parse metadata + apply temporal filter.
-            arcpy.AddMessage("\nStep 2/5 — Filtering scenes by date/season...")
+            # Phase 2 — temporal filter
+            arcpy.AddMessage("\n▶ Phase 2 — Temporal filter")
             seasonal_pattern = self._seasonal_pattern_for_region(region)
             temporal_filter = self._create_temporal_filter(
                 time_type, year, month, season,
             )
             kept_scenes = []
+            skipped_no_meta = 0
             for path, kind in sources:
                 meta = self._parse_safe_metadata(path, kind)
                 if meta is None:
-                    arcpy.AddWarning(f"  Skipped (no metadata): {os.path.basename(path)}")
+                    skipped_no_meta += 1
+                    arcpy.AddWarning(f"  ✗ {os.path.basename(path)}: no metadata")
                     continue
                 if not self._scene_passes_filter(meta, temporal_filter, seasonal_pattern):
                     continue
@@ -3905,62 +3873,78 @@ class Sentinel2Mosaic(object):
                     "metadata": meta,
                 })
             if not kept_scenes:
-                arcpy.AddError("No scenes match the temporal filter.")
+                arcpy.AddError("  ✗ No scenes match the temporal filter.")
                 return None
-            arcpy.AddMessage(f"  Kept {len(kept_scenes)} scenes after temporal filter.")
+            arcpy.AddMessage(
+                f"  ✓ {len(kept_scenes)}/{len(sources)} scenes kept "
+                f"({temporal_filter.get('type', 'all_images')})"
+            )
 
             # Step 3: process each scene (mask + scale + stack), grouped by tile.
             arcpy.AddMessage(
-                f"\nStep 3/5 — Cloud-masking and stacking {len(kept_scenes)} "
-                f"scenes (per-band SCL mask + scale + resample-to-10m + 10-band "
-                f"stack). On archive inputs the JP2 decode happens once per band "
-                f"during resample; expect tens of seconds per scene."
+                f"\n▶ Phase 3 — Cloud-mask + stack ({len(kept_scenes)} scenes)"
             )
             scenes_by_tile = {}
             all_scenes_used = []
             stack_start = datetime.now()
+            arcpy.SetProgressor(
+                "step", "Cloud-masking + stacking scenes", 0, len(kept_scenes), 1
+            )
+            log_every = max(1, len(kept_scenes) // 10)
+            scene_times = []
+
             for idx, scene in enumerate(kept_scenes, 1):
-                # Each scene is tens of seconds; check every iteration.
                 if arcpy.env.isCancelled:
+                    arcpy.ResetProgressor()
                     arcpy.AddWarning(
-                        f"Cancelled by user after processing {idx-1}/{len(kept_scenes)} scenes."
+                        f"  ✗ Cancelled after {idx-1}/{len(kept_scenes)} scenes."
                     )
                     return None
                 meta = scene["metadata"]
                 tile = meta.get("tile_id")
                 if not tile:
                     arcpy.AddWarning(
-                        f"  [{idx}/{len(kept_scenes)}] Skipped (no tile ID): "
-                        f"{os.path.basename(scene['path'])}"
+                        f"  ✗ {os.path.basename(scene['path'])}: no tile ID"
                     )
                     continue
                 src_tag = "zip" if scene.get("source_kind") == "zip" else "safe"
-                arcpy.AddMessage(
-                    f"  [{idx}/{len(kept_scenes)}] [{tile}] [{src_tag}] "
+                arcpy.SetProgressorLabel(
+                    f"[{idx}/{len(kept_scenes)}] [{tile}/{src_tag}] "
                     f"{os.path.basename(scene['path'])}"
                 )
                 scene_start = datetime.now()
                 try:
                     stacked_path = self._process_scene(scene, scratch_dir)
                 except Exception as e:
-                    arcpy.AddWarning(f"      Failed: {e}")
+                    arcpy.AddWarning(f"  ✗ {os.path.basename(scene['path'])}: {e}")
                     continue
                 if stacked_path:
                     scenes_by_tile.setdefault(tile, []).append(stacked_path)
                     composite_temp_paths.append(stacked_path)
                     all_scenes_used.append(scene)
-                    arcpy.AddMessage(
-                        f"      done in "
-                        f"{(datetime.now() - scene_start).total_seconds():.1f}s"
+                    scene_times.append(
+                        (datetime.now() - scene_start).total_seconds()
                     )
+                arcpy.SetProgressorPosition(idx)
+                # Periodic message ~10× during the phase
+                if idx % log_every == 0 or idx == len(kept_scenes):
+                    if scene_times:
+                        avg = sum(scene_times) / len(scene_times)
+                        pct = 100.0 * idx / len(kept_scenes)
+                        arcpy.AddMessage(
+                            f"  [{idx}/{len(kept_scenes)}] {pct:.0f}% — "
+                            f"avg {avg:.1f}s/scene"
+                        )
+
+            arcpy.ResetProgressor()
             if not scenes_by_tile:
-                arcpy.AddError("No scenes survived cloud masking + stacking.")
+                arcpy.AddError("  ✗ No scenes survived cloud masking + stacking.")
                 return None
             stack_elapsed = (datetime.now() - stack_start).total_seconds()
             arcpy.AddMessage(
-                f"  Step 3 done in {stack_elapsed:.1f}s "
-                f"({stack_elapsed/max(1,len(all_scenes_used)):.1f}s/scene). "
-                f"Tiles ready: {sorted(scenes_by_tile.keys())}"
+                f"  ✓ {len(all_scenes_used)} scenes in {stack_elapsed:.1f}s "
+                f"({stack_elapsed/max(1,len(all_scenes_used)):.1f}s/scene) — "
+                f"tiles: {sorted(scenes_by_tile.keys())}"
             )
 
             # Optional Step 3b: multitemporal cloud refinement layer.
@@ -3972,24 +3956,24 @@ class Sentinel2Mosaic(object):
                     "temporal anomaly pass will land in a follow-up phase."
                 )
 
-            # Step 4: per-tile geometric median, then merge.
+            # Step 4: per-tile geometric median.
             arcpy.AddMessage(
-                f"\nStep 4/5 — Computing per-tile geometric median across "
-                f"{len(scenes_by_tile)} tile(s). arcpy.sa.GeometricMedian "
-                f"iterates internally (no per-iteration log); each tile is "
-                f"silent until its mosaic is saved."
+                f"\n▶ Phase 4 — GeometricMedian over {len(scenes_by_tile)} tile(s)"
             )
             tile_mosaics = []
             median_phase_start = datetime.now()
+            arcpy.SetProgressor(
+                "step", "Per-tile GeometricMedian", 0, len(scenes_by_tile), 1
+            )
             for ti, (tile, stacked_paths) in enumerate(scenes_by_tile.items(), 1):
                 if arcpy.env.isCancelled:
+                    arcpy.ResetProgressor()
                     arcpy.AddWarning(
-                        f"Cancelled by user after computing {ti-1}/{len(scenes_by_tile)} tile medians."
+                        f"  ✗ Cancelled after {ti-1}/{len(scenes_by_tile)} tiles."
                     )
                     return None
-                arcpy.AddMessage(
-                    f"  [{ti}/{len(scenes_by_tile)}] [{tile}] computing median "
-                    f"over {len(stacked_paths)} scenes..."
+                arcpy.SetProgressorLabel(
+                    f"[{ti}/{len(scenes_by_tile)}] {tile} ({len(stacked_paths)} scenes)"
                 )
                 tile_start = datetime.now()
                 try:
@@ -3999,37 +3983,30 @@ class Sentinel2Mosaic(object):
                     median.save(tile_mosaic_path)
                     tile_mosaics.append(tile_mosaic_path)
                     arcpy.AddMessage(
-                        f"      saved {tile_mosaic_path} in "
+                        f"  ✓ [{tile}] {len(stacked_paths)} scenes → "
                         f"{(datetime.now() - tile_start).total_seconds():.1f}s"
                     )
                 except Exception as e:
-                    arcpy.AddError(f"      Geometric median failed for {tile}: {e}")
+                    arcpy.AddError(f"  ✗ [{tile}] GeometricMedian failed: {e}")
                     continue
+                arcpy.SetProgressorPosition(ti)
+            arcpy.ResetProgressor()
             arcpy.AddMessage(
-                f"  Step 4 done in "
-                f"{(datetime.now() - median_phase_start).total_seconds():.1f}s "
-                f"({len(tile_mosaics)} tile mosaic(s) created)."
+                f"  ✓ Phase 4 in {(datetime.now() - median_phase_start).total_seconds():.1f}s "
+                f"({len(tile_mosaics)} tile mosaic(s))"
             )
 
             if not tile_mosaics:
-                arcpy.AddError("No tile mosaics were created.")
+                arcpy.AddError("  ✗ No tile mosaics were created.")
                 return None
 
-            # Merge multi-tile result.
-            arcpy.AddMessage("\nStep 5/5 — Finalising output...")
-
-            # Track intermediates created during this run so we can
-            # delete them after the final output is established. The
-            # user wants ONE raster in the output GDB.
+            # Phase 5 — merge + mask + cleanup
+            arcpy.AddMessage("\n▶ Phase 5 — Merge / mask / cleanup")
             intermediates_to_delete = []
 
             if len(tile_mosaics) > 1:
                 final_path = os.path.join(gdb_path, mosaic_name)
                 merge_start = datetime.now()
-                arcpy.AddMessage(
-                    f"  Merging {len(tile_mosaics)} tile mosaics via "
-                    f"MosaicToNewRaster (MEAN, 10m, 32-bit float)..."
-                )
                 arcpy.management.MosaicToNewRaster(
                     input_rasters=tile_mosaics,
                     output_location=gdb_path,
@@ -4041,61 +4018,62 @@ class Sentinel2Mosaic(object):
                     mosaic_method="MEAN",
                 )
                 arcpy.AddMessage(
-                    f"    Merge complete in "
+                    f"  ✓ Merged {len(tile_mosaics)} tiles in "
                     f"{(datetime.now() - merge_start).total_seconds():.1f}s "
-                    f"→ {final_path}"
+                    f"→ {os.path.basename(final_path)}"
                 )
-                # Per-tile mosaics are superseded by the merged result.
                 intermediates_to_delete.extend(tile_mosaics)
                 final_mosaic = final_path
             else:
-                arcpy.AddMessage(
-                    f"  Single tile — skipping merge. Final mosaic: "
-                    f"{tile_mosaics[0]}"
-                )
                 final_mosaic = tile_mosaics[0]
+                arcpy.AddMessage(f"  ✓ Single tile → {os.path.basename(final_mosaic)}")
 
             # Apply AOI mask if requested.
             if mask_feature and arcpy.Exists(mask_feature):
                 mask_start = datetime.now()
-                arcpy.AddMessage(f"  Applying AOI mask: {mask_feature}")
                 masked = arcpy.sa.ExtractByMask(final_mosaic, mask_feature)
                 masked_path = os.path.join(gdb_path, f"{mosaic_name}_Masked")
                 masked.save(masked_path)
-                # The unmasked mosaic is superseded by the masked one.
                 intermediates_to_delete.append(final_mosaic)
                 final_mosaic = masked_path
                 arcpy.AddMessage(
-                    f"    AOI mask applied in "
+                    f"  ✓ AOI mask applied in "
                     f"{(datetime.now() - mask_start).total_seconds():.1f}s "
-                    f"→ {masked_path}"
+                    f"→ {os.path.basename(masked_path)}"
                 )
             elif mask_feature:
                 arcpy.AddWarning(
-                    f"AOI mask {mask_feature!r} not found — output is unmasked."
+                    f"  ✗ AOI mask {mask_feature!r} not found — output is unmasked."
                 )
 
             # Delete superseded intermediates so only the final mosaic
             # remains in the output GDB.
+            cleaned_count = 0
             for path in intermediates_to_delete:
                 if path and path != final_mosaic:
                     try:
                         if arcpy.Exists(path):
                             arcpy.management.Delete(path)
-                            arcpy.AddMessage(
-                                f"  Removed intermediate: {os.path.basename(path)}"
-                            )
+                            cleaned_count += 1
                     except Exception as e:
                         arcpy.AddWarning(
-                            f"  Could not delete intermediate {path}: {e}"
+                            f"  Could not delete {os.path.basename(path)}: {e}"
                         )
+            if cleaned_count:
+                arcpy.AddMessage(f"  ✓ Cleaned up {cleaned_count} intermediate(s)")
 
-            # Provenance CSV.
             if save_stats:
-                arcpy.AddMessage("  Writing provenance CSV...")
                 self._write_provenance_csv(final_mosaic, all_scenes_used)
 
-            arcpy.AddMessage("\nDone. Final mosaic: " + str(final_mosaic))
+            total_elapsed = (datetime.now() - stack_start).total_seconds()
+            mins, secs = divmod(int(total_elapsed), 60)
+            hrs, mins = divmod(mins, 60)
+            time_str = f"{hrs}h {mins}m {secs}s" if hrs else f"{mins}m {secs}s"
+
+            arcpy.AddMessage("\n" + "=" * 60)
+            arcpy.AddMessage(f"DONE — {os.path.basename(final_mosaic)}")
+            arcpy.AddMessage(f"Total: {time_str}  |  Scenes: {len(all_scenes_used)}")
+            arcpy.AddMessage("=" * 60)
             return final_mosaic
 
         except Exception as e:
@@ -4419,7 +4397,6 @@ class Sentinel2Mosaic(object):
 
         # Build the cloud mask from SCL resampled to 10m (NEAREST so we
         # don't blur the class boundaries).
-        arcpy.AddMessage("      • SCL resample → 10m (NEAREST) + cloud-class mask build")
         scl_10m_path = os.path.join(scratch_dir, f"{scene_id}_SCL_10m.tif")
         arcpy.management.Resample(bands["SCL"], scl_10m_path, 10, "NEAREST")
         scl_10m = arcpy.sa.Raster(scl_10m_path)
@@ -4430,12 +4407,6 @@ class Sentinel2Mosaic(object):
 
         # Process each band: resample if 20m, scale to reflectance,
         # apply cloud mask, save.
-        n_20m = sum(1 for b in _S2_STACK_ORDER if b not in _S2_NATIVE_10M)
-        n_10m = len(_S2_STACK_ORDER) - n_20m
-        arcpy.AddMessage(
-            f"      • scale + mask {len(_S2_STACK_ORDER)} bands "
-            f"({n_10m} @ 10m native, {n_20m} resampled 20m→10m)"
-        )
         masked_paths = []
         for band in _S2_STACK_ORDER:
             band_src = bands[band]
@@ -4456,7 +4427,6 @@ class Sentinel2Mosaic(object):
             masked_paths.append(out_path)
 
         # Composite into a single 10-band raster.
-        arcpy.AddMessage("      • composite 10 bands → scene stack")
         stacked_path = os.path.join(scratch_dir, f"{scene_id}_stack.tif")
         arcpy.management.CompositeBands(masked_paths, stacked_path)
         return stacked_path
@@ -4854,29 +4824,24 @@ class AsterMosaic(object):
             # loads only AOI pixels — a massive memory saving on top of
             # the compute saving.
             # ----------------------------------------------------------------
+            # Header — one block of run context.
+            arcpy.AddMessage("=" * 60)
+            arcpy.AddMessage(f"ASTER L2 MOSAIC — {region}")
+            arcpy.AddMessage("=" * 60)
+            arcpy.AddMessage(f"  Output:     {gdb_path}\\{mosaic_name}")
+            arcpy.AddMessage(f"  Source:     {data_folder}")
+            arcpy.AddMessage(
+                f"  Options:    QA mask = {use_qa}, temporal refinement = {apply_temporal}"
+            )
+
             if mask_feature and arcpy.Exists(mask_feature):
                 arcpy.env.mask = mask_feature
                 arcpy.env.extent = mask_feature
-                arcpy.AddMessage(
-                    f"\nAOI scope active: arcpy.env.mask + arcpy.env.extent "
-                    f"set to {mask_feature}. All downstream raster operations "
-                    f"(SWIR resample, QA mask, scale, composite, temporal "
-                    f"refinement, GeometricMedian) will be restricted to AOI "
-                    f"pixels."
-                )
+                arcpy.AddMessage(f"  AOI:        {mask_feature} (env.mask + env.extent active)")
             elif mask_feature:
                 arcpy.AddWarning(
-                    f"AOI mask {mask_feature!r} does not exist; processing "
-                    f"will run over the full scene footprint."
+                    f"  AOI:        {mask_feature!r} NOT FOUND — running over full scene footprint"
                 )
-
-            arcpy.AddMessage("\nInitialising ASTER mosaic processing:")
-            arcpy.AddMessage(f"  Workspace:   {gdb_path}")
-            arcpy.AddMessage(f"  Output name: {mosaic_name}")
-            arcpy.AddMessage(f"  Region:      {region}")
-            arcpy.AddMessage(f"  Data folder: {data_folder}")
-            arcpy.AddMessage(f"  QA mask:     {use_qa}")
-            arcpy.AddMessage(f"  Temporal:    {apply_temporal}")
 
             # Scratch is pinned to the output GDB's parent folder
             # (same-disk-as-output, avoids OneDrive sync overhead).
@@ -4885,17 +4850,18 @@ class AsterMosaic(object):
                 f"_genesis_aster_scratch_{uuid.uuid4().hex[:8]}",
             )
             os.makedirs(scratch_dir, exist_ok=True)
+            arcpy.AddMessage(f"  Scratch:    {scratch_dir}")
 
-            # Step 1: discover scenes (TIFF and HDF).
-            arcpy.AddMessage("\nStep 1/6 — Discovering ASTER scenes...")
+            # Phase 1 — discover scenes (TIFF and HDF)
+            arcpy.AddMessage("\n▶ Phase 1 — Scene discovery")
             scenes = self._find_aster_scenes(data_folder)
             if not scenes:
-                arcpy.AddError("No ASTER scenes found.")
+                arcpy.AddError("  ✗ No ASTER scenes found.")
                 return None
-            arcpy.AddMessage(f"  Found {len(scenes)} scene(s).")
+            arcpy.AddMessage(f"  ✓ {len(scenes)} scene(s)")
 
-            # Step 2: temporal filter.
-            arcpy.AddMessage("\nStep 2/6 — Filtering scenes by date/season...")
+            # Phase 2 — temporal filter
+            arcpy.AddMessage("\n▶ Phase 2 — Temporal filter")
             seasonal_pattern = self._seasonal_pattern_for_region(region)
             temporal_filter = self._create_temporal_filter(time_type, year, month, season)
             kept_scenes = [
@@ -4905,121 +4871,132 @@ class AsterMosaic(object):
                 )
             ]
             if not kept_scenes:
-                arcpy.AddError("No scenes match the temporal filter.")
+                arcpy.AddError("  ✗ No scenes match the temporal filter.")
                 return None
-            arcpy.AddMessage(f"  Kept {len(kept_scenes)} scene(s) after temporal filter.")
-
-            # Step 3: per-scene processing — scale, resample SWIR, QA mask, stack.
             arcpy.AddMessage(
-                f"\nStep 3/6 — Processing {len(kept_scenes)} scenes "
-                f"(scale + SWIR 30m→15m resample + optional QA mask + 9-band stack). "
-                f"HDF inputs are extracted lazily per scene via gdal.Translate."
+                f"  ✓ {len(kept_scenes)}/{len(scenes)} scenes kept "
+                f"({temporal_filter.get('type', 'all_images')})"
+            )
+
+            # Phase 3 — per-scene processing (scale, SWIR resample, QA mask, stack)
+            arcpy.AddMessage(
+                f"\n▶ Phase 3 — Per-scene processing ({len(kept_scenes)} scenes)"
             )
             stacked_paths = []
             scenes_used = []
             stack_phase_start = datetime.now()
             for idx, scene in enumerate(kept_scenes, 1):
                 if arcpy.env.isCancelled:
+                    arcpy.ResetProgressor()
                     arcpy.AddWarning(
-                        f"Cancelled by user after processing {idx-1}/{len(kept_scenes)} ASTER scenes."
+                        f"  ✗ Cancelled after {idx-1}/{len(kept_scenes)} scenes."
                     )
                     return None
-                arcpy.AddMessage(
-                    f"  [{idx}/{len(kept_scenes)}] [{scene.get('format','?')}] "
+                if idx == 1:
+                    arcpy.SetProgressor(
+                        "step", "ASTER per-scene processing",
+                        0, len(kept_scenes), 1
+                    )
+                    log_every = max(1, len(kept_scenes) // 10)
+                    scene_times = []
+
+                arcpy.SetProgressorLabel(
+                    f"[{idx}/{len(kept_scenes)}] [{scene.get('format','?')}] "
                     f"{scene['scene_id']}"
                 )
                 scene_start = datetime.now()
                 try:
                     stacked = self._process_scene(scene, scratch_dir, use_qa)
                 except Exception as e:
-                    arcpy.AddWarning(f"      Failed: {e}")
+                    arcpy.AddWarning(f"  ✗ {scene['scene_id']}: {e}")
+                    arcpy.SetProgressorPosition(idx)
                     continue
                 if stacked:
                     stacked_paths.append(stacked)
                     scenes_used.append(scene)
-                    arcpy.AddMessage(
-                        f"      done in "
-                        f"{(datetime.now() - scene_start).total_seconds():.1f}s"
+                    scene_times.append(
+                        (datetime.now() - scene_start).total_seconds()
                     )
+                arcpy.SetProgressorPosition(idx)
+                if idx % log_every == 0 or idx == len(kept_scenes):
+                    if scene_times:
+                        avg = sum(scene_times) / len(scene_times)
+                        pct = 100.0 * idx / len(kept_scenes)
+                        arcpy.AddMessage(
+                            f"  [{idx}/{len(kept_scenes)}] {pct:.0f}% — "
+                            f"avg {avg:.1f}s/scene"
+                        )
+
+            arcpy.ResetProgressor()
             if not stacked_paths:
-                arcpy.AddError("No scenes survived per-scene processing.")
+                arcpy.AddError("  ✗ No scenes survived per-scene processing.")
                 return None
             stack_phase_elapsed = (datetime.now() - stack_phase_start).total_seconds()
             arcpy.AddMessage(
-                f"  Step 3 done in {stack_phase_elapsed:.1f}s "
-                f"({stack_phase_elapsed/max(1,len(stacked_paths)):.1f}s/scene)."
+                f"  ✓ {len(stacked_paths)} scenes in {stack_phase_elapsed:.1f}s "
+                f"({stack_phase_elapsed/max(1,len(stacked_paths)):.1f}s/scene)"
             )
 
-            # Step 4: optional multitemporal anomaly refinement.
+            # Phase 4 — optional multitemporal anomaly refinement
             if apply_temporal and len(stacked_paths) >= 5:
                 arcpy.AddMessage(
-                    f"\nStep 4/6 — Multitemporal cloud refinement "
-                    f"({len(stacked_paths)} scenes). Computes per-pixel "
-                    f"temporal median + MAD and flags anomalies."
+                    f"\n▶ Phase 4 — Multitemporal cloud refinement ({len(stacked_paths)} scenes)"
                 )
                 temporal_start = datetime.now()
                 stacked_paths = self._apply_multitemporal_refinement(
                     stacked_paths, scratch_dir,
                 )
                 arcpy.AddMessage(
-                    f"  Step 4 done in "
-                    f"{(datetime.now() - temporal_start).total_seconds():.1f}s."
+                    f"  ✓ Phase 4 in {(datetime.now() - temporal_start).total_seconds():.1f}s"
                 )
             elif apply_temporal:
                 arcpy.AddWarning(
-                    f"\nStep 4/6 — Skipped multitemporal refinement: "
-                    f"only {len(stacked_paths)} scenes (need ≥5 for robust statistics)."
+                    f"\n▶ Phase 4 — Skipped (only {len(stacked_paths)} scenes; need ≥5)"
                 )
 
-            # Step 5: geometric median.
-            arcpy.AddMessage(
-                f"\nStep 5/6 — Computing geometric median across "
-                f"{len(stacked_paths)} scene stack(s). arcpy.sa.GeometricMedian "
-                f"is silent during iteration; please wait."
-            )
+            # Phase 5 — GeometricMedian
+            arcpy.AddMessage(f"\n▶ Phase 5 — GeometricMedian over {len(stacked_paths)} stacks")
+            arcpy.SetProgressor("default", "Computing GeometricMedian...")
             median_start = datetime.now()
             output_path = os.path.join(gdb_path, mosaic_name)
             try:
                 median = arcpy.sa.GeometricMedian(stacked_paths)
                 median.save(output_path)
+                arcpy.ResetProgressor()
                 arcpy.AddMessage(
-                    f"  Saved {output_path} in "
-                    f"{(datetime.now() - median_start).total_seconds():.1f}s."
+                    f"  ✓ GeometricMedian in {(datetime.now() - median_start).total_seconds():.1f}s "
+                    f"→ {os.path.basename(output_path)}"
                 )
             except Exception as e:
-                arcpy.AddError(f"GeometricMedian failed: {e}")
+                arcpy.ResetProgressor()
+                arcpy.AddError(f"  ✗ GeometricMedian failed: {e}")
                 return None
 
-            # Step 6: AOI mask + provenance.
-            arcpy.AddMessage("\nStep 6/6 — Finalising output...")
+            # Phase 6 — AOI mask + provenance
+            arcpy.AddMessage("\n▶ Phase 6 — Mask / cleanup / provenance")
             final_path = output_path
             unmasked_to_delete = None
             if mask_feature and arcpy.Exists(mask_feature):
                 mask_start = datetime.now()
-                arcpy.AddMessage(f"  Applying AOI mask: {mask_feature}")
                 masked = arcpy.sa.ExtractByMask(output_path, mask_feature)
                 masked_path = os.path.join(gdb_path, f"{mosaic_name}_Masked")
                 masked.save(masked_path)
-                # The unmasked Geomedian output is superseded by the
-                # masked one — queue it for cleanup so the GDB ends up
-                # with one raster, not two.
                 unmasked_to_delete = output_path
                 final_path = masked_path
                 arcpy.AddMessage(
-                    f"    AOI mask applied in "
+                    f"  ✓ AOI mask applied in "
                     f"{(datetime.now() - mask_start).total_seconds():.1f}s "
-                    f"→ {masked_path}"
+                    f"→ {os.path.basename(masked_path)}"
                 )
             elif mask_feature:
-                arcpy.AddWarning(f"AOI mask {mask_feature!r} not found — output is unmasked.")
+                arcpy.AddWarning(f"  ✗ AOI mask {mask_feature!r} not found — output is unmasked.")
 
-            # Delete superseded unmasked intermediate.
             if unmasked_to_delete and unmasked_to_delete != final_path:
                 try:
                     if arcpy.Exists(unmasked_to_delete):
                         arcpy.management.Delete(unmasked_to_delete)
                         arcpy.AddMessage(
-                            f"  Removed intermediate: {os.path.basename(unmasked_to_delete)}"
+                            f"  ✓ Removed intermediate: {os.path.basename(unmasked_to_delete)}"
                         )
                 except Exception as e:
                     arcpy.AddWarning(
@@ -5027,10 +5004,16 @@ class AsterMosaic(object):
                     )
 
             if save_stats:
-                arcpy.AddMessage("  Writing provenance CSV...")
                 self._write_provenance_csv(final_path, scenes_used)
 
-            arcpy.AddMessage(f"\nDone. Final mosaic: {final_path}")
+            total_elapsed = (datetime.now() - stack_phase_start).total_seconds()
+            mins, secs = divmod(int(total_elapsed), 60)
+            hrs, mins = divmod(mins, 60)
+            time_str = f"{hrs}h {mins}m {secs}s" if hrs else f"{mins}m {secs}s"
+            arcpy.AddMessage("\n" + "=" * 60)
+            arcpy.AddMessage(f"DONE — {os.path.basename(final_path)}")
+            arcpy.AddMessage(f"Total: {time_str}  |  Scenes: {len(scenes_used)}")
+            arcpy.AddMessage("=" * 60)
             return final_path
 
         except Exception as e:
@@ -5222,21 +5205,12 @@ class AsterMosaic(object):
                 try:
                     test_uri = next(iter(extracted.values()))
                     _ = arcpy.sa.Raster(test_uri).bandCount
-                    arcpy.AddMessage(
-                        "      • reading HDF subdatasets directly via GDAL "
-                        "(no scratch materialisation)"
-                    )
                 except Exception:
-                    arcpy.AddMessage(
-                        "      • arcpy cannot read HDF subdataset URIs on "
-                        "this install; falling back to scratch TIFFs"
-                    )
-                    extracted = None
+                    extracted = None  # arcpy can't read URIs; fall back below
             if extracted is None:
-                arcpy.AddMessage("      • extracting HDF subdatasets to scratch TIFFs")
                 extracted = self._extract_hdf_to_tiffs(scene["files"]["hdf"], scratch_dir)
                 if extracted is None:
-                    arcpy.AddWarning("      HDF extraction failed; scene skipped.")
+                    arcpy.AddWarning(f"  ✗ {scene['scene_id']}: HDF extraction failed")
                     return None
             scene = dict(scene, format="tiff", files=extracted)
 
@@ -5246,7 +5220,7 @@ class AsterMosaic(object):
         # Verify we have all 9 image bands.
         missing = [b for b in _ASTER_STACK_ORDER if b not in files]
         if missing:
-            arcpy.AddWarning(f"      Missing bands {missing}; scene skipped.")
+            arcpy.AddWarning(f"  ✗ {scene_id}: missing bands {missing}")
             return None
 
         # Optional QA mask. Conservative implementation: treat any non-zero
@@ -5259,7 +5233,6 @@ class AsterMosaic(object):
         if use_qa and any(qa in files for qa in _ASTER_QA_NAMES):
             qa_path = next((files[q] for q in _ASTER_QA_NAMES if q in files), None)
             if qa_path:
-                arcpy.AddMessage("      • QA Data Plane → 15m (NEAREST), non-zero pixels flagged")
                 try:
                     qa_raster = arcpy.sa.Raster(qa_path)
                     # Resample QA to 15m (NEAREST to preserve class codes).
@@ -5268,19 +5241,11 @@ class AsterMosaic(object):
                     qa_raster = arcpy.sa.Raster(qa_resampled)
                     qa_mask = qa_raster != 0  # non-zero == flagged
                 except Exception as e:
-                    arcpy.AddWarning(f"      QA mask build failed (continuing without): {e}")
+                    arcpy.AddWarning(f"  ✗ {scene_id}: QA mask build failed ({e}); continuing without")
                     qa_mask = None
-        elif use_qa:
-            arcpy.AddMessage("      • QA mask requested but no QA Data Plane present; skipped")
 
         # Process each band: resample SWIR to 15m, scale to reflectance,
         # apply QA mask if present.
-        n_swir = sum(1 for b in _ASTER_STACK_ORDER if b not in _ASTER_NATIVE_15M)
-        n_vnir = len(_ASTER_STACK_ORDER) - n_swir
-        arcpy.AddMessage(
-            f"      • scale + mask {len(_ASTER_STACK_ORDER)} bands "
-            f"({n_vnir} VNIR @ 15m native, {n_swir} SWIR resampled 30m→15m)"
-        )
         masked_paths = []
         for band in _ASTER_STACK_ORDER:
             src = files[band]
@@ -5301,7 +5266,6 @@ class AsterMosaic(object):
             masked.save(out)
             masked_paths.append(out)
 
-        arcpy.AddMessage("      • composite 9 bands → scene stack")
         stacked = os.path.join(scratch_dir, f"{scene_id}_stack.tif")
         arcpy.management.CompositeBands(masked_paths, stacked)
         return stacked
