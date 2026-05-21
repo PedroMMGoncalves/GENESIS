@@ -144,22 +144,26 @@ class phase:
     """Context manager that wraps a phase of work with start/end markers.
 
     Standardises the ``▶ Phase N — ...`` / ``✓ Phase N in Xs`` /
-    ``✗ Phase N failed after Xs`` logging idiom that previously lived
-    open-coded in every mosaic tool, and exposes the elapsed time as
-    ``.elapsed`` so callers can fold it into a richer close-line.
+    ``✗ Phase N failed after Xs: {exc}`` logging idiom that previously
+    lived open-coded in every mosaic tool, and exposes the elapsed
+    time as ``.elapsed`` so callers can fold it into a richer
+    close-line.
 
-    Two usage modes:
+    Lowercase class name is intentional — reads as a verb in
+    ``with phase("..."):`` blocks (cf. ``contextlib.suppress``).
 
-      Auto-close (simple sites, prints "✓ {label} in {t:.1f}s" on
-      successful exit)::
+    Three usage modes:
+
+      Auto-close (simple sites, prints
+      "✓ {label} in {t:.1f}s" on successful exit)::
 
           with phase("Phase 5 — Merge / mask / cleanup"):
               ...
 
-      Quiet-close (sites that want to print their own enriched close
-      line — averaged per-scene timings, scene-count breakdowns, etc.
-      The context manager still prints the ▶ entry line and the ✗
-      failure line, just suppresses its own ✓ close)::
+      Quiet-close (sites that print their own enriched close line —
+      averaged per-scene timings, scene-count breakdowns, etc. The
+      manager still prints the ▶ entry line and the ✗ failure line,
+      just suppresses its own ✓ close)::
 
           with phase("Phase 3 — Per-scene processing", count=n,
                      quiet_close=True) as p:
@@ -167,17 +171,30 @@ class phase:
               arcpy.AddMessage(f"  ✓ {n} scenes in {p.elapsed:.1f}s "
                                f"(avg {avg:.1f}s/scene)")
 
-    On exception the context manager prints ``✗ {label} failed after
-    Xs`` as a warning and re-raises, so phase failures stay visible in
-    the GP dialog without callers needing a separate try/except just
-    for logging.
+      Silent-error (sites already wrapped in an outer ``except``
+      handler that logs the failure with its own canonical message.
+      Avoids the duplicate yellow-then-red icon noise in the GP
+      dialog. The manager still prints the ▶ entry line and the ✓
+      close line; only the ✗ failure warning is suppressed)::
+
+          try:
+              with phase("Phase 4 — GeometricMedian", quiet_close=True,
+                         silent_error=True) as ph:
+                  ... work ...
+          except arcpy.ExecuteError as e:
+              arcpy.AddError(f"GeometricMedian failed: {e}")
+              return None
+
+    Returns ``False`` from ``__exit__`` in all error modes, so
+    exceptions always propagate.
     """
 
     def __init__(self, label, count=None, quiet_close=False,
-                 message_callback=None):
+                 silent_error=False, message_callback=None):
         self.label = label
         self.count = count
         self.quiet_close = quiet_close
+        self.silent_error = silent_error
         self._msg = message_callback or arcpy.AddMessage
         self._start = None
         self.elapsed = 0.0
@@ -195,7 +212,7 @@ class phase:
         if exc_type is None:
             if not self.quiet_close:
                 self._msg(f"  ✓ {self.label} in {self.elapsed:.1f}s")
-        else:
+        elif not self.silent_error:
             arcpy.AddWarning(
                 f"  ✗ {self.label} failed after {self.elapsed:.1f}s: {exc_val}"
             )
@@ -2673,6 +2690,10 @@ class LandsatMosaic(object):
             with phase(
                 f"Phase 4 — GeometricMedian over {len(multiband_rasters)} stacks",
                 quiet_close=True,
+                # Outer except in _create_geometric_median_mosaic logs the
+                # canonical failure message — suppress phase's own warning
+                # to avoid the double yellow+red icons in the GP dialog.
+                silent_error=True,
             ) as ph:
                 arcpy.AddMessage(
                     "  Silent phase (arcpy.ia.GeometricMedian has no per-iteration hook)."
@@ -2868,46 +2889,49 @@ class LandsatMosaic(object):
             # pre-mask intermediates.
             intermediates_to_delete = []
 
-            arcpy.AddMessage("\n▶ Phase 5 — Merge / mask / cleanup")
-
-            # Merge zones if needed
-            if len(final_mosaics) > 1:
-                merged = self._merge_zone_mosaics(
-                    gdb_path, mosaic_name, final_mosaics, region_info
-                )
-                if merged:
-                    intermediates_to_delete.extend(final_mosaics)
-                    final_mosaic = merged
-                    arcpy.AddMessage(f"  ✓ Merged {len(final_mosaics)} zones → {os.path.basename(merged)}")
+            with phase(
+                "Phase 5 — Merge / mask / cleanup",
+                quiet_close=True,
+                silent_error=True,
+            ) as ph5:
+                # Merge zones if needed
+                if len(final_mosaics) > 1:
+                    merged = self._merge_zone_mosaics(
+                        gdb_path, mosaic_name, final_mosaics, region_info
+                    )
+                    if merged:
+                        intermediates_to_delete.extend(final_mosaics)
+                        final_mosaic = merged
+                        arcpy.AddMessage(f"  ✓ Merged {len(final_mosaics)} zones → {os.path.basename(merged)}")
+                    else:
+                        final_mosaic = final_mosaics[0]
+                        arcpy.AddWarning("  ✗ Merge failed; keeping single-zone output")
                 else:
                     final_mosaic = final_mosaics[0]
-                    arcpy.AddWarning("  ✗ Merge failed; keeping single-zone output")
-            else:
-                final_mosaic = final_mosaics[0]
 
-            # Apply mask if specified
-            if final_mosaic and mask_feature:
-                masked = self._apply_mask(
-                    final_mosaic, mask_feature, gdb_path, mosaic_name
-                )
-                if masked and masked != final_mosaic:
-                    intermediates_to_delete.append(final_mosaic)
-                    final_mosaic = masked
-                    arcpy.AddMessage(f"  ✓ AOI mask applied → {os.path.basename(masked)}")
+                # Apply mask if specified
+                if final_mosaic and mask_feature:
+                    masked = self._apply_mask(
+                        final_mosaic, mask_feature, gdb_path, mosaic_name
+                    )
+                    if masked and masked != final_mosaic:
+                        intermediates_to_delete.append(final_mosaic)
+                        final_mosaic = masked
+                        arcpy.AddMessage(f"  ✓ AOI mask applied → {os.path.basename(masked)}")
 
-            # Clean up superseded intermediates so the GDB ends with
-            # one raster, not a trail.
-            cleaned_count = 0
-            for path in intermediates_to_delete:
-                if path and path != final_mosaic:
-                    try:
-                        if arcpy.Exists(path):
-                            arcpy.management.Delete(path)
-                            cleaned_count += 1
-                    except arcpy.ExecuteError as e:
-                        arcpy.AddWarning(f"  Could not delete {os.path.basename(path)}: {e}")
-            if cleaned_count:
-                arcpy.AddMessage(f"  ✓ Cleaned up {cleaned_count} intermediate(s)")
+                # Clean up superseded intermediates so the GDB ends with
+                # one raster, not a trail.
+                cleaned_count = 0
+                for path in intermediates_to_delete:
+                    if path and path != final_mosaic:
+                        try:
+                            if arcpy.Exists(path):
+                                arcpy.management.Delete(path)
+                                cleaned_count += 1
+                        except arcpy.ExecuteError as e:
+                            arcpy.AddWarning(f"  Could not delete {os.path.basename(path)}: {e}")
+                if cleaned_count:
+                    arcpy.AddMessage(f"  ✓ Cleaned up {cleaned_count} intermediate(s)")
 
             # Save statistics
             if save_stats:
@@ -4490,6 +4514,10 @@ class Sentinel2Mosaic(object):
             with phase(
                 f"Phase 4 — GeometricMedian over {len(scenes_by_tile)} tile(s)",
                 quiet_close=True,
+                # Outer except in Sentinel2Mosaic.execute logs the canonical
+                # "Tool 01 failed" message + traceback — suppress phase's own
+                # warning to avoid the double yellow+red icons.
+                silent_error=True,
             ) as ph:
                 arcpy.SetProgressor(
                     "step", "Per-tile GeometricMedian", 0, len(scenes_by_tile), 1
@@ -4536,58 +4564,62 @@ class Sentinel2Mosaic(object):
                 return None
 
             # Phase 5 — merge + mask + cleanup
-            arcpy.AddMessage("\n▶ Phase 5 — Merge / mask / cleanup")
-            intermediates_to_delete = []
+            with phase(
+                "Phase 5 — Merge / mask / cleanup",
+                quiet_close=True,
+                silent_error=True,
+            ) as ph5:
+                intermediates_to_delete = []
 
-            if len(tile_mosaics) > 1:
-                final_path = os.path.join(gdb_path, mosaic_name)
-                merge_start = datetime.now()
-                arcpy.management.MosaicToNewRaster(
-                    input_rasters=tile_mosaics,
-                    output_location=gdb_path,
-                    raster_dataset_name_with_extension=mosaic_name,
-                    coordinate_system_for_the_raster="",
-                    pixel_type="32_BIT_FLOAT",
-                    cellsize=10,
-                    number_of_bands=len(_S2_STACK_ORDER),
-                    mosaic_method="MEAN",
+                if len(tile_mosaics) > 1:
+                    final_path = os.path.join(gdb_path, mosaic_name)
+                    merge_start = datetime.now()
+                    arcpy.management.MosaicToNewRaster(
+                        input_rasters=tile_mosaics,
+                        output_location=gdb_path,
+                        raster_dataset_name_with_extension=mosaic_name,
+                        coordinate_system_for_the_raster="",
+                        pixel_type="32_BIT_FLOAT",
+                        cellsize=10,
+                        number_of_bands=len(_S2_STACK_ORDER),
+                        mosaic_method="MEAN",
+                    )
+                    arcpy.AddMessage(
+                        f"  ✓ Merged {len(tile_mosaics)} tiles in "
+                        f"{(datetime.now() - merge_start).total_seconds():.1f}s "
+                        f"→ {os.path.basename(final_path)}"
+                    )
+                    intermediates_to_delete.extend(tile_mosaics)
+                    final_mosaic = final_path
+                else:
+                    final_mosaic = tile_mosaics[0]
+                    arcpy.AddMessage(f"  ✓ Single tile → {os.path.basename(final_mosaic)}")
+
+                # Apply AOI mask if requested.
+                final_mosaic, unmasked_to_delete = _apply_aoi_mask_and_save(
+                    final_mosaic, mask_feature, gdb_path, mosaic_name,
                 )
-                arcpy.AddMessage(
-                    f"  ✓ Merged {len(tile_mosaics)} tiles in "
-                    f"{(datetime.now() - merge_start).total_seconds():.1f}s "
-                    f"→ {os.path.basename(final_path)}"
-                )
-                intermediates_to_delete.extend(tile_mosaics)
-                final_mosaic = final_path
-            else:
-                final_mosaic = tile_mosaics[0]
-                arcpy.AddMessage(f"  ✓ Single tile → {os.path.basename(final_mosaic)}")
+                if unmasked_to_delete:
+                    intermediates_to_delete.append(unmasked_to_delete)
 
-            # Apply AOI mask if requested.
-            final_mosaic, unmasked_to_delete = _apply_aoi_mask_and_save(
-                final_mosaic, mask_feature, gdb_path, mosaic_name,
-            )
-            if unmasked_to_delete:
-                intermediates_to_delete.append(unmasked_to_delete)
+                # Delete superseded intermediates so only the final mosaic
+                # remains in the output GDB.
+                cleaned_count = 0
+                for path in intermediates_to_delete:
+                    if path and path != final_mosaic:
+                        try:
+                            if arcpy.Exists(path):
+                                arcpy.management.Delete(path)
+                                cleaned_count += 1
+                        except arcpy.ExecuteError as e:
+                            arcpy.AddWarning(
+                                f"  Could not delete {os.path.basename(path)}: {e}"
+                            )
+                if cleaned_count:
+                    arcpy.AddMessage(f"  ✓ Cleaned up {cleaned_count} intermediate(s)")
 
-            # Delete superseded intermediates so only the final mosaic
-            # remains in the output GDB.
-            cleaned_count = 0
-            for path in intermediates_to_delete:
-                if path and path != final_mosaic:
-                    try:
-                        if arcpy.Exists(path):
-                            arcpy.management.Delete(path)
-                            cleaned_count += 1
-                    except arcpy.ExecuteError as e:
-                        arcpy.AddWarning(
-                            f"  Could not delete {os.path.basename(path)}: {e}"
-                        )
-            if cleaned_count:
-                arcpy.AddMessage(f"  ✓ Cleaned up {cleaned_count} intermediate(s)")
-
-            if save_stats:
-                self._write_provenance_csv(final_mosaic, all_scenes_used)
+                if save_stats:
+                    self._write_provenance_csv(final_mosaic, all_scenes_used)
 
             _sanity_check_output(
                 final_mosaic, sensor_hint="sentinel-2",
@@ -5704,31 +5736,37 @@ class AsterMosaic(object):
                 output_path, sensor_hint="aster",
                 label=f"{os.path.basename(output_path)} [{label}]",
             )
-        except Exception as e:
+        except arcpy.ExecuteError:
+            # phase manager already warned with the canonical "✗ Phase 5
+            # ... failed after Xs" line; no need for a duplicate AddError.
             arcpy.ResetProgressor()
-            arcpy.AddError(f"  ✗ [{label}] GeometricMedian failed: {e}")
+            return None
+        except Exception:
+            # Non-arcpy failure (memory, logic bug). phase's warning
+            # is the canonical record here too.
+            arcpy.ResetProgressor()
             return None
 
         # Phase 6 — AOI mask + provenance
-        arcpy.AddMessage(f"\n▶ Phase 6 [{label}] — Mask / cleanup / provenance")
-        final_path, unmasked_to_delete = _apply_aoi_mask_and_save(
-            output_path, mask_feature, gdb_path, output_name,
-        )
+        with phase(f"Phase 6 [{label}] — Mask / cleanup / provenance") as ph6:
+            final_path, unmasked_to_delete = _apply_aoi_mask_and_save(
+                output_path, mask_feature, gdb_path, output_name,
+            )
 
-        if unmasked_to_delete and unmasked_to_delete != final_path:
-            try:
-                if arcpy.Exists(unmasked_to_delete):
-                    arcpy.management.Delete(unmasked_to_delete)
-                    arcpy.AddMessage(
-                        f"  ✓ Removed intermediate: {os.path.basename(unmasked_to_delete)}"
+            if unmasked_to_delete and unmasked_to_delete != final_path:
+                try:
+                    if arcpy.Exists(unmasked_to_delete):
+                        arcpy.management.Delete(unmasked_to_delete)
+                        arcpy.AddMessage(
+                            f"  ✓ Removed intermediate: {os.path.basename(unmasked_to_delete)}"
+                        )
+                except arcpy.ExecuteError as e:
+                    arcpy.AddWarning(
+                        f"  Could not delete intermediate {unmasked_to_delete}: {e}"
                     )
-            except arcpy.ExecuteError as e:
-                arcpy.AddWarning(
-                    f"  Could not delete intermediate {unmasked_to_delete}: {e}"
-                )
 
-        if save_stats:
-            self._write_provenance_csv(final_path, scenes_used)
+            if save_stats:
+                self._write_provenance_csv(final_path, scenes_used)
 
         return final_path
 
