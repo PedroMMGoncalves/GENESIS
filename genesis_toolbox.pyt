@@ -6242,9 +6242,15 @@ class AsterMosaic(object):
 # ---------------------------------------------------------------------------
 
 def _sym_decorrelation(W):
-    """Symmetric decorrelation: ``W' = (W W^T)^(-1/2) W``."""
+    """Symmetric decorrelation: ``W' = (W W^T)^(-1/2) W``.
+
+    Clamps the eigenvalues at a small floor before inverting their
+    square root so a rank-deficient ``W`` (or one that drifts toward
+    rank-deficiency over many iterations) does not produce inf / NaN.
+    """
     s, u = np.linalg.eigh(W @ W.T)
-    return (u * (1.0 / np.sqrt(s))) @ u.T @ W
+    inv_sqrt_s = 1.0 / np.sqrt(np.maximum(s, 1e-12))
+    return (u * inv_sqrt_s) @ u.T @ W
 
 
 def _fast_ica_numpy(X, max_iter=1000, tol=1e-4, random_state=None):
@@ -6261,7 +6267,7 @@ def _fast_ica_numpy(X, max_iter=1000, tol=1e-4, random_state=None):
     W = rng.normal(size=(n_features, n_features)).astype(X.dtype, copy=False)
     W = _sym_decorrelation(W)
 
-    n_iter = 0
+    n_iter = max_iter  # default if loop exits via max_iter without converging
     for n_iter in range(1, max_iter + 1):
         # g(u) = tanh(u), g'(u) = 1 - tanh(u)^2  (logcosh non-linearity)
         WX = W @ X_T
@@ -7138,7 +7144,11 @@ class Transformations(object):
         Perform ICA transformation with kurtosis metrics.
 
         ISS-007: random_state is a parameter (default 42) and is persisted on
-        ICAStatistics so a saved fit can be reproduced exactly.
+        ICAStatistics so a fresh fit is reproducible across runs of the same
+        code version. Bit-identical reproduction across toolbox versions is
+        not guaranteed (ICA results are unique only up to sign + permutation
+        of components), but stored unmixing/mixing matrices replay the
+        original fit exactly via _apply_ica_transform.
         ISS-011: logging is routed through the optional callbacks.
         """
         log = message_callback or (lambda msg: None)
