@@ -40,6 +40,16 @@ The toolbox exposes six tools in workflow order:
 
 All three mosaic tools write a `_provenance.csv` next to the output documenting every scene that contributed (scene ID, acquisition date, cloud cover, input path, processing baseline, toolbox version).
 
+### Resume on re-run
+
+All three mosaic tools expose a **Preserve Scratch & Resume on Re-run** option under *Advanced Options*. When the option is on:
+
+- Per-scene intermediate stacks are kept in a deterministically-named scratch folder beside the output geodatabase (e.g. `_genesis_s2_scratch_{mosaic_name}`) instead of being cleaned up at the end of the run.
+- Each successfully written stack also writes a one-line `{scene_id}_stack.tif.complete` sentinel.
+- Re-running with the same output name causes Phase 3 to skip any scene whose stack file *and* sentinel are both present — the per-scene processing is reused as-is, the run jumps straight to the geometric-median stage.
+
+A late-phase failure (e.g. a transient GP error during the median or AOI-mask step) therefore costs only the time of the failed phase, not the hours of per-scene QA / mask / resample / composite work that preceded it.
+
 ---
 
 ## Sensor-aware design
@@ -50,7 +60,9 @@ Tools 04, 05, and 06 take a `Sensor Type` parameter (Auto-detect / Landsat 8/9 /
 | --- | --- | --- |
 | **Landsat 8/9** | 7 bands: Coastal, Blue, Green, Red, NIR, SWIR1, SWIR2 | NDVI, NDWI, NDMI, NDBI, geological mineral ratios with Blue |
 | **Sentinel-2** | 10 bands: B02, B03, B04, B05, B06, B07, B08, B8A, B11, B12 | All of the above + NDRE, CIred-edge, IRECI |
-| **ASTER** | 9 bands: B01, B02, B03N, B04, B05, B06, B07, B08, B09 | Geological staples + Alunite, Kaolinite, Muscovite, Calcite, Hydrothermal Alteration (Cudahy) |
+| **ASTER** | 9 bands: B01, B02, B03N, B04, B05, B06, B07, B08, B09 ¹ | Geological staples + Alunite, Kaolinite, Muscovite, Calcite, Hydrothermal Alteration (Cudahy) |
+
+¹ Tool 03 emits **two outputs**: `{name}_VnirSwir` is the canonical 9-band mosaic built from pre-April-2008 scenes only (full VNIR + crosstalk-corrected SWIR), and `{name}_Vnir` is a 3-band (B01, B02, B03N) mosaic built from the full archive — the ASTER SWIR detector failed in April 2008 and any post-failure scene contributes only to the VNIR-only product. Tool 04 detects the band count of its input automatically and skips indices that need SWIR roles when handed the 3-band variant.
 
 ---
 
@@ -59,7 +71,7 @@ Tools 04, 05, and 06 take a `Sensor Type` parameter (Auto-detect / Landsat 8/9 /
 - **ArcGIS Pro 3.0 or higher**
 - **Spatial Analyst** extension (required for all six tools)
 - **Image Analyst** extension (used by Mosaic and Transformations)
-- Python 3.9+ with `numpy`, `scipy`, `scikit-learn` — all included with ArcGIS Pro's bundled Python
+- Python 3.9+ with `numpy` and `scipy` — both included with ArcGIS Pro's bundled Python (no other ML or scientific-computing dependencies; the FastICA used in Tool 05 is a pure-numpy in-house implementation)
 - `osgeo.gdal` (also bundled with ArcGIS Pro) — used by Tool 03 for HDF input
 
 ---
@@ -78,8 +90,8 @@ Tools 04, 05, and 06 take a `Sensor Type` parameter (Auto-detect / Landsat 8/9 /
 
 | Sensor | Accepted | Notes |
 | --- | --- | --- |
-| Sentinel-2 L2A | `.SAFE` folders or `.zip` Copernicus archives | Zips auto-extracted on first run; idempotent |
-| Landsat 8/9 | EarthExplorer `.tar` archives or extracted scene folders | Both L2SR and L2SP accepted; tars auto-extracted |
+| Sentinel-2 L2A | `.SAFE` folders or `.zip` Copernicus archives | Archives read on the fly via GDAL VSI (no extraction needed); browser-style duplicate-download suffixes (`(1).zip`) are deduped by canonical `PRODUCT_URI` from the archive's MTD XML |
+| Landsat 8/9 | EarthExplorer `.tar` or `.zip` archives, or extracted scene folders | Both L2SR and L2SP accepted; archives read on the fly via GDAL VSI (no extraction needed) |
 | ASTER | AST_07XT V004 per-band TIFFs or `.hdf` archives | TIFFs grouped by 17-char scene ID; HDF read via `osgeo.gdal` |
 
 ---
@@ -90,6 +102,8 @@ Tools 04, 05, and 06 take a `Sensor Type` parameter (Auto-detect / Landsat 8/9 /
 - Mosaic CRS: inherited from input (UTM for Landsat / S2; resample-aligned for ASTER)
 - Each mosaic: **multi-band GeoTIFF or geodatabase raster + `_provenance.csv`**
 - Transformation statistics: **`.npz` (NumPy archive)** for re-applying to new AOIs
+- Tool 04 outputs: when the workspace is a **folder**, indices and composites are written to sibling `indices/` and `composites/` subfolders (forced GeoTIFF, no 13-character ESRI-GRID name limit). When the workspace is a **`.gdb`**, both products are saved flat at the workspace root with no extension (geodatabases have no name-length limit and don't support nested folders).
+- Each mosaic's median output is sanity-checked after save: per-band MIN / MEAN / MAX are logged, and a warning is emitted if any band's mean is suspiciously close to zero for that sensor's expected reflectance range — catches the class of NoData-handling regression that would otherwise pass type-checking and structural validation while producing visually-broken outputs.
 
 ---
 
@@ -133,8 +147,7 @@ The author's contribution within GENESIS is the production of cloud-removed mult
 
 - *PCA.* Pearson, K. (1901). On lines and planes of closest fit to systems of points in space. *Philosophical Magazine*, 2(11), 559–572. <https://doi.org/10.1080/14786440109462720>
 - *MNF.* Green, A. A., Berman, M., Switzer, P., & Craig, M. D. (1988). A transformation for ordering multispectral data in terms of image quality with implications for noise removal. *IEEE Transactions on Geoscience and Remote Sensing*, 26(1), 65–74. <https://doi.org/10.1109/36.3001>
-- *ICA / FastICA.* Hyvärinen, A., & Oja, E. (2000). Independent component analysis: algorithms and applications. *Neural Networks*, 13(4–5), 411–430. <https://doi.org/10.1016/S0893-6080(00)00026-5>
-- *scikit-learn FastICA implementation.* Pedregosa, F. et al. (2011). Scikit-learn: Machine Learning in Python. *Journal of Machine Learning Research*, 12, 2825–2830.
+- *ICA / FastICA.* Hyvärinen, A., & Oja, E. (2000). Independent component analysis: algorithms and applications. *Neural Networks*, 13(4–5), 411–430. <https://doi.org/10.1016/S0893-6080(00)00026-5> — the Hyvärinen parallel algorithm with symmetric decorrelation and the *logcosh* non-linearity is implemented in pure NumPy inside the toolbox (see `_fast_ica_numpy` in `genesis_toolbox.pyt`); no `scikit-learn` dependency.
 
 #### Spectral indices — vegetation, water, built-up
 
@@ -153,7 +166,7 @@ The author's contribution within GENESIS is the production of cloud-removed mult
 
 #### Compositing
 
-- *Geometric median for temporal pixel reduction.* Roberts, D., Mueller, N., & McIntyre, A. (2017). High-dimensional pixel composites from earth observation time series. *IEEE Transactions on Geoscience and Remote Sensing*, 55(11), 6254–6264. <https://doi.org/10.1109/TGRS.2017.2723896> (the algorithm Esri's `arcpy.ia.GeometricMedian` / `arcpy.sa.GeometricMedian` implement)
+- *Geometric median for temporal pixel reduction.* Roberts, D., Mueller, N., & McIntyre, A. (2017). High-dimensional pixel composites from earth observation time series. *IEEE Transactions on Geoscience and Remote Sensing*, 55(11), 6254–6264. <https://doi.org/10.1109/TGRS.2017.2723896> (the algorithm Esri's `arcpy.ia.GeometricMedian` implements, called by all three mosaic tools)
 
 #### Classification
 
