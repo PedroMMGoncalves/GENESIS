@@ -20,10 +20,10 @@
 #   Sentinel-2       L2A SAFE folder          SCL classes 3, 8, 9, 10
 #                    (`S2A_MSIL2A_*` /        + optional temporal refinement
 #                     `S2B_MSIL2A_*`)
-#   ASTER            AST_07XT V004 — both     QA Data Plane cloud bits
-#                    HDF (`.hdf`) and TIFF    + multitemporal anomaly
-#                    folder (`*_SRF_VNIR_*`,    (mandatory for ASTER)
-#                            `*_SRF_SWIR_*`)
+#   ASTER            AST_07XT V004 — both     QA Data Plane non-zero
+#                    HDF (`.hdf`) and TIFF    + per-scene VIS/SWIR test
+#                    folder (`*_SRF_VNIR_*`,    + optional thermal (AST_08
+#                            `*_SRF_SWIR_*`)    SKT, paired by scene ID)
 #
 # Tools (workflow-ordered, by numeric prefix in the ArcGIS Pro UI):
 #   01 — Sentinel-2 L2A Mosaic
@@ -437,15 +437,37 @@ _RAM_WARNING_GB = 4.0
 _GEOMETRIC_MEDIAN_EPSILON = 0.001
 _GEOMETRIC_MEDIAN_MAX_ITER = 20
 
-# ASTER Phase 4 multitemporal cloud refinement. After the per-scene QA
-# mask, scenes whose B01+B02 brightness exceeds (per-pixel percentile
-# × factor) get an extra cloud mask. Tuned for the Faial demonstrator
-# (persistent marine cumulus). Lowering the percentile or raising the
-# factor drops more scenes on hazy days; raising the percentile or
-# lowering the factor retains more observations at the cost of
-# residual cloud leakage in the median.
-_TEMPORAL_REFINEMENT_PERCENTILE = 75
-_TEMPORAL_REFINEMENT_FACTOR = 1.5
+# ASTER per-scene multi-spectral cloud test. The AST_07XT QA Data Plane
+# only flags SR retrieval status (not clouds), so we add a brightness
+# test inspired by Hulley & Hook (2008)'s ACCA-adapted ASTER cloud
+# detection. A pixel is flagged as cloud when BOTH the visible red
+# (B02) AND the SWIR (B04) reflectance exceed the thresholds below.
+# Requiring both bands separates bright cloud tops (high in VIS *and*
+# SWIR) from bright bare ground / sand / snow (high in VIS but lower
+# in SWIR). VNIR-only mosaics degrade to a B02-only test.
+# Thresholds match the conservative end of Hulley's "definitely cloud"
+# band — false-positive rate over bare basalt should be < 5%.
+_ASTER_CLOUD_B02_MIN = 0.45
+_ASTER_CLOUD_B04_MIN = 0.25
+
+# Optional brightness-temperature cloud channel. When AST_08 (Surface
+# Kinetic Temperature, V004) scenes are paired with the AST_07XT input
+# by scene ID, pixels colder than this threshold are flagged as cloud
+# regardless of VIS/SWIR brightness. 295 K matches Hulley & Hook
+# (2008)'s ACCA-on-ASTER warm-cloud screen — catches thin cirrus
+# (cold but VIS-dim) and warm marine cumulus that the VIS+SWIR
+# conjunction would miss, while still leaving daytime forest canopy
+# / bare basalt (typically 290-310 K) safely above the line. AST_08
+# V004 COG TIFFs export already-scaled Kelvin values, so no scale
+# factor is applied.
+_ASTER_CLOUD_BT_MAX_K = 295.0
+
+# Lower validity bound for AST_08 Surface Kinetic Temperature, in
+# Kelvin. AST_08 NoData is stored as 0 K (V004 COG) and Resample
+# can introduce float32 NoData sentinels (~ -3.4e+38) near scene
+# edges; both fall well below this floor. Daytime land brightness
+# temperatures over Earth's surface are very rarely below 200 K.
+_ASTER_TIR_VALID_K_FLOOR = 200.0
 
 # Pure-numpy FastICA defaults (Hyvärinen parallel, logcosh). Match the
 # previous sklearn defaults so the convergence behaviour is unchanged
@@ -5231,6 +5253,32 @@ _ASTER_TIFF_RE = re.compile(
     re.IGNORECASE,
 )
 
+# AST_08 V004 (Surface Kinetic Temperature) — optional companion
+# product, joined to AST_07XT by scene ID. The SKT COG TIFF naming is
+#   AST_08_<17-char-sceneID>_<14-char-procDT>_SKT.tif
+# and the matching HDF-EOS5 archive is
+#   AST_08_<17-char-sceneID>_<14-char-procDT>.hdf
+# (with subdataset "SurfaceKineticTemperature"). 90 m native; LP DAAC
+# COG exports come already in Kelvin so no scale factor is applied
+# downstream. We accept the SKT band only; the AST_08 QA Data Plane
+# is not consumed.
+_AST08_TIFF_RE = re.compile(
+    r"^AST_08_"
+    r"(?P<pass>\d{3})(?P<MM>\d{2})(?P<DD>\d{2})(?P<YYYY>\d{4})(?P<HMS>\d{6})_"
+    r"(?P<proc>\d{14})_SKT\.tif$",
+    re.IGNORECASE,
+)
+_AST08_HDF_RE = re.compile(
+    r"^AST_08_(?P<pass>\d{3})(?P<MM>\d{2})(?P<DD>\d{2})(?P<YYYY>\d{4})"
+    r"(?P<HMS>\d{6})_(?P<proc>\d{14})\.hdf$",
+    re.IGNORECASE,
+)
+# HDF-EOS5 SDS names accepted for the surface kinetic temperature
+# layer. Modern V004 emits "SurfaceKineticTemperature"; older revisions
+# (V003 / legacy SwathName 'TIR') used "KineticTemperature". We accept
+# either to keep older archives readable.
+_AST08_BT_SDS_NAMES = ("SurfaceKineticTemperature", "KineticTemperature")
+
 
 class AsterMosaic(object):
     """Tool 03 — ASTER AST_07XT V004 mineral-mapping mosaic.
@@ -5242,15 +5290,27 @@ class AsterMosaic(object):
       b) HDF-EOS `.hdf` archives (best-effort via osgeo.gdal — extracted
          to TIFFs in a scratch folder before processing).
 
+    Optionally also accepts paired AST_08 (Surface Kinetic Temperature,
+    V004) files (`AST_08_<sceneID>_<procDT>_SKT.tif` or the equivalent
+    HDF) — either co-located in the main data folder, or in a separate
+    folder pointed to by the optional "ASTER Thermal Data Folder"
+    parameter (the natural LP DAAC by-product download layout). When
+    present, the thermal channel is folded into the per-scene cloud test
+    — pixels colder than ~295 K are flagged as cloud regardless of
+    VIS/SWIR brightness, which catches thin cirrus and reduces false
+    positives over warm bare ground.
+
     Per-scene processing:
       1. Load 3 VNIR bands at native 15m + 6 SWIR bands resampled to 15m
          (BILINEAR).
       2. Apply scale factor 0.001 to convert DN → surface reflectance [0, 1].
       3. Apply QA cloud mask from the QA Data Plane layers (best-effort
          bit decoding — exact layout per ASTER User Handbook V004).
-      4. Optionally apply a multitemporal anomaly mask across the scene
-         stack — recommended for cloud-prone regions like Faial.
-      5. Stack into a 9-band float32 raster.
+      4. Build a multi-spectral cloud mask
+         ``(B02 > 0.45 AND B04 > 0.25) OR (BT < 295 K)`` — Hulley & Hook
+         (2008)-style ACCA-on-ASTER. The thermal term is dropped when no
+         AST_08 is paired; the SWIR term is dropped for VNIR-only scenes.
+      5. Stack into a 9-band float32 raster (3-band for VNIR-only mode).
 
     Mosaicking: Esri arcpy.ia.GeometricMedian across the cloud-masked
     stack, then optional AOI clip and provenance CSV.
@@ -5263,10 +5323,14 @@ class AsterMosaic(object):
             "Surface Reflectance scenes (VNIR + crosstalk-corrected SWIR). "
             "Accepts per-band TIFFs (the common LP DAAC export) or HDF-EOS "
             "archives. SWIR (30m) is resampled to 15m to match VNIR. Cloud "
-            "handling combines QA Data Plane flags + optional multitemporal "
-            "anomaly detection (recommended for cloud-prone regions). The "
-            "temporal stack is reduced to a geometric median. A provenance "
-            "CSV is written alongside the output."
+            "handling combines the QA Data Plane non-zero flag with a "
+            "per-scene multi-spectral test on B02 (red) + B04 (SWIR1); "
+            "paired AST_08 Surface Kinetic Temperature scenes (either "
+            "co-located, or supplied through the optional thermal folder "
+            "parameter) add a brightness-temperature channel that catches "
+            "thin cirrus and warm bare ground that VIS/SWIR alone would "
+            "miss. The temporal stack is reduced to a geometric median. A "
+            "provenance CSV is written alongside the output."
         )
         self.canRunInBackground = True
 
@@ -5293,10 +5357,23 @@ class AsterMosaic(object):
         )
 
         data_folder = arcpy.Parameter(
-            displayName="ASTER Data Folder",
+            displayName="ASTER Data Folder (AST_07XT)",
             name="data_folder",
             datatype="DEFolder",
             parameterType="Required",
+            direction="Input",
+        )
+
+        thermal_folder = arcpy.Parameter(
+            displayName=(
+                "Optional ASTER Thermal Data Folder (AST_08 Surface "
+                "Kinetic Temperature) — paired with AST_07XT by scene ID. "
+                "When omitted, the main data folder is also searched for "
+                "AST_08 files."
+            ),
+            name="thermal_folder",
+            datatype="DEFolder",
+            parameterType="Optional",
             direction="Input",
         )
 
@@ -5361,15 +5438,6 @@ class AsterMosaic(object):
             direction="Input",
         )
 
-        apply_temporal = arcpy.Parameter(
-            displayName="Apply Multitemporal Cloud Refinement (recommended for ASTER)",
-            name="apply_temporal_refinement",
-            datatype="GPBoolean",
-            parameterType="Optional",
-            direction="Input",
-        )
-        apply_temporal.value = True  # default ON for ASTER (no SCL)
-
         use_qa_planes = arcpy.Parameter(
             displayName="Apply QA Data Plane Cloud Mask",
             name="use_qa_planes",
@@ -5408,17 +5476,17 @@ class AsterMosaic(object):
         preserve_scratch.value = False
 
         return [
-            gdb, mosaic_name, data_folder, region, time_type,
-            year, month, season, apply_temporal, use_qa_planes,
-            mask_feature, save_stats, preserve_scratch,
+            gdb, mosaic_name, data_folder, thermal_folder,
+            region, time_type, year, month, season,
+            use_qa_planes, mask_feature, save_stats, preserve_scratch,
         ]
 
     def updateParameters(self, parameters):
         try:
-            time_type = parameters[4]
-            year = parameters[5]
-            month = parameters[6]
-            season = parameters[7]
+            time_type = parameters[5]
+            year = parameters[6]
+            month = parameters[7]
+            season = parameters[8]
             if time_type.valueAsText == "all_images":
                 year.enabled = False; month.enabled = False; season.enabled = False
             elif time_type.valueAsText == "year_month":
@@ -5451,12 +5519,12 @@ class AsterMosaic(object):
             gdb_path = parameters[0].valueAsText
             mosaic_name = parameters[1].valueAsText
             data_folder = parameters[2].valueAsText
-            region = parameters[3].valueAsText
-            time_type = parameters[4].valueAsText
-            year = parameters[5].value
-            month = parameters[6].value
-            season = parameters[7].valueAsText
-            apply_temporal = bool(parameters[8].value)
+            thermal_folder = parameters[3].valueAsText
+            region = parameters[4].valueAsText
+            time_type = parameters[5].valueAsText
+            year = parameters[6].value
+            month = parameters[7].value
+            season = parameters[8].valueAsText
             use_qa = bool(parameters[9].value)
             mask_feature = parameters[10].valueAsText
             save_stats = bool(parameters[11].value)
@@ -5466,12 +5534,11 @@ class AsterMosaic(object):
             # AOI-first scoping. See LandsatMosaic.execute() for the full
             # rationale. For ASTER the win includes: the SWIR 30m→15m
             # resample for six bands per scene (the heaviest per-scene
-            # cost) now operates only on AOI pixels; the conservative QA
-            # Data Plane non-zero mask is only built over the AOI; the
-            # multitemporal anomaly refinement (which reads every scene's
-            # pixels into a NumPy stack for percentile computation) now
-            # loads only AOI pixels — a massive memory saving on top of
-            # the compute saving.
+            # cost) now operates only on AOI pixels; the QA Data Plane
+            # non-zero mask is only built over the AOI; the per-scene
+            # multi-spectral cloud test (B02 reflectance + optional B04
+            # reflectance + optional BT) operates on AOI-clipped rasters;
+            # and the AST_08 thermal resample also runs only over the AOI.
             # ----------------------------------------------------------------
             # Header — one block of run context.
             arcpy.AddMessage("=" * 60)
@@ -5479,8 +5546,20 @@ class AsterMosaic(object):
             arcpy.AddMessage("=" * 60)
             arcpy.AddMessage(f"  Output:     {gdb_path}\\{mosaic_name}")
             arcpy.AddMessage(f"  Source:     {data_folder}")
+            if thermal_folder:
+                if os.path.isdir(thermal_folder):
+                    arcpy.AddMessage(f"  Thermal:    {thermal_folder}")
+                else:
+                    arcpy.AddWarning(
+                        f"  Thermal:    {thermal_folder!r} NOT FOUND — "
+                        "falling back to scanning the main data folder for AST_08"
+                    )
+                    thermal_folder = None
             arcpy.AddMessage(
-                f"  Options:    QA mask = {use_qa}, temporal refinement = {apply_temporal}"
+                f"  Options:    QA mask = {use_qa}, "
+                f"per-scene cloud test = on "
+                f"(B02 > {_ASTER_CLOUD_B02_MIN}, B04 > {_ASTER_CLOUD_B04_MIN}, "
+                f"BT < {_ASTER_CLOUD_BT_MAX_K:.0f} K when AST_08 paired)"
             )
 
             if mask_feature and arcpy.Exists(mask_feature):
@@ -5505,10 +5584,10 @@ class AsterMosaic(object):
             # Snap raster anchors every per-scene Resample to a single
             # 15m pixel grid covering the AOI. Without it, scenes from
             # different overpasses drift by a fraction of a cell on
-            # save, and Phase 4's _apply_multitemporal_refinement fails
-            # when np.stack(brightness_arrays) sees off-by-one shapes.
-            # Only set when an AOI is active — without env.extent the
-            # constant-raster anchor has nothing to cover.
+            # save, which causes downstream alignment issues for the
+            # GeometricMedian temporal reduction. Only set when an AOI
+            # is active — without env.extent the constant-raster anchor
+            # has nothing to cover.
             if arcpy.env.mask:
                 try:
                     snap_anchor = os.path.join(scratch_dir, "_snap_anchor.tif")
@@ -5526,14 +5605,13 @@ class AsterMosaic(object):
                     )
                 except Exception as e:
                     arcpy.AddWarning(
-                        f"  Snap raster setup failed ({e}); Phase 4 "
-                        "temporal refinement may be skipped due to "
-                        "shape mismatch"
+                        f"  Snap raster setup failed ({e}); per-scene "
+                        "stacks may not share a single cell origin"
                     )
 
             # Phase 1 — discover scenes (TIFF and HDF)
             arcpy.AddMessage("\n▶ Phase 1 — Scene discovery")
-            scenes = self._find_aster_scenes(data_folder)
+            scenes = self._find_aster_scenes(data_folder, thermal_folder)
             if not scenes:
                 arcpy.AddError("  ✗ No ASTER scenes found.")
                 return None
@@ -5570,6 +5648,18 @@ class AsterMosaic(object):
                 f"(pre-Apr-2008) + {vnir_only_count} VNIR-only "
                 f"(post-Apr-2008 SWIR failure)"
             )
+            paired = sum(1 for s in kept_scenes if s.get("thermal"))
+            if paired:
+                arcpy.AddMessage(
+                    f"  Thermal:    {paired}/{len(kept_scenes)} scenes paired with "
+                    f"AST_08 — thermal cloud channel active for those scenes"
+                )
+            else:
+                arcpy.AddMessage(
+                    "  Thermal:    no AST_08 (Surface Kinetic Temperature) "
+                    "files found alongside AST_07XT — "
+                    "cloud test runs on VIS/SWIR only"
+                )
 
             outputs = []
             total_start = datetime.now()
@@ -5578,7 +5668,7 @@ class AsterMosaic(object):
             if full_scenes:
                 output_full = self._run_mosaic_pipeline(
                     full_scenes, gdb_path, f"{mosaic_name}_VnirSwir",
-                    scratch_dir, use_qa, apply_temporal, mask_feature,
+                    scratch_dir, use_qa, mask_feature,
                     save_stats, _ASTER_MODE_FULL, "VNIR+SWIR (9-band)",
                 )
                 if output_full:
@@ -5593,7 +5683,7 @@ class AsterMosaic(object):
             # contribute their VNIR bands for a longer temporal stack).
             output_vnir = self._run_mosaic_pipeline(
                 kept_scenes, gdb_path, f"{mosaic_name}_Vnir",
-                scratch_dir, use_qa, apply_temporal, mask_feature,
+                scratch_dir, use_qa, mask_feature,
                 save_stats, _ASTER_MODE_VNIR, "VNIR-only (3-band)",
             )
             if output_vnir:
@@ -5635,9 +5725,9 @@ class AsterMosaic(object):
 
     def _run_mosaic_pipeline(
         self, scenes, gdb_path, output_name, scratch_dir,
-        use_qa, apply_temporal, mask_feature, save_stats, mode, label,
+        use_qa, mask_feature, save_stats, mode, label,
     ):
-        """Run Phases 3-6 over a scene list in one of the supported modes.
+        """Run Phases 3-5 over a scene list in one of the supported modes.
 
         Returns the final raster path on success, or None if no scenes
         survived per-scene processing (in which case a warning has
@@ -5724,24 +5814,12 @@ class AsterMosaic(object):
             f"({stack_phase_elapsed/max(1,len(stacked_paths)):.1f}s/scene)"
         )
 
-        # Phase 4 — multitemporal anomaly refinement
-        if apply_temporal and len(stacked_paths) >= 5:
-            arcpy.AddMessage(
-                f"\n▶ Phase 4 [{label}] — Multitemporal cloud refinement "
-                f"({len(stacked_paths)} scenes)"
-            )
-            temporal_start = datetime.now()
-            stacked_paths = self._apply_multitemporal_refinement(
-                stacked_paths, scratch_dir,
-            )
-            arcpy.AddMessage(
-                f"  ✓ Phase 4 in {(datetime.now() - temporal_start).total_seconds():.1f}s"
-            )
-        elif apply_temporal:
-            arcpy.AddWarning(
-                f"\n▶ Phase 4 [{label}] — Skipped "
-                f"(only {len(stacked_paths)} scenes; need ≥5)"
-            )
+        # Phase 4 (multitemporal cloud refinement) was removed in favour
+        # of the per-scene multi-spectral cloud test inside
+        # ``_process_scene``. The temporal-percentile approach assumed a
+        # clear-dominant scene stack and could not handle the persistent
+        # marine cumulus over the Faial demonstrator (where p75 brightness
+        # was itself cloud).
 
         # Phase 5 — GeometricMedian
         output_path = os.path.join(gdb_path, output_name)
@@ -5807,16 +5885,21 @@ class AsterMosaic(object):
     # ------------------------------------------------------------------
 
     @classmethod
-    def _find_aster_scenes(cls, data_folder):
+    def _find_aster_scenes(cls, data_folder, thermal_folder=None):
         """Discover ASTER scenes in data_folder. Groups per-band TIFFs by
         sceneID; for HDF, each .hdf is one scene (extracted lazily by
-        _process_scene).
+        _process_scene). If ``thermal_folder`` is supplied, AST_08 files
+        are sourced from it (so AST_07XT and AST_08 can live in sibling
+        folders, the LP DAAC default); otherwise the main data folder is
+        scanned for AST_08 too.
 
         Returns a list of dicts with keys:
             scene_id:   17-char ASTER granule identifier
             format:     "tiff" or "hdf"
             files:      dict {band_name: path} (for tiff) or {hdf: path}
             metadata:   {acquisition_date: date, pass_number: str, ...}
+            thermal:    optional {"format", "path"} when an AST_08 file
+                        was paired by scene ID.
         """
         if not data_folder or not os.path.isdir(data_folder):
             return []
@@ -5871,6 +5954,42 @@ class AsterMosaic(object):
                     "pass_number": parsed["pass"],
                     "scene_id": scene_id,
                 },
+            }
+
+        # Third pass: AST_08 (Surface Kinetic Temperature) — optional
+        # thermal companion. Attached to the matching AST_07XT scene by
+        # scene_id; AST_08 files with no AST_07XT counterpart are
+        # ignored. TIFF is preferred over HDF when both exist (the COG
+        # TIFF is already in Kelvin; HDF needs gdal subdataset extraction).
+        # When ``thermal_folder`` is supplied AND exists, scan it for
+        # AST_08; otherwise look in the main data folder. The thermal
+        # folder also matches sibling-of-main when the user only set the
+        # main folder but co-located both products on disk.
+        thermal_folder = thermal_folder or None
+        if thermal_folder and os.path.isdir(thermal_folder):
+            scan_root = thermal_folder
+            scan_entries = os.listdir(thermal_folder)
+        else:
+            scan_root = data_folder
+            scan_entries = entries
+        for entry in scan_entries:
+            full = os.path.join(scan_root, entry)
+            if not os.path.isfile(full):
+                continue
+            scene_id = cls._parse_ast08_filename(entry)
+            if not scene_id or scene_id not in scenes_by_id:
+                continue
+            existing = scenes_by_id[scene_id].get("thermal")
+            is_tiff = entry.lower().endswith((".tif", ".tiff"))
+            is_hdf = entry.lower().endswith(".hdf")
+            if not (is_tiff or is_hdf):
+                continue
+            # Prefer TIFF; do not overwrite a TIFF entry with an HDF.
+            if existing and existing.get("format") == "tiff" and is_hdf:
+                continue
+            scenes_by_id[scene_id]["thermal"] = {
+                "format": "tiff" if is_tiff else "hdf",
+                "path": full,
             }
 
         return sorted(scenes_by_id.values(), key=lambda s: s["scene_id"])
@@ -5932,6 +6051,22 @@ class AsterMosaic(object):
                 "group": None,
                 "band": None,
             }
+        return None
+
+    @staticmethod
+    def _parse_ast08_filename(filename):
+        """Match an AST_08 (Surface Kinetic Temperature) file. Returns the
+        17-char scene_id used to pair the file with its AST_07XT
+        counterpart, or None on non-matching names.
+        """
+        name = os.path.basename(filename)
+        for regex in (_AST08_TIFF_RE, _AST08_HDF_RE):
+            m = regex.match(name)
+            if m:
+                return (
+                    m.group("pass") + m.group("MM") + m.group("DD")
+                    + m.group("YYYY") + m.group("HMS")
+                )
         return None
 
     # ------------------------------------------------------------------
@@ -6012,11 +6147,11 @@ class AsterMosaic(object):
             return None
 
         # Optional QA mask. Conservative implementation: treat any non-zero
-        # value in either QA Data Plane as a quality issue (cloud / fill /
-        # bad pixel). Exact bit decoding per ASTER User Handbook V004 would
-        # be more precise but the documented bit layout is product-version
-        # specific — this conservative choice errs on the side of dropping
-        # uncertain pixels, which is fine for a temporal median.
+        # value in either QA Data Plane as a quality issue (fill / bad
+        # pixel / retrieval failure). Note that the AST_07XT QA Data Plane
+        # is NOT a cloud mask — it flags surface-reflectance retrieval
+        # status only. Cloud detection is handled separately below via
+        # the per-scene multi-spectral test.
         qa_mask = None
         if use_qa and any(qa in files for qa in preferred_qa):
             qa_path = next((files[q] for q in preferred_qa if q in files), None)
@@ -6030,24 +6165,65 @@ class AsterMosaic(object):
                     arcpy.AddWarning(f"  ✗ {scene_id}: QA mask build failed ({e}); continuing without")
                     qa_mask = None
 
-        # Process each band: resample SWIR to 15m, scale to reflectance,
-        # apply QA mask if present.
-        masked_paths = []
+        # First pass: build scaled-reflectance rasters for every required
+        # band. SWIR bands are resampled from 30m to 15m first. The
+        # ``SetNull(< 0)`` after Resample translates float32 NoData
+        # sentinels (~-3.4e+38) that BILINEAR can introduce near scene
+        # edges into proper NoData — without it the sentinel flows through
+        # ``Float() * scale`` and contaminates downstream statistics.
+        scaled = {}
         for band in required_bands:
             src = files[band]
             if band not in _ASTER_NATIVE_15M:
-                # SWIR (30m) → 15m via BILINEAR (continuous reflectance).
                 resampled = os.path.join(scratch_dir, f"{scene_id}_{band}_15m.tif")
                 arcpy.management.Resample(src, resampled, 15, "BILINEAR")
-                band_raster = arcpy.sa.Raster(resampled)
+                resampled_raster = arcpy.sa.Raster(resampled)
+                band_raster = arcpy.sa.SetNull(
+                    resampled_raster < 0, resampled_raster,
+                )
             else:
                 band_raster = arcpy.sa.Raster(src)
+            scaled[band] = Float(band_raster) * _ASTER_REFLECTANCE_SCALE
 
-            reflectance = Float(band_raster) * _ASTER_REFLECTANCE_SCALE
-            if qa_mask is not None:
-                masked = arcpy.sa.SetNull(qa_mask, reflectance)
-            else:
-                masked = reflectance
+        # Per-scene multi-spectral cloud test. Hulley & Hook (2008)'s
+        # ACCA-on-ASTER uses VIS + SWIR + TIR; we follow the same
+        # decomposition. The VIS/SWIR conjunction
+        #     (B02 > _B02_MIN) AND (B04 > _B04_MIN)
+        # separates true cloud tops (bright in BOTH red and SWIR) from
+        # bright bare basalt / sand (bright in VIS, dim in SWIR). VNIR-only
+        # scenes have no B04, so they fall back to a B02-only test, which
+        # over-flags bright bare ground; the optional thermal channel
+        # below partially compensates when paired with an AST_08 scene.
+        cloud_vis = scaled["B02"] > _ASTER_CLOUD_B02_MIN
+        if "B04" in scaled:
+            cloud_vis_swir = cloud_vis & (scaled["B04"] > _ASTER_CLOUD_B04_MIN)
+        else:
+            cloud_vis_swir = cloud_vis
+
+        # Optional thermal channel. When the scene was paired with an
+        # AST_08 (Surface Kinetic Temperature) file in scene discovery,
+        # pixels below ``_ASTER_CLOUD_BT_MAX_K`` are flagged as cloud
+        # regardless of VIS/SWIR brightness — this catches thin cirrus
+        # (cold but not bright) and reduces false positives over warm
+        # bare ground. Combined with VIS/SWIR via OR: either signal is
+        # sufficient.
+        bt_kelvin = self._load_bt_kelvin(scene.get("thermal"), scratch_dir, scene_id)
+        if bt_kelvin is not None:
+            cloud_mask = cloud_vis_swir | (bt_kelvin < _ASTER_CLOUD_BT_MAX_K)
+        else:
+            cloud_mask = cloud_vis_swir
+
+        # Combine QA mask (non-cloud quality issues) with the cloud mask.
+        # Either condition is enough to drop the pixel.
+        if qa_mask is not None:
+            drop_mask = qa_mask | cloud_mask
+        else:
+            drop_mask = cloud_mask
+
+        # Second pass: apply the combined drop mask to every band and save.
+        masked_paths = []
+        for band in required_bands:
+            masked = arcpy.sa.SetNull(drop_mask, scaled[band])
             out = os.path.join(scratch_dir, f"{scene_id}_{band}_masked.tif")
             masked.save(out)
             masked_paths.append(out)
@@ -6155,118 +6331,75 @@ class AsterMosaic(object):
             return None
 
     # ------------------------------------------------------------------
-    # Multitemporal cloud refinement
+    # AST_08 (Surface Kinetic Temperature) — thermal cloud channel
     # ------------------------------------------------------------------
 
-    def _apply_multitemporal_refinement(self, stacked_paths, scratch_dir):
-        """Compute per-pixel temporal anomaly mask on visible brightness
-        (B01 + B02 = Green + Red) and mark pixels well above the per-pixel
-        percentile as cloudy. Re-emit each scene with the additional mask
-        applied so the geometric median sees cleaner inputs.
-
-        For very cloudy locations like Faial — Faial is in the Azores
-        North Atlantic, marine climate, persistent cumulus — this is the
-        most important quality lever for ASTER (which lacks a SCL-grade
-        per-scene cloud product).
-
-        Algorithm: for each pixel (i, j) across N scenes, compute
-        brightness_pct(75) = 75th percentile of B01+B02. Mask scenes
-        where brightness > 1.5 × percentile.
-
-        Returns the new list of refined-stacked paths.
+    @classmethod
+    def _extract_ast08_bt_tiff(cls, hdf_path, scratch_dir):
+        """Materialise the AST_08 kinetic temperature SDS to a scratch
+        TIFF. Returns the TIFF path, or None on failure (gdal missing,
+        no recognised SDS, etc.).
         """
-        n = len(stacked_paths)
-        if n < 5:
-            return stacked_paths  # not enough samples for robust statistics
+        try:
+            from osgeo import gdal
+        except ImportError:
+            return None
+        try:
+            ds = gdal.Open(hdf_path)
+            if ds is None:
+                return None
+            scene_stem = os.path.splitext(os.path.basename(hdf_path))[0]
+            for sub_path, _ in ds.GetSubDatasets():
+                tail = sub_path.rsplit(":", 1)[-1]
+                if tail in _AST08_BT_SDS_NAMES:
+                    out_tiff = os.path.join(scratch_dir, f"{scene_stem}_BT.tif")
+                    gdal.Translate(out_tiff, sub_path)
+                    return out_tiff
+            return None
+        except Exception as e:
+            arcpy.AddWarning(f"    AST_08 HDF extraction error: {e}")
+            return None
+
+    def _load_bt_kelvin(self, thermal_meta, scratch_dir, scene_id):
+        """Load the paired AST_08 surface kinetic temperature, resample
+        to 15 m, and return a lazy Kelvin raster suitable for the cloud
+        test. Returns ``None`` when no thermal pairing exists or the
+        load fails (the caller falls back to VIS/SWIR-only cloud detection).
+
+        AST_08 V004 COG TIFFs export already-scaled Kelvin, so no scale
+        factor is applied. NoData (stored as 0 K, and the float32 sentinel
+        Resample can introduce near scene edges) is screened with a
+        single ``SetNull`` against ``_ASTER_TIR_VALID_K_FLOOR``.
+        """
+        if not thermal_meta:
+            return None
+        fmt = thermal_meta.get("format")
+        path = thermal_meta.get("path")
+        if not (fmt and path):
+            return None
+
+        if fmt == "hdf":
+            bt_src = self._extract_ast08_bt_tiff(path, scratch_dir)
+            if bt_src is None:
+                arcpy.AddWarning(
+                    f"  ✗ {scene_id}: AST_08 HDF extraction failed; "
+                    "continuing without thermal cloud channel"
+                )
+                return None
+        else:
+            bt_src = path
 
         try:
-            # All stacks in a single pipeline run share the same band count
-            # (either 9 for VNIR+SWIR or 3 for VNIR-only). Detect once from
-            # the first stack; brightness is always B01+B02 (channels 0+1).
-            n_bands = int(arcpy.Raster(stacked_paths[0]).bandCount)
-
-            arcpy.AddMessage(
-                f"    Pass 1/3 — loading B01+B02 brightness arrays from "
-                f"{n} scene stacks into memory..."
-            )
-            # Compute B01+B02 brightness raster for each scene (band 1 + band 2).
-            brightness_arrays = []
-            ref_meta = None
-            for bi, path in enumerate(stacked_paths, 1):
-                r = arcpy.Raster(path)
-                ext = r.extent
-                cell = (r.meanCellWidth, r.meanCellHeight)
-                arr = arcpy.RasterToNumPyArray(
-                    r, nodata_to_value=np.nan,
-                ).astype(np.float64)
-                # arr shape: (n_bands, h, w) or (h, w, n_bands) depending on arcpy version.
-                # Normalise to (n_bands, h, w).
-                if arr.ndim == 3 and arr.shape[-1] == n_bands:
-                    arr = np.transpose(arr, (2, 0, 1))
-                # Brightness = B01 + B02 (channels 0 + 1).
-                brightness = arr[0] + arr[1]
-                brightness_arrays.append(brightness)
-                if ref_meta is None:
-                    ref_meta = (ext, cell)
-                if bi % 10 == 0 or bi == n:
-                    arcpy.AddMessage(f"      loaded {bi}/{n}")
-
-            arcpy.AddMessage(
-                f"    Pass 2/3 — computing per-pixel "
-                f"{_TEMPORAL_REFINEMENT_PERCENTILE}th-percentile brightness "
-                f"threshold (× {_TEMPORAL_REFINEMENT_FACTOR})..."
-            )
-            stack = np.stack(brightness_arrays, axis=0)  # (n, h, w)
-            # Per-pixel percentile, ignoring NaN.
-            percentile = np.nanpercentile(
-                stack, _TEMPORAL_REFINEMENT_PERCENTILE, axis=0,
-            )
-            threshold = percentile * _TEMPORAL_REFINEMENT_FACTOR
-
-            arcpy.AddMessage(
-                f"    Pass 3/3 — re-emitting {n} scenes with anomaly mask applied..."
-            )
-            # Re-emit each scene with the temporal mask applied.
-            refined_paths = []
-            for ri, (path, brightness) in enumerate(zip(stacked_paths, brightness_arrays), 1):
-                cloud_pixels = brightness > threshold  # (h, w) bool
-                # Load the full stack, apply mask to all bands.
-                r = arcpy.Raster(path)
-                arr = arcpy.RasterToNumPyArray(r, nodata_to_value=np.nan).astype(np.float64)
-                if arr.ndim == 3 and arr.shape[-1] == n_bands:
-                    arr = np.transpose(arr, (2, 0, 1))
-                arr[:, cloud_pixels] = np.nan
-                # Save back as a refined stack — preserve the _stack or
-                # _stack_vnir suffix the upstream helper chose.
-                if path.endswith("_stack_vnir.tif"):
-                    out_path = path.replace("_stack_vnir.tif", "_stack_vnir_refined.tif")
-                else:
-                    out_path = path.replace("_stack.tif", "_stack_refined.tif")
-                # NumPyArrayToRaster wants (n_bands, h, w) → (h, w, n_bands)
-                arr_hwc = np.transpose(arr, (1, 2, 0)).astype(np.float32)
-                ext, cell = ref_meta
-                refined = arcpy.NumPyArrayToRaster(
-                    arr_hwc,
-                    arcpy.Point(ext.XMin, ext.YMin),
-                    cell[0], cell[1],
-                    value_to_nodata=np.nan,
-                )
-                refined.save(out_path)
-                refined_paths.append(out_path)
-                if ri % 10 == 0 or ri == n:
-                    arcpy.AddMessage(f"      refined {ri}/{n}")
-
-            arcpy.AddMessage(
-                f"    Refined {len(refined_paths)} scenes "
-                f"(per-pixel 75th-pctile × 1.5 threshold)."
-            )
-            return refined_paths
+            resampled = os.path.join(scratch_dir, f"{scene_id}_BT_15m.tif")
+            arcpy.management.Resample(bt_src, resampled, 15, "BILINEAR")
+            bt_raster = Float(arcpy.sa.Raster(resampled))
+            return arcpy.sa.SetNull(bt_raster < _ASTER_TIR_VALID_K_FLOOR, bt_raster)
         except Exception as e:
             arcpy.AddWarning(
-                f"    Multitemporal refinement failed (continuing with "
-                f"per-scene QA mask only): {e}"
+                f"  ✗ {scene_id}: AST_08 BT load failed ({e}); "
+                "continuing without thermal cloud channel"
             )
-            return stacked_paths
+            return None
 
     # ------------------------------------------------------------------
     # Provenance

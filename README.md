@@ -33,7 +33,7 @@ The toolbox exposes six tools in workflow order:
 | --- | --- | --- |
 | **01** | Sentinel-2 L2A Mosaic | Cloud-masked mosaic from S2 `.SAFE` archives or `.zip` downloads (SCL classes 3/8/9/10 masked; 20m bands resampled to 10m) |
 | **02** | Landsat 8/9 C2L2 Mosaic | Cloud-masked mosaic from EarthExplorer `.tar` archives (QA_PIXEL bits 0-4 masked; multi-UTM-zone merging) |
-| **03** | ASTER L2 Mosaic | Mineral-mapping mosaic from AST_07XT V004 (TIFF + HDF input; SWIR 30m → 15m; QA Data Plane + multitemporal cloud refinement) |
+| **03** | ASTER L2 Mosaic | Mineral-mapping mosaic from AST_07XT V004 (TIFF + HDF input; SWIR 30m → 15m; QA Data Plane + per-scene multi-spectral cloud test on B02 (red) + B04 (SWIR1); optional brightness-temperature channel from paired AST_08 Surface Kinetic Temperature scenes) |
 | **04** | Spectral Indices & Composites | ~25 indices + ~8 RGB composites, sensor-filtered to what each sensor can compute (red-edge for S2; per-wavelength SWIR minerals for ASTER) |
 | **05** | Statistical Transformations | PCA, MNF, and ICA — sensor-agnostic algorithm with persisted `.npz` statistics for cross-AOI re-application |
 | **06** | Spectral Angle Mapper | Reference-spectra classification (table / training samples / endmember pixels) |
@@ -92,7 +92,7 @@ Tools 04, 05, and 06 take a `Sensor Type` parameter (Auto-detect / Landsat 8/9 /
 | --- | --- | --- |
 | Sentinel-2 L2A | `.SAFE` folders or `.zip` Copernicus archives | Archives read on the fly via GDAL VSI (no extraction needed); browser-style duplicate-download suffixes (`(1).zip`) are deduped by canonical `PRODUCT_URI` from the archive's MTD XML |
 | Landsat 8/9 | EarthExplorer `.tar` or `.zip` archives, or extracted scene folders | Both L2SR and L2SP accepted; archives read on the fly via GDAL VSI (no extraction needed) |
-| ASTER | AST_07XT V004 per-band TIFFs or `.hdf` archives | TIFFs grouped by 17-char scene ID; HDF read via `osgeo.gdal` |
+| ASTER | AST_07XT V004 per-band TIFFs or `.hdf` archives; optionally paired AST_08 V004 Surface Kinetic Temperature files (`AST_08_*_SKT.tif` or HDF), supplied either co-located with the AST_07XT files or in a separate sibling folder via the optional *ASTER Thermal Data Folder* parameter (the natural LP DAAC by-product download layout) | TIFFs grouped by 17-char scene ID; HDF read via `osgeo.gdal`. When an AST_08 file matches an AST_07XT scene by scene ID, its kinetic temperature is folded into the per-scene cloud test (pixels < ~295 K → cloud), catching thin cirrus and disambiguating cloud from warm bare ground |
 
 ---
 
