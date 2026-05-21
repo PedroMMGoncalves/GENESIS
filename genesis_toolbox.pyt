@@ -1736,7 +1736,7 @@ class IndicesComposites(object):
                     result = self._rescale_to_0_255(result)
 
                 name = f"{out_prefix}{meta['output_suffix']}" if out_prefix else meta["output_suffix"]
-                out_path = self._build_out_path(out_workspace, name)
+                out_path = self._build_out_path(out_workspace, name, "index")
                 result.save(out_path)
                 arcpy.AddMessage(f"  Saved: {out_path}")
                 written += 1
@@ -1771,7 +1771,7 @@ class IndicesComposites(object):
                     channels.append(b)
 
                 name = f"{out_prefix}{meta['output_suffix']}" if out_prefix else meta["output_suffix"]
-                out_path = self._build_out_path(out_workspace, name)
+                out_path = self._build_out_path(out_workspace, name, "composite")
                 arcpy.management.CompositeBands(channels, out_path)
                 arcpy.AddMessage(f"  Saved: {out_path}")
                 written += 1
@@ -1781,19 +1781,26 @@ class IndicesComposites(object):
                 arcpy.AddWarning(f"Error creating {clean}: {e}")
         return written
 
-    def _build_out_path(self, out_workspace, name):
-        """Append .tif when the workspace is a plain folder.
+    def _build_out_path(self, out_workspace, name, kind):
+        """Build the output path for an index or composite raster.
 
         Folder workspaces default to ESRI GRID, which caps raster names
-        at 13 characters and rejects longer suffixes (ClaySWIR,
-        FerrousIron, IronOxide, FerricIron, …) with ERROR 010240 /
-        ERROR 000472. File geodatabases (.gdb) and SDE workspaces have
-        no such limit, so leave the path extension-less in those cases.
+        at 13 characters; appending .tif forces GeoTIFF and lifts that
+        limit. For folder workspaces we also split outputs into two
+        sibling subfolders — ``indices/`` and ``composites/`` — so the
+        two product families don't visually mix in the catalog.
+
+        File geodatabases (.gdb) and SDE workspaces have no name length
+        limit and don't support nested folders, so we save flat into
+        the workspace root.
         """
         ws_lower = (out_workspace or "").lower().rstrip("\\/")
         if ws_lower.endswith(".gdb") or ws_lower.endswith(".sde"):
             return os.path.join(out_workspace, name)
-        return os.path.join(out_workspace, f"{name}.tif")
+        subfolder = "indices" if kind == "index" else "composites"
+        target_dir = os.path.join(out_workspace, subfolder)
+        os.makedirs(target_dir, exist_ok=True)
+        return os.path.join(target_dir, f"{name}.tif")
 
     def _rescale_to_0_255(self, raster):
         """Linear rescale a raster to [0, 255] using its own min/max."""
