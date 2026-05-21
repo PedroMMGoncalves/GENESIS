@@ -3877,11 +3877,21 @@ class Sentinel2Mosaic(object):
         )
         save_stats.value = True
 
+        preserve_scratch = arcpy.Parameter(
+            displayName="Preserve Scratch & Resume on Re-run",
+            name="preserve_scratch",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        preserve_scratch.value = False
+
         return [
             gdb, mosaic_name, data_folder, region, time_type,
             year, month, season, apply_temporal,
             cloud_aggressiveness, cloud_buffer,
-            mask_feature, save_stats,
+            mask_feature, save_stats, preserve_scratch,
         ]
 
     def updateParameters(self, parameters):
@@ -3946,6 +3956,7 @@ class Sentinel2Mosaic(object):
             cloud_buffer_pixels = parameters[10].value if parameters[10].value is not None else 2
             mask_feature = parameters[11].valueAsText
             save_stats = bool(parameters[12].value)
+            preserve_scratch = bool(parameters[13].value)
 
             # Resolve aggressiveness preset → SCL class tuple. The dropdown
             # constrains the value to the preset keys; fall back defensively
@@ -3986,12 +3997,20 @@ class Sentinel2Mosaic(object):
 
             # Scratch is pinned to the output GDB's parent folder
             # (same-disk-as-output, avoids OneDrive sync overhead).
+            # The folder name is deterministic from the mosaic name so a
+            # re-run with the same output name reuses any per-scene stacks
+            # left over from a previous run when Preserve Scratch is on.
             scratch_dir = os.path.join(
                 os.path.dirname(os.path.normpath(gdb_path)),
-                f"_genesis_s2_scratch_{uuid.uuid4().hex[:8]}",
+                f"_genesis_s2_scratch_{_sanitize_arcpy_name(mosaic_name)}",
             )
             os.makedirs(scratch_dir, exist_ok=True)
             arcpy.AddMessage(f"  Scratch:    {scratch_dir}")
+            if preserve_scratch:
+                arcpy.AddMessage(
+                    "  Resume:     Preserve Scratch is ON — completed "
+                    "per-scene stacks from previous runs will be reused"
+                )
 
             # Phase 1 — discover scenes
             arcpy.AddMessage("\n▶ Phase 1 — Scene discovery")
@@ -4060,17 +4079,56 @@ class Sentinel2Mosaic(object):
             scenes_by_tile = {}
             all_scenes_used = []
             stack_start = datetime.now()
+
+            # Resume scan: any scene whose stack file AND its .complete
+            # marker survive in scratch is treated as already processed.
+            # Both files must be present — the marker is written only
+            # after CompositeBands returns successfully, so a stack
+            # without a marker is partial and must be rebuilt.
+            resumed_count = 0
+            to_process = []
+            for scene in kept_scenes:
+                meta = scene["metadata"]
+                tile = meta.get("tile_id")
+                product_uri = meta.get("product_uri")
+                if not (tile and product_uri):
+                    to_process.append(scene)
+                    continue
+                expected_stack = os.path.join(
+                    scratch_dir, f"{product_uri}_stack.tif"
+                )
+                expected_marker = expected_stack + ".complete"
+                if (os.path.exists(expected_stack)
+                        and os.path.exists(expected_marker)):
+                    scenes_by_tile.setdefault(tile, []).append(expected_stack)
+                    composite_temp_paths.append(expected_stack)
+                    all_scenes_used.append(scene)
+                    resumed_count += 1
+                else:
+                    to_process.append(scene)
+            if resumed_count:
+                arcpy.AddMessage(
+                    f"  ✓ Resume: {resumed_count}/{len(kept_scenes)} scene "
+                    f"stack(s) reused from previous run"
+                )
+                if not to_process:
+                    arcpy.AddMessage(
+                        "  ✓ All scenes already processed — skipping to "
+                        "Phase 4"
+                    )
+
             arcpy.SetProgressor(
-                "step", "Cloud-masking + stacking scenes", 0, len(kept_scenes), 1
+                "step", "Cloud-masking + stacking scenes",
+                0, max(1, len(to_process)), 1,
             )
-            log_every = max(1, len(kept_scenes) // 10)
+            log_every = max(1, len(to_process) // 10) if to_process else 1
             scene_times = []
 
-            for idx, scene in enumerate(kept_scenes, 1):
+            for idx, scene in enumerate(to_process, 1):
                 if arcpy.env.isCancelled:
                     arcpy.ResetProgressor()
                     arcpy.AddWarning(
-                        f"  ✗ Cancelled after {idx-1}/{len(kept_scenes)} scenes."
+                        f"  ✗ Cancelled after {idx-1}/{len(to_process)} scenes."
                     )
                     return None
                 meta = scene["metadata"]
@@ -4082,7 +4140,7 @@ class Sentinel2Mosaic(object):
                     continue
                 src_tag = "zip" if scene.get("source_kind") == "zip" else "safe"
                 arcpy.SetProgressorLabel(
-                    f"[{idx}/{len(kept_scenes)}] [{tile}/{src_tag}] "
+                    f"[{idx}/{len(to_process)}] [{tile}/{src_tag}] "
                     f"{os.path.basename(scene['path'])}"
                 )
                 scene_start = datetime.now()
@@ -4102,12 +4160,12 @@ class Sentinel2Mosaic(object):
                     )
                 arcpy.SetProgressorPosition(idx)
                 # Periodic message ~10× during the phase
-                if idx % log_every == 0 or idx == len(kept_scenes):
+                if idx % log_every == 0 or idx == len(to_process):
                     if scene_times:
                         avg = sum(scene_times) / len(scene_times)
-                        pct = 100.0 * idx / len(kept_scenes)
+                        pct = 100.0 * idx / len(to_process)
                         arcpy.AddMessage(
-                            f"  [{idx}/{len(kept_scenes)}] {pct:.0f}% — "
+                            f"  [{idx}/{len(to_process)}] {pct:.0f}% — "
                             f"avg {avg:.1f}s/scene"
                         )
 
@@ -4264,7 +4322,14 @@ class Sentinel2Mosaic(object):
             return None
 
         finally:
-            _cleanup_scratch_folder(scratch_dir)
+            if locals().get("preserve_scratch") and scratch_dir:
+                arcpy.AddMessage(
+                    f"  Scratch preserved at: {scratch_dir}\n"
+                    "  Re-run with the same Output Mosaic Name to resume "
+                    "from completed scenes."
+                )
+            else:
+                _cleanup_scratch_folder(scratch_dir)
             if arcpy.CheckExtension("Spatial") == "Available":
                 arcpy.CheckInExtension("Spatial")
 
@@ -4631,6 +4696,17 @@ class Sentinel2Mosaic(object):
         # Composite into a single 10-band raster.
         stacked_path = os.path.join(scratch_dir, f"{scene_id}_stack.tif")
         arcpy.management.CompositeBands(masked_paths, stacked_path)
+
+        # Resume sentinel — written only after CompositeBands returns,
+        # so its presence guarantees the stack file is complete. A failure
+        # mid-CompositeBands leaves the stack without a marker, which the
+        # Phase 3 resume scan treats as partial and rebuilds.
+        try:
+            with open(stacked_path + ".complete", "w", encoding="utf-8") as fh:
+                fh.write(datetime.now().isoformat(timespec="seconds") + "\n")
+        except OSError:
+            pass  # Non-fatal — without the marker the scene rebuilds next run
+
         return stacked_path
 
     # ------------------------------------------------------------------
