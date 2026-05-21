@@ -2055,6 +2055,13 @@ class LandsatMosaic(object):
             required = ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "QA_PIXEL"]
 
             for idx, scene in enumerate(scenes, 1):
+                # Validation is fast (~10ms per scene), so checking every
+                # 25 scenes is responsive enough without burning cycles.
+                if idx % 25 == 0 and arcpy.env.isCancelled:
+                    arcpy.AddWarning(
+                        f"Cancelled by user after validating {idx-1}/{total_scenes} scenes."
+                    )
+                    return None
                 try:
                     scene_path = scene.get('path', '')
                     scene_id = scene.get('scene_id') or os.path.basename(
@@ -2170,6 +2177,15 @@ class LandsatMosaic(object):
 
             composite_idx = 0
             for scene in clean_scenes:
+                # Each composite is ~30s+; checking every iteration keeps
+                # the Cancel button responsive without measurable overhead.
+                if arcpy.env.isCancelled:
+                    arcpy.AddWarning(
+                        f"Cancelled by user after {composite_idx}/{total} composites. "
+                        f"Scratch folder will be cleaned up; GeometricMedian skipped."
+                    )
+                    return None
+
                 band_paths = scene.get('band_paths') or {}
                 if not (all(f"B{n}" in band_paths for n in range(1, 8))
                         and 'QA_PIXEL' in band_paths):
@@ -2326,10 +2342,17 @@ class LandsatMosaic(object):
                 arcpy.CheckOutExtension("Spatial")
             if arcpy.CheckExtension("ImageAnalyst") == "Available":
                 arcpy.CheckOutExtension("ImageAnalyst")
-            
+
             # Enable overwrite
             arcpy.env.overwriteOutput = True
-            
+
+            # Take control of cancellation so we can clean up scratch +
+            # extensions instead of Pro hard-killing the process. Cancel
+            # checks at the loop boundaries below return None with a
+            # warning when the user clicks the Cancel button in the GP
+            # dialog.
+            arcpy.env.autoCancelling = False
+
             # Get parameters
             gdb_path = parameters[0].valueAsText
             mosaic_name = parameters[1].valueAsText
@@ -2415,6 +2438,9 @@ class LandsatMosaic(object):
             # Process each UTM zone
             final_mosaics = []
             for utm_zone in region_info['utm_zones']:
+                if arcpy.env.isCancelled:
+                    arcpy.AddWarning("Cancelled by user between UTM zones.")
+                    return None
                 try:
                     arcpy.AddMessage(f"\nProcessing UTM zone {utm_zone}{region_info['hemisphere']}")
                     
@@ -3130,7 +3156,25 @@ class LandsatMosaic(object):
             for fn in archive_entries:
                 stats['total_scenes'] += 1
                 archive_path = os.path.join(data_folder, fn)
-                scene_id = fn[:-4]  # strip .tar / .zip
+
+                # Derive the canonical scene_id from INSIDE the archive
+                # rather than the outer filename. Required because:
+                #   * Windows duplicate-download renames produce filenames
+                #     like `LC08_..._T1 (1).tar`; the ` (1)` suffix breaks
+                #     filename-based scene_id derivation but the MTL
+                #     inside the archive still uses the canonical name.
+                #   * Users sometimes rename archives manually.
+                #   * Empty / corrupt tars are caught here too — they
+                #     return None and get a clean skip with a warning.
+                canonical_scene_id = self._derive_scene_id_from_archive(archive_path)
+                if not canonical_scene_id:
+                    arcpy.AddWarning(
+                        f"  Could not derive scene_id from {fn} "
+                        f"(archive unreadable or no *_MTL.txt inside)."
+                    )
+                    stats['failed_scenes'] += 1
+                    continue
+                scene_id = canonical_scene_id
                 if scene_id in seen_scene_ids:
                     continue
 
@@ -3326,6 +3370,46 @@ class LandsatMosaic(object):
     # through GDAL's drivers — no extraction, no cleanup, no double disk.
     # MTL.txt sidecars are read in-memory with the stdlib tarfile/zipfile
     # modules.
+
+    @staticmethod
+    def _derive_scene_id_from_archive(archive_path):
+        """Read the canonical Landsat scene_id from inside an archive.
+
+        Looks for a `*_MTL.txt` member and returns the part before the
+        suffix. This is more robust than deriving from the outer
+        filename because:
+
+          * Windows duplicate downloads add ` (1)` to the filename
+            (e.g., `LC08_..._T1 (1).tar`) while the MTL inside stays
+            canonical. The outside-derived scene_id wouldn't match
+            the inside member names.
+          * Users sometimes rename archives manually.
+          * Empty/corrupt archives that can't be opened return None,
+            giving callers a clean way to skip them with a warning.
+
+        Returns the canonical scene_id (e.g.,
+        `LC08_L2SR_217033_20210707_20210713_02_T1`) or None.
+        """
+        sl = archive_path.lower()
+        try:
+            if sl.endswith('.tar'):
+                with tarfile.open(archive_path, 'r') as tf:
+                    for member in tf.getmembers():
+                        if not member.isfile():
+                            continue
+                        basename = member.name.rsplit('/', 1)[-1]
+                        if basename.endswith('_MTL.txt'):
+                            return basename[:-len('_MTL.txt')]
+            elif sl.endswith('.zip'):
+                with zipfile.ZipFile(archive_path, 'r') as zf:
+                    for name in zf.namelist():
+                        basename = name.rsplit('/', 1)[-1]
+                        if basename.endswith('_MTL.txt'):
+                            return basename[:-len('_MTL.txt')]
+        except (tarfile.TarError, zipfile.BadZipFile, OSError):
+            # Empty / corrupt / unreadable archive — caller logs.
+            pass
+        return None
 
     @staticmethod
     def _validate_tar_file(tar_path):
@@ -3724,6 +3808,9 @@ class Sentinel2Mosaic(object):
                 return None
             arcpy.CheckOutExtension("Spatial")
             arcpy.env.overwriteOutput = True
+            # Take control of cancellation so loop-boundary checks can
+            # abort cleanly instead of Pro hard-killing the process.
+            arcpy.env.autoCancelling = False
 
             gdb_path = parameters[0].valueAsText
             mosaic_name = parameters[1].valueAsText
@@ -3833,6 +3920,12 @@ class Sentinel2Mosaic(object):
             all_scenes_used = []
             stack_start = datetime.now()
             for idx, scene in enumerate(kept_scenes, 1):
+                # Each scene is tens of seconds; check every iteration.
+                if arcpy.env.isCancelled:
+                    arcpy.AddWarning(
+                        f"Cancelled by user after processing {idx-1}/{len(kept_scenes)} scenes."
+                    )
+                    return None
                 meta = scene["metadata"]
                 tile = meta.get("tile_id")
                 if not tile:
@@ -3889,6 +3982,11 @@ class Sentinel2Mosaic(object):
             tile_mosaics = []
             median_phase_start = datetime.now()
             for ti, (tile, stacked_paths) in enumerate(scenes_by_tile.items(), 1):
+                if arcpy.env.isCancelled:
+                    arcpy.AddWarning(
+                        f"Cancelled by user after computing {ti-1}/{len(scenes_by_tile)} tile medians."
+                    )
+                    return None
                 arcpy.AddMessage(
                     f"  [{ti}/{len(scenes_by_tile)}] [{tile}] computing median "
                     f"over {len(stacked_paths)} scenes..."
@@ -4009,9 +4107,29 @@ class Sentinel2Mosaic(object):
         finally:
             # Cleanup scratch.
             if scratch_dir and os.path.isdir(scratch_dir):
+                # Two-pass retry — Pro sometimes holds file locks on
+                # scratch GeoTIFFs after .save() returns. gc.collect()
+                # + ClearWorkspaceCache + brief sleep usually releases
+                # them. Survivors are warned, not silently leaked.
                 try:
                     import shutil
                     shutil.rmtree(scratch_dir, ignore_errors=True)
+                    if os.path.isdir(scratch_dir):
+                        import gc
+                        import time as _time
+                        gc.collect()
+                        try:
+                            arcpy.management.ClearWorkspaceCache()
+                        except Exception:
+                            pass
+                        _time.sleep(1.0)
+                        shutil.rmtree(scratch_dir, ignore_errors=True)
+                        if os.path.isdir(scratch_dir):
+                            arcpy.AddWarning(
+                                f"  Scratch folder {scratch_dir} could not "
+                                f"be fully removed (file locks held by Pro). "
+                                f"It is safe to delete manually."
+                            )
                 except Exception:
                     pass
             if arcpy.CheckExtension("Spatial") == "Available":
@@ -4708,6 +4826,9 @@ class AsterMosaic(object):
                 return None
             arcpy.CheckOutExtension("Spatial")
             arcpy.env.overwriteOutput = True
+            # Take control of cancellation so loop-boundary checks can
+            # abort cleanly instead of Pro hard-killing the process.
+            arcpy.env.autoCancelling = False
 
             gdb_path = parameters[0].valueAsText
             mosaic_name = parameters[1].valueAsText
@@ -4798,6 +4919,11 @@ class AsterMosaic(object):
             scenes_used = []
             stack_phase_start = datetime.now()
             for idx, scene in enumerate(kept_scenes, 1):
+                if arcpy.env.isCancelled:
+                    arcpy.AddWarning(
+                        f"Cancelled by user after processing {idx-1}/{len(kept_scenes)} ASTER scenes."
+                    )
+                    return None
                 arcpy.AddMessage(
                     f"  [{idx}/{len(kept_scenes)}] [{scene.get('format','?')}] "
                     f"{scene['scene_id']}"
@@ -4915,9 +5041,29 @@ class AsterMosaic(object):
 
         finally:
             if scratch_dir and os.path.isdir(scratch_dir):
+                # Two-pass retry — Pro sometimes holds file locks on
+                # scratch GeoTIFFs after .save() returns. gc.collect()
+                # + ClearWorkspaceCache + brief sleep usually releases
+                # them. Survivors are warned, not silently leaked.
                 try:
                     import shutil
                     shutil.rmtree(scratch_dir, ignore_errors=True)
+                    if os.path.isdir(scratch_dir):
+                        import gc
+                        import time as _time
+                        gc.collect()
+                        try:
+                            arcpy.management.ClearWorkspaceCache()
+                        except Exception:
+                            pass
+                        _time.sleep(1.0)
+                        shutil.rmtree(scratch_dir, ignore_errors=True)
+                        if os.path.isdir(scratch_dir):
+                            arcpy.AddWarning(
+                                f"  Scratch folder {scratch_dir} could not "
+                                f"be fully removed (file locks held by Pro). "
+                                f"It is safe to delete manually."
+                            )
                 except Exception:
                     pass
             if arcpy.CheckExtension("Spatial") == "Available":
@@ -5066,11 +5212,32 @@ class AsterMosaic(object):
         unreadable QA, etc.).
         """
         if scene["format"] == "hdf":
-            arcpy.AddMessage("      • extracting HDF subdatasets to scratch TIFFs")
-            extracted = self._extract_hdf_to_tiffs(scene["files"]["hdf"], scratch_dir)
+            # Try GDAL subdataset URIs first — arcpy in Pro 3.x can read
+            # `HDF4_EOS:EOS_SWATH:"foo.hdf":...:ImageData4` directly with
+            # windowed reads, avoiding the per-band gdal.Translate
+            # materialisation that the legacy path needs. Falls back to
+            # scratch TIFFs if arcpy can't open the URIs on this install.
+            extracted = self._get_hdf_subdataset_uris(scene["files"]["hdf"])
+            if extracted is not None:
+                try:
+                    test_uri = next(iter(extracted.values()))
+                    _ = arcpy.sa.Raster(test_uri).bandCount
+                    arcpy.AddMessage(
+                        "      • reading HDF subdatasets directly via GDAL "
+                        "(no scratch materialisation)"
+                    )
+                except Exception:
+                    arcpy.AddMessage(
+                        "      • arcpy cannot read HDF subdataset URIs on "
+                        "this install; falling back to scratch TIFFs"
+                    )
+                    extracted = None
             if extracted is None:
-                arcpy.AddWarning("      HDF extraction failed; scene skipped.")
-                return None
+                arcpy.AddMessage("      • extracting HDF subdatasets to scratch TIFFs")
+                extracted = self._extract_hdf_to_tiffs(scene["files"]["hdf"], scratch_dir)
+                if extracted is None:
+                    arcpy.AddWarning("      HDF extraction failed; scene skipped.")
+                    return None
             scene = dict(scene, format="tiff", files=extracted)
 
         files = scene["files"]
@@ -5139,10 +5306,57 @@ class AsterMosaic(object):
         arcpy.management.CompositeBands(masked_paths, stacked)
         return stacked
 
-    @staticmethod
-    def _extract_hdf_to_tiffs(hdf_path, scratch_dir):
+    # Subdataset name → band label mapping used by both the URI helper
+    # (no materialisation) and the legacy gdal.Translate path.
+    _HDF_SUBDATASET_LOOKUP = {
+        "ImageData1": "B01", "ImageData2": "B02", "ImageData3": "B03N",
+        "ImageData4": "B04", "ImageData5": "B05", "ImageData6": "B06",
+        "ImageData7": "B07", "ImageData8": "B08", "ImageData9": "B09",
+        "QA_DataPlane": "VNIR_QA_DataPlane",
+        "QA_DataPlane2": "SWIR_QA_DataPlane",
+    }
+
+    @classmethod
+    def _get_hdf_subdataset_uris(cls, hdf_path):
+        """Map ASTER HDF subdatasets to GDAL URIs without materialisation.
+
+        Returns dict {band_label: subdataset_uri} or None on failure.
+        The URIs are GDAL-format strings like
+        `HDF4_EOS:EOS_SWATH:"foo.hdf":SwathName:ImageData4` that arcpy
+        can read directly on Pro 3.x. arcpy then issues windowed reads
+        through the GDAL HDF4 driver as the downstream `Resample` /
+        `CompositeBands` need pixels — avoiding the ~10 gdal.Translate
+        calls per scene that `_extract_hdf_to_tiffs` does.
+
+        Returns None if osgeo.gdal isn't available, the HDF can't be
+        opened, or no recognised subdatasets are present. Callers
+        should fall back to `_extract_hdf_to_tiffs` in that case.
+        """
+        try:
+            from osgeo import gdal
+        except ImportError:
+            return None
+        try:
+            ds = gdal.Open(hdf_path)
+            if ds is None:
+                return None
+            outputs = {}
+            for sub_path, _ in ds.GetSubDatasets():
+                tail = sub_path.rsplit(":", 1)[-1]
+                if tail in cls._HDF_SUBDATASET_LOOKUP:
+                    outputs[cls._HDF_SUBDATASET_LOOKUP[tail]] = sub_path
+            return outputs if outputs else None
+        except Exception:
+            return None
+
+    @classmethod
+    def _extract_hdf_to_tiffs(cls, hdf_path, scratch_dir):
         """Extract ASTER AST_07XT subdatasets from an HDF-EOS file to a
         per-band TIFF dict matching the standard TIFF convention.
+
+        Used as a fallback when arcpy cannot read HDF subdataset URIs
+        directly on the current install (see `_get_hdf_subdataset_uris`
+        which avoids this materialisation step entirely).
 
         Uses osgeo.gdal (bundled with arcpy) to read the subdatasets.
         Returns None if gdal isn't available or if the HDF structure
@@ -5161,26 +5375,16 @@ class AsterMosaic(object):
             ds = gdal.Open(hdf_path)
             if ds is None:
                 return None
-            subdatasets = ds.GetSubDatasets()
-            # Expected names: ImageData1..9 for bands, QA_DataPlane / QA_DataPlane2.
-            # The exact subdataset names vary by hdf_eos library version; match
-            # by suffix.
+            # The exact subdataset names vary by hdf_eos library version;
+            # we match by suffix using the shared class-level lookup.
             outputs = {}
-            band_lookup = {
-                "ImageData1": "B01", "ImageData2": "B02", "ImageData3": "B03N",
-                "ImageData4": "B04", "ImageData5": "B05", "ImageData6": "B06",
-                "ImageData7": "B07", "ImageData8": "B08", "ImageData9": "B09",
-                "QA_DataPlane": "VNIR_QA_DataPlane",
-                "QA_DataPlane2": "SWIR_QA_DataPlane",
-            }
             scene_stem = os.path.splitext(os.path.basename(hdf_path))[0]
-            for sub_path, sub_desc in subdatasets:
-                # sub_path typically looks like
-                # 'HDF4_EOS:EOS_SWATH:"foo.hdf":SwathName:ImageData4'
+            for sub_path, _ in ds.GetSubDatasets():
+                # sub_path looks like 'HDF4_EOS:EOS_SWATH:"foo.hdf":SwathName:ImageData4'
                 tail = sub_path.rsplit(":", 1)[-1]
-                if tail not in band_lookup:
+                if tail not in cls._HDF_SUBDATASET_LOOKUP:
                     continue
-                band_label = band_lookup[tail]
+                band_label = cls._HDF_SUBDATASET_LOOKUP[tail]
                 out_tiff = os.path.join(scratch_dir, f"{scene_stem}_{band_label}.tif")
                 gdal.Translate(out_tiff, sub_path)
                 outputs[band_label] = out_tiff
