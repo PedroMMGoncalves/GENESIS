@@ -1987,8 +1987,18 @@ class LandsatMosaic(object):
         )
         save_stats.value = True
 
-        params = [gdb, mosaic_name, data_folder, region, time_type, 
-                 year, month, season, mask, save_stats]
+        preserve_scratch = arcpy.Parameter(
+            displayName="Preserve Scratch & Resume on Re-run",
+            name="preserve_scratch",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        preserve_scratch.value = False
+
+        params = [gdb, mosaic_name, data_folder, region, time_type,
+                 year, month, season, mask, save_stats, preserve_scratch]
         return params
     
     def updateParameters(self, parameters):
@@ -2228,7 +2238,8 @@ class LandsatMosaic(object):
             arcpy.AddError(f"Scene validation failed: {str(e)}")
             return None
 
-    def _create_geometric_median_mosaic(self, clean_scenes, gdb_path, mosaic_name):
+    def _create_geometric_median_mosaic(self, clean_scenes, gdb_path, mosaic_name,
+                                         preserve_scratch=False):
         """Create geometric median mosaic preserving multi-band structure.
 
         Cleanup fix: previously the temp composites (one per scene) were
@@ -2260,11 +2271,15 @@ class LandsatMosaic(object):
                 ) and 'QA_PIXEL' in s['band_paths']
             )
 
-            # Scratch is pinned to the output GDB's parent folder.
+            # Scratch is pinned to the output GDB's parent folder. The
+            # folder name is deterministic from the per-zone mosaic name
+            # so a re-run with the same name reuses any per-scene
+            # composites left over from a previous run when Preserve
+            # Scratch is on.
             scratch_root = os.path.dirname(os.path.normpath(gdb_path))
             scratch_dir = os.path.join(
                 scratch_root,
-                f"_genesis_landsat_composites_{uuid.uuid4().hex[:8]}",
+                f"_genesis_landsat_composites_{_sanitize_arcpy_name(mosaic_name)}",
             )
             os.makedirs(scratch_dir, exist_ok=True)
 
@@ -2276,41 +2291,74 @@ class LandsatMosaic(object):
                 "materialised once per scene to avoid 7× QA decode"
             )
 
+            # Resume scan — any scene whose composite + .complete marker
+            # both survive in scratch is reused as-is. A composite file
+            # without a marker is partial (Phase 3 died mid-CompositeBands)
+            # and gets rebuilt below.
+            def _composite_path_for(scene):
+                sid = scene.get('scene_id') or os.path.basename(
+                    (scene.get('path') or '').rstrip(os.sep)
+                ) or "scene"
+                return os.path.join(
+                    scratch_dir,
+                    f"{_sanitize_arcpy_name(sid)}_composite.tif",
+                )
+
+            eligible_scenes = [
+                s for s in clean_scenes
+                if (s.get('band_paths') and
+                    all(f"B{n}" in s['band_paths'] for n in range(1, 8)) and
+                    'QA_PIXEL' in s['band_paths'])
+            ]
+            resumed_count = 0
+            to_process = []
+            for scene in eligible_scenes:
+                comp_path = _composite_path_for(scene)
+                if os.path.exists(comp_path) and os.path.exists(comp_path + ".complete"):
+                    multiband_rasters.append(comp_path)
+                    resumed_count += 1
+                else:
+                    to_process.append(scene)
+            if resumed_count:
+                arcpy.AddMessage(
+                    f"  ✓ Resume: {resumed_count}/{len(eligible_scenes)} "
+                    f"composite(s) reused from previous run"
+                )
+
             arcpy.SetProgressor(
-                "step", "Building per-scene composites", 0, total, 1
+                "step", "Building per-scene composites",
+                0, max(1, len(to_process)), 1,
             )
             # Periodic Messages-tab update: ~10 lines for the whole phase,
             # whatever the scene count. Per-scene progress is on the GP
             # dialog progress bar (SetProgressorLabel/Position).
-            log_every = max(1, total // 10)
+            log_every = max(1, len(to_process) // 10) if to_process else 1
             scene_times = []
             composite_idx = 0
 
-            for scene in clean_scenes:
+            for scene in to_process:
                 # Cancel check every iteration — each composite is ~30s+.
                 if arcpy.env.isCancelled:
                     arcpy.ResetProgressor()
                     arcpy.AddWarning(
-                        f"  ✗ Cancelled by user after {composite_idx}/{total} composites."
+                        f"  ✗ Cancelled by user after {composite_idx}/{len(to_process)} composites."
                     )
                     return None
 
-                band_paths = scene.get('band_paths') or {}
-                if not (all(f"B{n}" in band_paths for n in range(1, 8))
-                        and 'QA_PIXEL' in band_paths):
-                    continue
-
+                band_paths = scene['band_paths']
                 composite_idx += 1
                 scene_id = scene.get('scene_id') or os.path.basename(
                     (scene.get('path') or '').rstrip(os.sep)
                 ) or f"scene_{composite_idx}"
-                arcpy.SetProgressorLabel(f"[{composite_idx}/{total}] {scene_id}")
+                arcpy.SetProgressorLabel(
+                    f"[{composite_idx}/{len(to_process)}] {scene_id}"
+                )
                 scene_start = datetime.now()
 
                 # Per-scene subfolder so vmask.tif + Bn.tif don't collide
                 # between scenes. _cleanup_scratch_folder() handles the lot.
                 scene_scratch = os.path.join(
-                    scratch_dir, f"s{composite_idx:04d}"
+                    scratch_dir, _sanitize_arcpy_name(scene_id),
                 )
                 os.makedirs(scene_scratch, exist_ok=True)
 
@@ -2348,10 +2396,16 @@ class LandsatMosaic(object):
                     for n in range(1, 8)
                 ]
 
-                temp_composite = os.path.join(
-                    scratch_dir, f"composite_{composite_idx:04d}.tif"
-                )
+                temp_composite = _composite_path_for(scene)
                 arcpy.management.CompositeBands(composite_inputs, temp_composite)
+                # Resume sentinel — only written after CompositeBands
+                # returns successfully; a half-written composite stays
+                # marker-less and is rebuilt next run.
+                try:
+                    with open(temp_composite + ".complete", "w", encoding="utf-8") as fh:
+                        fh.write(datetime.now().isoformat(timespec="seconds") + "\n")
+                except OSError:
+                    pass
                 multiband_rasters.append(temp_composite)
 
                 scene_times.append(
@@ -2360,11 +2414,11 @@ class LandsatMosaic(object):
                 arcpy.SetProgressorPosition(composite_idx)
 
                 # Periodic Messages-tab update — ~10 lines for the phase.
-                if composite_idx % log_every == 0 or composite_idx == total:
+                if composite_idx % log_every == 0 or composite_idx == len(to_process):
                     avg = sum(scene_times) / len(scene_times)
-                    pct = 100.0 * composite_idx / total
+                    pct = 100.0 * composite_idx / len(to_process)
                     arcpy.AddMessage(
-                        f"  [{composite_idx}/{total}] {pct:.0f}% — "
+                        f"  [{composite_idx}/{len(to_process)}] {pct:.0f}% — "
                         f"avg {avg:.1f}s/scene"
                     )
 
@@ -2410,13 +2464,20 @@ class LandsatMosaic(object):
             return None
 
         finally:
-            if multiband_rasters:
+            if preserve_scratch and scratch_dir:
                 arcpy.AddMessage(
-                    f"  Cleaning up scratch folder "
-                    f"({len(multiband_rasters)} composite(s))..."
+                    f"  Scratch preserved at: {scratch_dir}\n"
+                    f"  Re-run with the same Output Mosaic Name to resume "
+                    f"from completed composites."
                 )
-            if 'scratch_dir' in locals():
-                _cleanup_scratch_folder(scratch_dir)
+            else:
+                if multiband_rasters:
+                    arcpy.AddMessage(
+                        f"  Cleaning up scratch folder "
+                        f"({len(multiband_rasters)} composite(s))..."
+                    )
+                if 'scratch_dir' in locals():
+                    _cleanup_scratch_folder(scratch_dir)
 
 
     def execute(self, parameters, messages):
@@ -2448,6 +2509,7 @@ class LandsatMosaic(object):
             season = parameters[7].valueAsText
             mask_feature = parameters[8].valueAsText
             save_stats = parameters[9].value
+            preserve_scratch = bool(parameters[10].value)
 
             # ----------------------------------------------------------------
             # AOI-first scoping. Set arcpy.env.mask + arcpy.env.extent BEFORE
@@ -2542,7 +2604,8 @@ class LandsatMosaic(object):
                     zone_mosaic = self._create_geometric_median_mosaic(
                         clean_scenes,
                         gdb_path,
-                        f"{mosaic_name}_UTM{utm_zone}{region_info['hemisphere']}"
+                        f"{mosaic_name}_UTM{utm_zone}{region_info['hemisphere']}",
+                        preserve_scratch=preserve_scratch,
                     )
 
                     if zone_mosaic:
@@ -5043,10 +5106,20 @@ class AsterMosaic(object):
         )
         save_stats.value = True
 
+        preserve_scratch = arcpy.Parameter(
+            displayName="Preserve Scratch & Resume on Re-run",
+            name="preserve_scratch",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        preserve_scratch.value = False
+
         return [
             gdb, mosaic_name, data_folder, region, time_type,
             year, month, season, apply_temporal, use_qa_planes,
-            mask_feature, save_stats,
+            mask_feature, save_stats, preserve_scratch,
         ]
 
     def updateParameters(self, parameters):
@@ -5096,6 +5169,7 @@ class AsterMosaic(object):
             use_qa = bool(parameters[9].value)
             mask_feature = parameters[10].valueAsText
             save_stats = bool(parameters[11].value)
+            preserve_scratch = bool(parameters[12].value)
 
             # ----------------------------------------------------------------
             # AOI-first scoping. See LandsatMosaic.execute() for the full
@@ -5128,13 +5202,22 @@ class AsterMosaic(object):
                 )
 
             # Scratch is pinned to the output GDB's parent folder
-            # (same-disk-as-output, avoids OneDrive sync overhead).
+            # (same-disk-as-output, avoids OneDrive sync overhead). The
+            # folder name is deterministic from the mosaic name so a
+            # re-run with the same output name reuses any per-scene
+            # stacks left over from a previous run when Preserve Scratch
+            # is on.
             scratch_dir = os.path.join(
                 os.path.dirname(os.path.normpath(gdb_path)),
-                f"_genesis_aster_scratch_{uuid.uuid4().hex[:8]}",
+                f"_genesis_aster_scratch_{_sanitize_arcpy_name(mosaic_name)}",
             )
             os.makedirs(scratch_dir, exist_ok=True)
             arcpy.AddMessage(f"  Scratch:    {scratch_dir}")
+            if preserve_scratch:
+                arcpy.AddMessage(
+                    "  Resume:     Preserve Scratch is ON — completed "
+                    "per-scene stacks from previous runs will be reused"
+                )
 
             # Phase 1 — discover scenes (TIFF and HDF)
             arcpy.AddMessage("\n▶ Phase 1 — Scene discovery")
@@ -5223,7 +5306,14 @@ class AsterMosaic(object):
             return None
 
         finally:
-            _cleanup_scratch_folder(scratch_dir)
+            if locals().get("preserve_scratch") and scratch_dir:
+                arcpy.AddMessage(
+                    f"  Scratch preserved at: {scratch_dir}\n"
+                    "  Re-run with the same Output Mosaic Name to resume "
+                    "from completed scene stacks."
+                )
+            else:
+                _cleanup_scratch_folder(scratch_dir)
             if arcpy.CheckExtension("Spatial") == "Available":
                 arcpy.CheckInExtension("Spatial")
 
@@ -5248,19 +5338,46 @@ class AsterMosaic(object):
         stacked_paths = []
         scenes_used = []
         stack_phase_start = datetime.now()
-        log_every = max(1, n_scenes // 10)
         scene_times = []
-        arcpy.SetProgressor("step", f"ASTER per-scene [{label}]", 0, n_scenes, 1)
 
-        for idx, scene in enumerate(scenes, 1):
+        # Resume scan — reuse any per-scene stack that survives in scratch
+        # alongside its .complete marker. The stack suffix is mode-specific
+        # so the VNIR+SWIR and VNIR-only mosaics maintain independent
+        # markers and do not collide.
+        stack_suffix = "_stack_vnir.tif" if mode == _ASTER_MODE_VNIR else "_stack.tif"
+        resumed_count = 0
+        to_process = []
+        for scene in scenes:
+            sid = scene.get("scene_id", "")
+            expected = os.path.join(scratch_dir, f"{sid}{stack_suffix}")
+            if (sid and os.path.exists(expected)
+                    and os.path.exists(expected + ".complete")):
+                stacked_paths.append(expected)
+                scenes_used.append(scene)
+                resumed_count += 1
+            else:
+                to_process.append(scene)
+        if resumed_count:
+            arcpy.AddMessage(
+                f"  ✓ Resume: {resumed_count}/{n_scenes} stack(s) reused "
+                f"from previous run"
+            )
+
+        log_every = max(1, len(to_process) // 10) if to_process else 1
+        arcpy.SetProgressor(
+            "step", f"ASTER per-scene [{label}]",
+            0, max(1, len(to_process)), 1,
+        )
+
+        for idx, scene in enumerate(to_process, 1):
             if arcpy.env.isCancelled:
                 arcpy.ResetProgressor()
                 arcpy.AddWarning(
-                    f"  ✗ Cancelled after {idx-1}/{n_scenes} scenes."
+                    f"  ✗ Cancelled after {idx-1}/{len(to_process)} scenes."
                 )
                 return None
             arcpy.SetProgressorLabel(
-                f"[{idx}/{n_scenes}] [{scene.get('format','?')}] "
+                f"[{idx}/{len(to_process)}] [{scene.get('format','?')}] "
                 f"{scene['scene_id']}"
             )
             scene_start = datetime.now()
@@ -5275,12 +5392,12 @@ class AsterMosaic(object):
                 scenes_used.append(scene)
                 scene_times.append((datetime.now() - scene_start).total_seconds())
             arcpy.SetProgressorPosition(idx)
-            if idx % log_every == 0 or idx == n_scenes:
+            if idx % log_every == 0 or idx == len(to_process):
                 if scene_times:
                     avg = sum(scene_times) / len(scene_times)
-                    pct = 100.0 * idx / n_scenes
+                    pct = 100.0 * idx / len(to_process)
                     arcpy.AddMessage(
-                        f"  [{idx}/{n_scenes}] {pct:.0f}% — avg {avg:.1f}s/scene"
+                        f"  [{idx}/{len(to_process)}] {pct:.0f}% — avg {avg:.1f}s/scene"
                     )
 
         arcpy.ResetProgressor()
@@ -5630,6 +5747,17 @@ class AsterMosaic(object):
 
         stacked = os.path.join(scratch_dir, f"{scene_id}{stack_suffix}")
         arcpy.management.CompositeBands(masked_paths, stacked)
+
+        # Resume sentinel — written only after CompositeBands succeeds,
+        # so its presence guarantees the stack file is complete. A
+        # crash mid-CompositeBands leaves the stack without a marker,
+        # which the Phase 3 resume scan treats as partial and rebuilds.
+        try:
+            with open(stacked + ".complete", "w", encoding="utf-8") as fh:
+                fh.write(datetime.now().isoformat(timespec="seconds") + "\n")
+        except OSError:
+            pass
+
         return stacked
 
     # Subdataset name → band label mapping used by both the URI helper
