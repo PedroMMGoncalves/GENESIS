@@ -1707,20 +1707,44 @@ class IndicesComposites(object):
     # ----- helpers -----
 
     def _extract_bands(self, input_raster, sensor):
-        """Extract bands 1..N (N depends on sensor) into a {idx: Raster}
-        dict for use by INDICES / COMPOSITES lookups."""
-        n_expected = len(SENSOR_BAND_ROLES[sensor])
+        """Extract bands 1..N into a {idx: Raster} dict for INDICES /
+        COMPOSITES lookups.
+
+        N is the minimum of the input raster's actual ``bandCount`` and
+        the number of roles defined for ``sensor``. Truncating to the
+        input's band count handles partial-spec products (e.g. the
+        3-band VNIR-only ASTER mosaic from a post-Apr-2008 archive)
+        without producing a flood of "Band X extraction failed"
+        warnings — indices that reference missing bands raise KeyError
+        in get_band() and are skipped gracefully by the caller.
+        """
+        role_mapping = SENSOR_BAND_ROLES[sensor]
+        n_expected = len(role_mapping)
+        try:
+            n_available = int(arcpy.Raster(input_raster).bandCount)
+        except Exception:
+            n_available = n_expected  # fall back to sensor expectation
+        n_to_extract = min(n_available, n_expected)
+
+        arcpy.AddMessage(
+            f"Extracting {n_to_extract} band(s) for {sensor} "
+            f"(input has {n_available}, sensor defines {n_expected})..."
+        )
         bands = {}
-        arcpy.AddMessage(f"Extracting {n_expected} bands for {sensor}...")
-        for i in range(1, n_expected + 1):
+        for i in range(1, n_to_extract + 1):
             try:
                 bands[i] = Float(ExtractBand(input_raster, [i]))
             except Exception as e:
                 arcpy.AddWarning(f"  Band {i} extraction failed: {e}")
-        if len(bands) < n_expected:
-            arcpy.AddWarning(
-                f"Only {len(bands)} of {n_expected} bands extracted. "
-                f"Indices/composites referencing missing bands will be skipped."
+
+        if n_available < n_expected:
+            missing_roles = sorted(
+                r for r, idx in role_mapping.items() if idx > n_available
+            )
+            arcpy.AddMessage(
+                f"  Input has fewer bands than {sensor} defines — "
+                f"indices/composites requiring {missing_roles} will be "
+                f"skipped automatically."
             )
         return bands
 
