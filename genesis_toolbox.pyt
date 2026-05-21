@@ -428,6 +428,38 @@ _MNF_CORR_OFFDIAG_WARN = 0.1
 # the working matrix. Chunked PCA/MNF is out of scope.
 _RAM_WARNING_GB = 4.0
 
+# arcpy.ia.GeometricMedian convergence parameters. Used by all three
+# mosaic tools (Landsat, Sentinel-2, ASTER) when reducing the per-scene
+# temporal stack to a cloud-removed composite. ``epsilon`` bounds the
+# iteration-to-iteration change before convergence is declared;
+# ``max_iter`` caps the cost on noisy stacks where the iteration never
+# fully converges. Values match the Esri defaults for GeometricMedian.
+_GEOMETRIC_MEDIAN_EPSILON = 0.001
+_GEOMETRIC_MEDIAN_MAX_ITER = 20
+
+# ASTER Phase 4 multitemporal cloud refinement. After the per-scene QA
+# mask, scenes whose B01+B02 brightness exceeds (per-pixel percentile
+# × factor) get an extra cloud mask. Tuned for the Faial demonstrator
+# (persistent marine cumulus). Lowering the percentile or raising the
+# factor drops more scenes on hazy days; raising the percentile or
+# lowering the factor retains more observations at the cost of
+# residual cloud leakage in the median.
+_TEMPORAL_REFINEMENT_PERCENTILE = 75
+_TEMPORAL_REFINEMENT_FACTOR = 1.5
+
+# Pure-numpy FastICA defaults (Hyvärinen parallel, logcosh). Match the
+# previous sklearn defaults so the convergence behaviour is unchanged
+# from the version that used scikit-learn.
+_FAST_ICA_MAX_ITER = 1000
+_FAST_ICA_TOL = 1e-4
+
+# Symmetric-decorrelation eigenvalue floor in _sym_decorrelation.
+# Clamps near-zero eigenvalues of ``W W^T`` before
+# inverse-square-rooting so a rank-deficient ``W`` does not produce
+# inf / NaN. Tighter than _EIGVAL_FLOOR_ABS because ICA whitening
+# operates on a higher-dynamic-range data covariance.
+_SYM_DECORRELATION_FLOOR = 1e-12
+
 
 class TransformStatistics:
     """Base class for transformation statistics"""
@@ -2701,8 +2733,8 @@ class LandsatMosaic(object):
                 arcpy.SetProgressor("default", "Computing GeometricMedian...")
                 geomedian = arcpy.ia.GeometricMedian(
                     multiband_rasters,
-                    epsilon=0.001,
-                    max_iteration=20,
+                    epsilon=_GEOMETRIC_MEDIAN_EPSILON,
+                    max_iteration=_GEOMETRIC_MEDIAN_MAX_ITER,
                     extent_type="UnionOf",
                     cellsize_type="FirstOf",
                 )
@@ -4538,8 +4570,8 @@ class Sentinel2Mosaic(object):
                         tile_mosaic_path = os.path.join(gdb_path, tile_mosaic_name)
                         median = arcpy.ia.GeometricMedian(
                             stacked_paths,
-                            epsilon=0.001,
-                            max_iteration=20,
+                            epsilon=_GEOMETRIC_MEDIAN_EPSILON,
+                            max_iteration=_GEOMETRIC_MEDIAN_MAX_ITER,
                             extent_type="UnionOf",
                             cellsize_type="FirstOf",
                         )
@@ -5721,8 +5753,8 @@ class AsterMosaic(object):
             ) as ph:
                 median = arcpy.ia.GeometricMedian(
                     stacked_paths,
-                    epsilon=0.001,
-                    max_iteration=20,
+                    epsilon=_GEOMETRIC_MEDIAN_EPSILON,
+                    max_iteration=_GEOMETRIC_MEDIAN_MAX_ITER,
                     extent_type="UnionOf",
                     cellsize_type="FirstOf",
                 )
@@ -6180,13 +6212,16 @@ class AsterMosaic(object):
                     arcpy.AddMessage(f"      loaded {bi}/{n}")
 
             arcpy.AddMessage(
-                "    Pass 2/3 — computing per-pixel 75th-percentile brightness "
-                "threshold (× 1.5)..."
+                f"    Pass 2/3 — computing per-pixel "
+                f"{_TEMPORAL_REFINEMENT_PERCENTILE}th-percentile brightness "
+                f"threshold (× {_TEMPORAL_REFINEMENT_FACTOR})..."
             )
             stack = np.stack(brightness_arrays, axis=0)  # (n, h, w)
-            # Per-pixel 75th percentile, ignoring NaN.
-            percentile = np.nanpercentile(stack, 75, axis=0)
-            threshold = percentile * 1.5
+            # Per-pixel percentile, ignoring NaN.
+            percentile = np.nanpercentile(
+                stack, _TEMPORAL_REFINEMENT_PERCENTILE, axis=0,
+            )
+            threshold = percentile * _TEMPORAL_REFINEMENT_FACTOR
 
             arcpy.AddMessage(
                 f"    Pass 3/3 — re-emitting {n} scenes with anomaly mask applied..."
@@ -6371,11 +6406,12 @@ def _sym_decorrelation(W):
     rank-deficiency over many iterations) does not produce inf / NaN.
     """
     s, u = np.linalg.eigh(W @ W.T)
-    inv_sqrt_s = 1.0 / np.sqrt(np.maximum(s, 1e-12))
+    inv_sqrt_s = 1.0 / np.sqrt(np.maximum(s, _SYM_DECORRELATION_FLOOR))
     return (u * inv_sqrt_s) @ u.T @ W
 
 
-def _fast_ica_numpy(X, max_iter=1000, tol=1e-4, random_state=None):
+def _fast_ica_numpy(X, max_iter=_FAST_ICA_MAX_ITER, tol=_FAST_ICA_TOL,
+                    random_state=None):
     """FastICA (Hyvärinen, parallel) on already-whitened ``X``.
 
     Drop-in replacement for ``sklearn.decomposition.FastICA`` with
@@ -7307,8 +7343,8 @@ class Transformations(object):
             # downstream shapes match the original sklearn-based path.
             transformed_valid, W_full, ica_n_iter = _fast_ica_numpy(
                 whitened,
-                max_iter=1000,
-                tol=1e-4,
+                max_iter=_FAST_ICA_MAX_ITER,
+                tol=_FAST_ICA_TOL,
                 random_state=random_state,
             )
             transformed_valid = transformed_valid[:, :n_components]
