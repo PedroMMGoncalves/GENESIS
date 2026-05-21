@@ -69,6 +69,74 @@ TOOLBOX_VERSION = "1.0.0-phase3"
 
 
 # ---------------------------------------------------------------------------
+# Shared mosaic scaffolding
+# ---------------------------------------------------------------------------
+
+def _make_mosaic_scratch_dir(gdb_path, prefix, mosaic_name):
+    """Build (and create) the per-tool scratch folder beside the output GDB.
+
+    All three mosaic tools place their scratch alongside the output
+    geodatabase on the same disk — that avoids OneDrive sync churn on
+    intermediates and keeps Pro's file handles local. The folder name
+    is deterministic from the mosaic name so a re-run with the same
+    output name finds (and may reuse) any leftover scratch from the
+    previous run.
+
+    Args:
+        gdb_path: Path to the output File Geodatabase.
+        prefix: Per-tool name prefix, e.g. ``_genesis_s2_scratch``.
+        mosaic_name: User-supplied output mosaic name; sanitised before
+            use to drop arcpy-hostile characters.
+
+    Returns:
+        Absolute path to the (now-created) scratch directory.
+    """
+    scratch_dir = os.path.join(
+        os.path.dirname(os.path.normpath(gdb_path)),
+        f"{prefix}_{_sanitize_arcpy_name(mosaic_name)}",
+    )
+    os.makedirs(scratch_dir, exist_ok=True)
+    return scratch_dir
+
+
+def _apply_aoi_mask_and_save(unmasked_path, mask_feature, gdb_path,
+                              output_name, log_prefix=""):
+    """Apply an optional AOI mask to a saved median output.
+
+    Returns ``(final_path, unmasked_to_delete)``:
+
+      - If ``mask_feature`` is missing or does not exist, returns the
+        unmasked path unchanged and ``None`` for the deletion target.
+      - Otherwise, runs ``arcpy.sa.ExtractByMask``, saves the result
+        next to the unmasked output as ``{output_name}_Masked``, and
+        returns the masked path plus the unmasked path so the caller
+        can delete it during downstream cleanup.
+
+    The helper does NOT delete the unmasked output itself — the caller
+    typically batches deletions with other intermediates after
+    provenance has been written.
+    """
+    if not (mask_feature and arcpy.Exists(mask_feature)):
+        if mask_feature:
+            arcpy.AddWarning(
+                f"{log_prefix}  ✗ AOI mask {mask_feature!r} not found — "
+                f"output is unmasked."
+            )
+        return unmasked_path, None
+
+    mask_start = datetime.now()
+    masked = arcpy.sa.ExtractByMask(unmasked_path, mask_feature)
+    masked_path = os.path.join(gdb_path, f"{output_name}_Masked")
+    masked.save(masked_path)
+    arcpy.AddMessage(
+        f"{log_prefix}  ✓ AOI mask applied in "
+        f"{(datetime.now() - mask_start).total_seconds():.1f}s "
+        f"→ {os.path.basename(masked_path)}"
+    )
+    return masked_path, unmasked_path
+
+
+# ---------------------------------------------------------------------------
 # Output sanity check
 # ---------------------------------------------------------------------------
 
@@ -2381,17 +2449,9 @@ class LandsatMosaic(object):
                 ) and 'QA_PIXEL' in s['band_paths']
             )
 
-            # Scratch is pinned to the output GDB's parent folder. The
-            # folder name is deterministic from the per-zone mosaic name
-            # so a re-run with the same name reuses any per-scene
-            # composites left over from a previous run when Preserve
-            # Scratch is on.
-            scratch_root = os.path.dirname(os.path.normpath(gdb_path))
-            scratch_dir = os.path.join(
-                scratch_root,
-                f"_genesis_landsat_composites_{_sanitize_arcpy_name(mosaic_name)}",
+            scratch_dir = _make_mosaic_scratch_dir(
+                gdb_path, "_genesis_landsat_composites", mosaic_name,
             )
-            os.makedirs(scratch_dir, exist_ok=True)
 
             aoi_active = bool(arcpy.env.mask)
             arcpy.AddMessage(f"\n▶ Phase 3 — Per-scene composites ({total} scenes)")
@@ -2779,7 +2839,7 @@ class LandsatMosaic(object):
                         if arcpy.Exists(path):
                             arcpy.management.Delete(path)
                             cleaned_count += 1
-                    except Exception as e:
+                    except arcpy.ExecuteError as e:
                         arcpy.AddWarning(f"  Could not delete {os.path.basename(path)}: {e}")
             if cleaned_count:
                 arcpy.AddMessage(f"  ✓ Cleaned up {cleaned_count} intermediate(s)")
@@ -3819,7 +3879,7 @@ class LandsatMosaic(object):
                         now_iso,
                     ])
             arcpy.AddMessage(f"Provenance CSV: {csv_path}")
-        except Exception as e:
+        except OSError as e:
             arcpy.AddWarning(f"Failed to write provenance CSV: {e}")
 
 
@@ -4173,16 +4233,9 @@ class Sentinel2Mosaic(object):
                     f"  AOI:        {mask_feature!r} NOT FOUND — running over full tile footprint"
                 )
 
-            # Scratch is pinned to the output GDB's parent folder
-            # (same-disk-as-output, avoids OneDrive sync overhead).
-            # The folder name is deterministic from the mosaic name so a
-            # re-run with the same output name reuses any per-scene stacks
-            # left over from a previous run when Preserve Scratch is on.
-            scratch_dir = os.path.join(
-                os.path.dirname(os.path.normpath(gdb_path)),
-                f"_genesis_s2_scratch_{_sanitize_arcpy_name(mosaic_name)}",
+            scratch_dir = _make_mosaic_scratch_dir(
+                gdb_path, "_genesis_s2_scratch", mosaic_name,
             )
-            os.makedirs(scratch_dir, exist_ok=True)
             arcpy.AddMessage(f"  Scratch:    {scratch_dir}")
             if preserve_scratch:
                 arcpy.AddMessage(
@@ -4446,22 +4499,11 @@ class Sentinel2Mosaic(object):
                 arcpy.AddMessage(f"  ✓ Single tile → {os.path.basename(final_mosaic)}")
 
             # Apply AOI mask if requested.
-            if mask_feature and arcpy.Exists(mask_feature):
-                mask_start = datetime.now()
-                masked = arcpy.sa.ExtractByMask(final_mosaic, mask_feature)
-                masked_path = os.path.join(gdb_path, f"{mosaic_name}_Masked")
-                masked.save(masked_path)
-                intermediates_to_delete.append(final_mosaic)
-                final_mosaic = masked_path
-                arcpy.AddMessage(
-                    f"  ✓ AOI mask applied in "
-                    f"{(datetime.now() - mask_start).total_seconds():.1f}s "
-                    f"→ {os.path.basename(masked_path)}"
-                )
-            elif mask_feature:
-                arcpy.AddWarning(
-                    f"  ✗ AOI mask {mask_feature!r} not found — output is unmasked."
-                )
+            final_mosaic, unmasked_to_delete = _apply_aoi_mask_and_save(
+                final_mosaic, mask_feature, gdb_path, mosaic_name,
+            )
+            if unmasked_to_delete:
+                intermediates_to_delete.append(unmasked_to_delete)
 
             # Delete superseded intermediates so only the final mosaic
             # remains in the output GDB.
@@ -4472,7 +4514,7 @@ class Sentinel2Mosaic(object):
                         if arcpy.Exists(path):
                             arcpy.management.Delete(path)
                             cleaned_count += 1
-                    except Exception as e:
+                    except arcpy.ExecuteError as e:
                         arcpy.AddWarning(
                             f"  Could not delete {os.path.basename(path)}: {e}"
                         )
@@ -4933,7 +4975,7 @@ class Sentinel2Mosaic(object):
                         now_iso,
                     ])
             arcpy.AddMessage(f"Provenance CSV: {csv_path}")
-        except Exception as e:
+        except OSError as e:
             arcpy.AddWarning(f"Failed to write provenance CSV: {e}")
 
     # ------------------------------------------------------------------
@@ -5321,17 +5363,9 @@ class AsterMosaic(object):
                     f"  AOI:        {mask_feature!r} NOT FOUND — running over full scene footprint"
                 )
 
-            # Scratch is pinned to the output GDB's parent folder
-            # (same-disk-as-output, avoids OneDrive sync overhead). The
-            # folder name is deterministic from the mosaic name so a
-            # re-run with the same output name reuses any per-scene
-            # stacks left over from a previous run when Preserve Scratch
-            # is on.
-            scratch_dir = os.path.join(
-                os.path.dirname(os.path.normpath(gdb_path)),
-                f"_genesis_aster_scratch_{_sanitize_arcpy_name(mosaic_name)}",
+            scratch_dir = _make_mosaic_scratch_dir(
+                gdb_path, "_genesis_aster_scratch", mosaic_name,
             )
-            os.makedirs(scratch_dir, exist_ok=True)
             arcpy.AddMessage(f"  Scratch:    {scratch_dir}")
             if preserve_scratch:
                 arcpy.AddMessage(
@@ -5612,24 +5646,9 @@ class AsterMosaic(object):
 
         # Phase 6 — AOI mask + provenance
         arcpy.AddMessage(f"\n▶ Phase 6 [{label}] — Mask / cleanup / provenance")
-        final_path = output_path
-        unmasked_to_delete = None
-        if mask_feature and arcpy.Exists(mask_feature):
-            mask_start = datetime.now()
-            masked = arcpy.sa.ExtractByMask(output_path, mask_feature)
-            masked_path = os.path.join(gdb_path, f"{output_name}_Masked")
-            masked.save(masked_path)
-            unmasked_to_delete = output_path
-            final_path = masked_path
-            arcpy.AddMessage(
-                f"  ✓ AOI mask applied in "
-                f"{(datetime.now() - mask_start).total_seconds():.1f}s "
-                f"→ {os.path.basename(masked_path)}"
-            )
-        elif mask_feature:
-            arcpy.AddWarning(
-                f"  ✗ AOI mask {mask_feature!r} not found — output is unmasked."
-            )
+        final_path, unmasked_to_delete = _apply_aoi_mask_and_save(
+            output_path, mask_feature, gdb_path, output_name,
+        )
 
         if unmasked_to_delete and unmasked_to_delete != final_path:
             try:
@@ -5638,7 +5657,7 @@ class AsterMosaic(object):
                     arcpy.AddMessage(
                         f"  ✓ Removed intermediate: {os.path.basename(unmasked_to_delete)}"
                     )
-            except Exception as e:
+            except arcpy.ExecuteError as e:
                 arcpy.AddWarning(
                     f"  Could not delete intermediate {unmasked_to_delete}: {e}"
                 )
@@ -6154,7 +6173,7 @@ class AsterMosaic(object):
                         now_iso,
                     ])
             arcpy.AddMessage(f"Provenance CSV: {csv_path}")
-        except Exception as e:
+        except OSError as e:
             arcpy.AddWarning(f"Failed to write provenance CSV: {e}")
 
     # ------------------------------------------------------------------
@@ -6497,7 +6516,7 @@ class Transformations(object):
                 if not os.path.exists(default_folder):
                     try:
                         os.makedirs(default_folder)
-                    except:
+                    except OSError:
                         pass
                 
                 if os.path.exists(default_folder):
@@ -7334,7 +7353,7 @@ class Transformations(object):
             for temp_path in temp_component_paths:
                 try:
                     arcpy.management.Delete(temp_path)
-                except:
+                except arcpy.ExecuteError:
                     pass
             
             return output_path
@@ -8167,7 +8186,7 @@ class SpectralAngleMapper(object):
             # Clean up
             try:
                 arcpy.management.Delete(temp_table)
-            except:
+            except arcpy.ExecuteError:
                 pass
             
             # Return output path
@@ -8223,7 +8242,7 @@ class SpectralAngleMapper(object):
             # Clean up
             try:
                 arcpy.management.Delete(temp_points)
-            except:
+            except arcpy.ExecuteError:
                 pass
             
             # Return output path
