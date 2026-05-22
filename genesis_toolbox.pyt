@@ -7765,6 +7765,7 @@ class Transformations(object):
                             self._generate_html_report(
                                 stats_file_html, transform_type, transform_stats,
                                 data_info, sensor_key=sensor_key,
+                                transformed_data=transformed_data,
                             )
                         except Exception as e:
                             arcpy.AddWarning(
@@ -8310,7 +8311,7 @@ class Transformations(object):
         return f"data:image/png;base64,{b64}"
 
     def _generate_html_report(self, html_file, transform_type, stats_obj,
-                               data_info, sensor_key=None):
+                               data_info, sensor_key=None, transformed_data=None):
         """Write a self-contained HTML dashboard summarising a fitted
         PCA / MNF / ICA result.
 
@@ -8321,7 +8322,10 @@ class Transformations(object):
         When ``sensor_key`` is supplied, loadings heatmap rows are
         labelled with the satellite band names from ``_BAND_LAYOUT``
         (``B04 (Red)`` rather than ``Band 4``) — the same UX win the
-        ``_bands.csv`` sidecar gives outside this report.
+        ``_bands.csv`` sidecar gives outside this report. When
+        ``transformed_data`` is supplied (the (h, w, n_components)
+        array produced by the transform), the report also embeds
+        per-component value histograms.
         """
         plt = self._get_pyplot()
         if plt is None:
@@ -8338,6 +8342,8 @@ class Transformations(object):
 
         # ---- Build the per-transform plots ----
         plot_blocks = []  # list of (title, data_uri, optional caption)
+        cut_text = None   # one-line "where to cut" summary, surfaced
+                          # into the run-metadata block
 
         if transform_type == "PCA":
             ev = np.asarray(stats_obj.eigenvalues, dtype=float)
@@ -8346,7 +8352,23 @@ class Transformations(object):
             var_pct = 100.0 * ev / total
             cumvar = np.cumsum(var_pct)
 
-            # Scree plot
+            # Where to cut: number of components needed to cross
+            # 90 / 95 / 99 % of total variance. Reports a concise
+            # recommendation in the run-metadata block and drops a
+            # dashed line on the scree plot.
+            cuts = {}
+            for thr in (90.0, 95.0, 99.0):
+                idxs = np.where(cumvar >= thr)[0]
+                cuts[thr] = (int(idxs[0]) + 1) if idxs.size else len(ev)
+            cut95 = cuts[95.0]
+            cut_text = (
+                f"{cuts[90]} component(s) capture 90% of variance, "
+                f"{cuts[95]} reach 95%, {cuts[99]} reach 99% "
+                f"(Jolliffe rule of thumb: keep enough components for "
+                f"~95% of the variance)."
+            )
+
+            # Scree plot + the 95% recommended-cut line
             n_show = min(20, len(ev))
             fig, ax1 = plt.subplots(figsize=(10, 5))
             ax1.bar(range(1, n_show + 1), var_pct[:n_show],
@@ -8359,13 +8381,30 @@ class Transformations(object):
             ax2.set_ylabel("Cumulative (%)", color="#e74c3c")
             ax2.set_ylim(0, 105)
             ax2.tick_params(axis="y", labelcolor="#e74c3c")
+            if cut95 <= n_show:
+                ax1.axvline(cut95 + 0.5, color="#27ae60", linestyle="--",
+                            linewidth=1.5, alpha=0.7)
+                ax2.annotate(
+                    f"95% at PC{cut95}", xy=(cut95 + 0.5, 95),
+                    xytext=(min(cut95 + 1.5, n_show), 80),
+                    fontsize=9, color="#27ae60",
+                    arrowprops=dict(arrowstyle="->", color="#27ae60", lw=1),
+                )
             fig.suptitle(f"PCA Scree Plot — top {n_show} components")
             fig.tight_layout()
             plot_blocks.append((
                 "Scree plot",
                 self._plot_to_base64_png(plt, fig),
-                f"Variance per component + cumulative ({cumvar[n_show-1]:.1f}% at PC{n_show}).",
+                f"Variance per component + cumulative ({cumvar[n_show-1]:.1f}% at PC{n_show}). "
+                f"Dashed green line marks the 95% cut.",
             ))
+
+            # Cumulative-variance curve with 90/95/99 % cuts. Sits
+            # alongside the scree plot because users routinely pick
+            # the component count from this view.
+            plot_blocks.append(
+                self._cumulative_variance_block(plt, ev, cuts)
+            )
 
             # Loadings heatmap
             plot_blocks.append(
@@ -8379,12 +8418,23 @@ class Transformations(object):
             evec = np.asarray(stats_obj.eigenvectors, dtype=float)
             snr = ev - 1.0
             n_show = min(20, len(ev))
+            n_signal = int(np.sum(snr >= 1.0))
+            cut_text = (
+                f"{n_signal} of {len(snr)} components have SNR ≥ 1 "
+                f"(carry more signal than noise). Components with "
+                f"SNR < 1 are predominantly noise and can usually be "
+                f"discarded for downstream analysis."
+            )
 
-            # SNR (signal-to-noise) plot — eigenvalue minus 1 in whitened space.
+            # SNR (signal-to-noise) plot with the SNR = 1 cut line
             fig, ax = plt.subplots(figsize=(10, 5))
             colors = ["#27ae60" if s >= 1.0 else "#bdc3c7" for s in snr[:n_show]]
             ax.bar(range(1, n_show + 1), snr[:n_show], color=colors)
-            ax.axhline(1.0, color="red", linestyle="--", linewidth=1, label="SNR = 1")
+            ax.axhline(1.0, color="red", linestyle="--", linewidth=1, label="SNR = 1 (signal floor)")
+            if n_signal and n_signal <= n_show:
+                ax.axvline(n_signal + 0.5, color="#27ae60", linestyle="--",
+                           linewidth=1.5, alpha=0.7,
+                           label=f"Last signal component (MNF{n_signal})")
             ax.set_xlabel("MNF component"); ax.set_ylabel("SNR (eigenvalue − 1)")
             ax.set_title(f"MNF SNR — top {n_show} components")
             ax.legend(loc="upper right")
@@ -8392,7 +8442,8 @@ class Transformations(object):
             plot_blocks.append((
                 "Signal-to-noise plot",
                 self._plot_to_base64_png(plt, fig),
-                "Components above the red line (SNR ≥ 1) carry more signal than noise.",
+                "Components above the red line (SNR ≥ 1) carry more signal than noise — "
+                f"{n_signal} component(s) qualify here.",
             ))
 
             plot_blocks.append(
@@ -8406,21 +8457,33 @@ class Transformations(object):
                     if stats_obj.kurtosis_values is not None else np.array([]))
             mixing = np.asarray(stats_obj.mixing_matrix, dtype=float)
             n_show = mixing.shape[1] if mixing.size else 0
+            n_iter = getattr(stats_obj, "n_iterations", None)
+            n_indep = int(np.sum(np.abs(kurt) > 1.0)) if kurt.size else 0
+            cut_text = (
+                f"{n_indep} of {len(kurt) if kurt.size else 0} components have "
+                f"|kurtosis| > 1 — reliably non-Gaussian, the ICA target. "
+                f"Convergence: {n_iter} iteration(s)."
+                if kurt.size else "No kurtosis data available."
+            )
 
             if kurt.size:
                 fig, ax = plt.subplots(figsize=(10, 5))
                 colors = ["#27ae60" if abs(k) > 1.0 else "#bdc3c7" for k in kurt]
                 ax.bar(range(1, len(kurt) + 1), kurt, color=colors)
                 ax.axhline(0, color="black", linewidth=0.5)
+                ax.axhline(1.0, color="red", linestyle="--", linewidth=1,
+                           label="|kurtosis| = 1 (non-Gaussian threshold)")
+                ax.axhline(-1.0, color="red", linestyle="--", linewidth=1)
                 ax.set_xlabel("ICA component")
                 ax.set_ylabel("Kurtosis (Gaussian → 0)")
                 ax.set_title("ICA kurtosis — non-Gaussianity per component")
+                ax.legend(loc="upper right")
                 fig.tight_layout()
                 plot_blocks.append((
                     "Kurtosis",
                     self._plot_to_base64_png(plt, fig),
-                    "Components with |kurtosis| > 1 (green) are reliably non-Gaussian — "
-                    "the ICA target.",
+                    f"Components with |kurtosis| > 1 (green) are reliably non-Gaussian — "
+                    f"the ICA target. {n_indep} of {len(kurt)} qualify here.",
                 ))
 
             if mixing.size:
@@ -8430,6 +8493,36 @@ class Transformations(object):
                         input_band_labels, n_components=n_show,
                     )
                 )
+
+        # ---- Cross-transform diagnostics ----
+
+        # Input-band correlation matrix (heatmap). Derived from the
+        # covariance matrix stored on the stats object when available
+        # (PCA / MNF), otherwise skipped. Surfaces strong inter-band
+        # correlations which explain why one PC tends to dominate.
+        cov = getattr(stats_obj, "covariance_matrix", None)
+        if cov is None:
+            cov = getattr(stats_obj, "signal_covariance", None)
+        if cov is not None:
+            try:
+                plot_blocks.insert(0, self._input_correlation_block(
+                    plt, np.asarray(cov, dtype=float), input_band_labels,
+                ))
+            except Exception as _e:
+                arcpy.AddWarning(f"Correlation heatmap skipped: {_e}")
+
+        # Per-component value histograms (small-multiples grid). Pulls
+        # the values straight from ``transformed_data`` so the
+        # distribution shape comes from real pixels, not from a
+        # gaussian approximation. Skipped when transformed_data is
+        # not passed in.
+        if transformed_data is not None:
+            try:
+                plot_blocks.append(self._component_histograms_block(
+                    plt, transformed_data, transform_type,
+                ))
+            except Exception as _e:
+                arcpy.AddWarning(f"Histograms grid skipped: {_e}")
 
         # ---- Compose the HTML ----
         run_ts = datetime.now().isoformat(timespec="seconds")
@@ -8443,6 +8536,56 @@ class Transformations(object):
         inputs_html = "".join(
             f"<li><code>{p}</code></li>" for p in data_info.get("input_rasters", [])
         ) or "<li>(none recorded)</li>"
+
+        # Extra run-metadata derived from transformed_data + the stats
+        # object. Stays defensive — anything that can't be computed
+        # falls back to the dash placeholder used by the earlier
+        # version of the report.
+        if transformed_data is not None:
+            try:
+                td = np.asarray(transformed_data)
+                h, w = td.shape[:2]
+                n_total = int(h * w)
+                # A valid pixel is one that has no NaN across components
+                # — matches the (valid_mask / is_not_nan) gate that the
+                # transforms apply on the input.
+                if td.ndim == 3:
+                    valid_mask_2d = ~np.isnan(td).any(axis=2)
+                else:
+                    valid_mask_2d = ~np.isnan(td)
+                n_valid = int(valid_mask_2d.sum())
+                shape_card = f"{h} × {w}"
+                pct_valid = (100.0 * n_valid / n_total) if n_total else 0.0
+                valid_card = f"{n_valid:,} ({pct_valid:.1f}%)"
+            except Exception:
+                shape_card = "—"
+                valid_card = "—"
+        else:
+            shape_card = "—"
+            valid_card = "—"
+
+        # Transform-specific extra metadata (ICA convergence, etc.).
+        extra_meta_rows = []
+        if transform_type == "ICA":
+            n_iter = getattr(stats_obj, "n_iterations", None)
+            rs = getattr(stats_obj, "random_state", None)
+            if n_iter is not None:
+                extra_meta_rows.append(("ICA convergence", f"{n_iter} iteration(s)"))
+            if rs is not None:
+                extra_meta_rows.append(("ICA random seed", f"{rs}"))
+
+        extra_meta_html = "".join(
+            f"<tr><th>{k}</th><td>{v}</td></tr>" for k, v in extra_meta_rows
+        )
+
+        # "Where to cut" recommendation card. Each transform branch
+        # populated ``cut_text`` above with a one-line summary derived
+        # from its own diagnostics (PCA: 95% variance, MNF: SNR ≥ 1,
+        # ICA: |kurtosis| > 1).
+        recommendation_html = (
+            f'<div class="recommend"><b>Recommended cut:</b> {cut_text}</div>'
+            if cut_text else ""
+        )
 
         html_chunks = []
         html_chunks.append(f"""<!DOCTYPE html>
@@ -8470,6 +8613,9 @@ class Transformations(object):
   td {{ padding: 8px 10px; border-bottom: 1px solid #eee; }}
   tr:hover td {{ background: #f0f7ff; }}
   .meta {{ font-size: 0.9em; color: #5d6d7e; }}
+  .recommend {{ background: #e8f5e9; border-left: 4px solid #27ae60;
+                padding: 12px 16px; border-radius: 4px; margin: 18px 0;
+                font-size: 0.95em; }}
   code {{ font-family: Consolas, monospace; font-size: 0.9em; color: #2c3e50; }}
 </style></head><body><div class="container">
 <h1>{transform_type} report</h1>
@@ -8486,10 +8632,22 @@ class Transformations(object):
     <div class="stat-label">Components fitted</div></div>
   <div class="stat-card"><div class="stat-value">{sensor_key or "?"}</div>
     <div class="stat-label">Sensor</div></div>
+  <div class="stat-card"><div class="stat-value">{shape_card}</div>
+    <div class="stat-label">Raster shape (h × w)</div></div>
+  <div class="stat-card"><div class="stat-value">{valid_card}</div>
+    <div class="stat-label">Valid pixels (in mask)</div></div>
 </div>
+{recommendation_html}
 <h2>Input rasters</h2>
 <ul>{inputs_html}</ul>
 """)
+
+        if extra_meta_rows:
+            html_chunks.append(
+                "<h2>Run details</h2><table>"
+                "<tr><th>Property</th><th>Value</th></tr>"
+                + extra_meta_html + "</table>"
+            )
 
         # Top-N component table (eigenvalue / variance / cumulative)
         if hasattr(stats_obj, "eigenvalues") and stats_obj.eigenvalues is not None:
@@ -8527,6 +8685,156 @@ class Transformations(object):
             arcpy.AddMessage(f"HTML report: {html_file}")
         except OSError as e:
             arcpy.AddWarning(f"Could not write HTML report ({e})")
+
+    def _cumulative_variance_block(self, plt, eigenvalues, cuts):
+        """Render the cumulative variance curve as a PNG with vertical
+        marker lines at the 90 / 95 / 99 % cuts. ``cuts`` is the dict
+        produced upstream — ``{threshold_pct: component_count}``. The
+        caption summarises the cuts in plain text.
+        """
+        ev = np.asarray(eigenvalues, dtype=float)
+        total = ev.sum() if ev.sum() else 1.0
+        var_pct = 100.0 * ev / total
+        cumvar = np.cumsum(var_pct)
+        n_show = min(20, len(ev))
+        x = np.arange(1, n_show + 1)
+
+        fig, ax = plt.subplots(figsize=(10, 4.5))
+        ax.plot(x, cumvar[:n_show], color="#e74c3c", marker="o",
+                linewidth=2, label="Cumulative variance (%)")
+        ax.fill_between(x, 0, cumvar[:n_show], color="#e74c3c", alpha=0.08)
+
+        cut_colors = {90.0: "#f39c12", 95.0: "#27ae60", 99.0: "#2980b9"}
+        for thr, n_comp in cuts.items():
+            if n_comp <= n_show:
+                color = cut_colors.get(thr, "#7f8c8d")
+                ax.axhline(thr, color=color, linestyle=":", linewidth=1, alpha=0.7)
+                ax.axvline(n_comp, color=color, linestyle=":", linewidth=1, alpha=0.7)
+                ax.scatter([n_comp], [thr], color=color, s=70, zorder=5)
+                ax.annotate(
+                    f"{int(thr)}% at PC{n_comp}",
+                    xy=(n_comp, thr),
+                    xytext=(n_comp + 0.4, thr - 6),
+                    fontsize=9, color=color,
+                )
+
+        ax.set_xlabel("Number of components retained")
+        ax.set_ylabel("Cumulative variance (%)")
+        ax.set_ylim(0, 105)
+        ax.set_xlim(0.5, n_show + 0.5)
+        ax.set_title("Cumulative variance — where to cut")
+        ax.grid(True, linestyle="--", alpha=0.3)
+        fig.tight_layout()
+
+        return (
+            "Cumulative variance",
+            self._plot_to_base64_png(plt, fig),
+            f"Component counts to capture 90 / 95 / 99% of the input "
+            f"variance: PC{cuts[90.0]} / PC{cuts[95.0]} / PC{cuts[99.0]} "
+            f"(Jolliffe rule of thumb: retain enough components for ~95%).",
+        )
+
+    def _input_correlation_block(self, plt, cov_matrix, input_band_labels):
+        """Render the input-band Pearson correlation matrix as a
+        diverging heatmap. Derived from the covariance matrix stored
+        on the stats object: ``corr[i,j] = cov[i,j] / sqrt(cov[i,i] *
+        cov[j,j])``. Strong off-diagonal correlations (which the
+        Landsat / Sentinel-2 visible+NIR bands always have) explain
+        why a single principal component tends to dominate the
+        variance budget.
+        """
+        cov = np.asarray(cov_matrix, dtype=float)
+        if cov.ndim != 2 or cov.shape[0] != cov.shape[1] or cov.shape[0] < 2:
+            return ("Input band correlation", "", "(insufficient data)")
+
+        n = cov.shape[0]
+        std = np.sqrt(np.diag(cov))
+        # Guard zero-variance bands so we don't divide by zero.
+        denom = np.outer(std, std)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            corr = np.where(denom > 0, cov / denom, 0.0)
+        corr = np.clip(corr, -1.0, 1.0)
+
+        labels = (input_band_labels[:n] if input_band_labels
+                  else [f"Band {i+1}" for i in range(n)])
+        side = max(4.5, 0.45 * n + 2.0)
+        fig, ax = plt.subplots(figsize=(side, side))
+        im = ax.imshow(corr, cmap="RdBu_r", vmin=-1.0, vmax=1.0)
+        ax.set_xticks(range(n)); ax.set_yticks(range(n))
+        ax.set_xticklabels(labels, rotation=45, ha="right")
+        ax.set_yticklabels(labels)
+        # Annotate cells with their value so the magnitude is readable
+        # without sampling the colorbar by eye.
+        for i in range(n):
+            for j in range(n):
+                ax.text(
+                    j, i, f"{corr[i, j]:.2f}",
+                    ha="center", va="center",
+                    color="white" if abs(corr[i, j]) > 0.5 else "#2c3e50",
+                    fontsize=max(6, min(10, 80 // n)),
+                )
+        ax.set_title("Input band correlation matrix (Pearson)")
+        fig.colorbar(im, ax=ax, shrink=0.85, label="correlation")
+        fig.tight_layout()
+
+        # Strongest off-diagonal magnitude — surfaces the "all bands
+        # are basically the same" pattern that explains a dominant PC1.
+        off = corr.copy()
+        np.fill_diagonal(off, 0.0)
+        peak = float(np.abs(off).max()) if off.size else 0.0
+
+        return (
+            "Input band correlation",
+            self._plot_to_base64_png(plt, fig),
+            f"Pearson correlation between input bands. Strongest "
+            f"off-diagonal magnitude = {peak:.2f}. Values near ±1 "
+            f"indicate redundancy across bands, which is what drives "
+            f"the eigendecomposition to concentrate variance into a "
+            f"single dominant component.",
+        )
+
+    def _component_histograms_block(self, plt, transformed_data, transform_type):
+        """Render a small-multiples grid of per-component value
+        histograms. Skips NaN (the outside-mask pixels). One panel
+        per component, up to 12 (a 3x4 grid).
+        """
+        td = np.asarray(transformed_data, dtype=float)
+        if td.ndim != 3:
+            return ("Per-component histograms", "", "(unexpected data shape)")
+        n_comp = td.shape[2]
+        n_show = min(12, n_comp)
+        ncols = 4
+        nrows = (n_show + ncols - 1) // ncols
+        fig, axes = plt.subplots(nrows, ncols, figsize=(12, 2.6 * nrows + 0.3))
+        axes = np.atleast_1d(axes).ravel()
+        for i in range(n_show):
+            ax = axes[i]
+            col = td[:, :, i].ravel()
+            col = col[~np.isnan(col)]
+            if col.size == 0:
+                ax.set_visible(False)
+                continue
+            ax.hist(col, bins=60, color="#3498db", alpha=0.8)
+            ax.set_title(f"{transform_type}{i+1}", fontsize=10)
+            ax.tick_params(labelsize=8)
+            ax.set_yticks([])
+        # Hide unused axes in the bottom row when n_show is not a
+        # multiple of ncols.
+        for j in range(n_show, len(axes)):
+            axes[j].set_visible(False)
+        fig.suptitle("Per-component value distribution (valid pixels only)",
+                     fontsize=12, y=1.0)
+        fig.tight_layout()
+
+        return (
+            "Per-component histograms",
+            self._plot_to_base64_png(plt, fig),
+            "Distribution of pixel values for each component over the "
+            "valid-data footprint. Sharp peaks at zero usually mean "
+            "the component is dominated by ground; long tails point to "
+            "rare features (anomalies, outliers — the candidates for "
+            "downstream analysis).",
+        )
 
     def _loadings_heatmap_block(self, plt, title, matrix, input_band_labels,
                                  n_components=20):
