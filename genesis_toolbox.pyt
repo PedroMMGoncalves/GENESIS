@@ -7946,8 +7946,16 @@ class Transformations(object):
             mnf_stats.signal_covariance = whitened_cov
             mnf_stats.component_correlation = component_correlation
 
-            # Reconstruct full data array
-            transformed_data = np.zeros((flat_data.shape[0], n_components))
+            # Reconstruct full data array. Initialise with NaN so the
+            # outside-mask pixels (where the input had NoData) carry
+            # forward as NoData through the save path
+            # (``NumPyArrayToRaster(value_to_nodata=np.nan)``); the
+            # earlier ``np.zeros`` initialisation produced a hard
+            # zero sentinel that survived the save and rendered as
+            # "0.0000" in the corners of the result extent.
+            transformed_data = np.full(
+                (flat_data.shape[0], n_components), np.nan, dtype=float,
+            )
             transformed_data[valid_mask] = transformed_valid
             transformed_data = transformed_data.reshape(shape[0], shape[1], n_components)
 
@@ -8007,11 +8015,17 @@ class Transformations(object):
             
             # Transform valid data
             transformed_valid = centered_data @ eigenvecs
-            
-            # Reconstruct full data array
-            transformed_data = np.zeros((flat_data.shape[0], n_components))
+
+            # Reconstruct full data array. NaN-initialised so
+            # ``NumPyArrayToRaster(value_to_nodata=np.nan)`` later
+            # turns the out-of-mask pixels into proper NoData on
+            # save (rather than the hard-zero sentinel a
+            # ``np.zeros`` init would leave behind).
+            transformed_data = np.full(
+                (flat_data.shape[0], n_components), np.nan, dtype=float,
+            )
             transformed_data[is_not_nan] = transformed_valid
-            
+
             # Store PCA statistics
             pca_stats.band_means = data_mean
             pca_stats.eigenvalues = eigenvals
@@ -8119,7 +8133,11 @@ class Transformations(object):
             ica_stats.n_iterations = ica_n_iter
             ica_stats.random_state = random_state
 
-            transformed_data = np.zeros((flat_data.shape[0], n_components))
+            # NaN-init for proper NoData propagation on save — see
+            # the matching comment in ``_perform_pca`` / ``_perform_mnf``.
+            transformed_data = np.full(
+                (flat_data.shape[0], n_components), np.nan, dtype=float,
+            )
             transformed_data[is_not_nan] = transformed_valid
 
             log(f"ICA completed in {ica_n_iter} iterations")
