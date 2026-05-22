@@ -729,9 +729,14 @@ _ASTER_CLOUD_B04_MIN = 0.25
 # tropical scenes — over-masks mid-latitude Atlantic land, where
 # daytime surface temperatures legitimately sit in the 275-296 K range
 # (cool forest canopy, north-facing slopes, early-morning passes).
-# 270 K is well below the typical Faial land floor and still captures
-# clear cumulus tops over the Azores (which sit at 250-275 K).
-_ASTER_CLOUD_BT_MAX_K = 270.0
+# The earlier 270 K floor proved too cold to catch warm maritime
+# stratus that sits on the Faial caldera at ~275-285 K and was leaking
+# through the (B02 AND B04) bright-cloud conjunction; bumped to 280 K
+# after the May 2026 visual inspection of AsterV3_VnirSwir_Masked.
+# Still well below typical daytime Faial land (vegetated slopes report
+# 285-296 K) and captures both clear cumulus tops (250-275 K) and warm
+# low-altitude marine cloud (275-280 K).
+_ASTER_CLOUD_BT_MAX_K = 280.0
 
 # AST_08 V004 stores Surface Kinetic Temperature as Int16 with a scale
 # factor of 0.1 (DN × 0.1 = Kelvin). The earlier comment in this
@@ -760,6 +765,20 @@ _ASTER_TIR_VALID_K_FLOOR = 200.0
 _NDVI_PERSISTENCE_THRESHOLD = 0.5
 _NDWI_WATER_THRESHOLD = 0.0
 _GDV_DRY_FLOOR = 0.3
+
+# Tool 07 stack discovery — auto-detect across the three per-scene
+# scratch conventions emitted by tools 01/02/03. Each mosaic writes a
+# different filename suffix (S2 → ``*_stack.tif``, Landsat →
+# ``*_composite.tif``, ASTER → ``*_stack.tif`` or ``*_stack_vnir.tif``)
+# and the user shouldn't have to know which one applies to the scratch
+# they just pointed at. When the GP parameter is left at the auto
+# label, the tool globs all three patterns and unions the results.
+_TOOL07_AUTO_LABEL = "(auto-detect)"
+_TOOL07_AUTO_PATTERNS = (
+    "*_stack.tif",
+    "*_stack_vnir.tif",
+    "*_composite.tif",
+)
 
 # Pure-numpy FastICA defaults (Hyvärinen parallel, logcosh). Match the
 # previous sklearn defaults so the convergence behaviour is unchanged
@@ -5681,10 +5700,11 @@ class AsterMosaic(object):
     folder pointed to by the optional "ASTER Thermal Data Folder"
     parameter (the natural LP DAAC by-product download layout). When
     present, the thermal channel is folded into the per-scene cloud test
-    — pixels colder than ~270 K (well below typical mid-latitude land
-    BT but above cumulus tops) are flagged as cloud regardless of
-    VIS/SWIR brightness, which catches thin cirrus and reduces false
-    positives over warm bare ground.
+    — pixels colder than ~280 K (below typical mid-latitude land BT but
+    above warm maritime stratus on Atlantic island summits) are flagged
+    as cloud regardless of VIS/SWIR brightness, which catches thin
+    cirrus and warm low cloud and reduces false positives over warm
+    bare ground.
 
     Per-scene processing:
       1. Load 3 VNIR bands at native 15m + 6 SWIR bands resampled to 15m
@@ -5693,10 +5713,11 @@ class AsterMosaic(object):
       3. Apply QA cloud mask from the QA Data Plane layers (best-effort
          bit decoding — exact layout per ASTER User Handbook V004).
       4. Build a multi-spectral cloud mask
-         ``(B02 > 0.45 AND B04 > 0.25) OR (BT < 270 K)`` — Hulley & Hook
+         ``(B02 > 0.45 AND B04 > 0.25) OR (BT < 280 K)`` — Hulley & Hook
          (2008)-style ACCA-on-ASTER with a mid-latitude-adjusted thermal
-         threshold. The thermal term is dropped when no AST_08 is paired;
-         the SWIR term is dropped for VNIR-only scenes.
+         threshold tuned for warm maritime stratus. The thermal term is
+         dropped when no AST_08 is paired; the SWIR term is dropped for
+         VNIR-only scenes.
       5. Stack into a 9-band float32 raster (3-band for VNIR-only mode).
 
     Mosaicking: Esri arcpy.ia.GeometricMedian across the cloud-masked
@@ -5865,18 +5886,20 @@ class AsterMosaic(object):
         # Per-scene thermal cloud threshold. Only consulted when an
         # AST_08 scene is paired with the AST_07XT input — pixels colder
         # than this value are flagged as cloud regardless of VIS/SWIR
-        # brightness. 270 K is well below typical mid-latitude land BT
-        # and above cumulus tops, matching the Faial diagnostic; raise
-        # to ~280-295 K for hot / arid AOIs (Cape Verde, Angola) where
-        # surface BT runs warmer, lower to ~255-265 K for very cold /
-        # high-altitude AOIs where ground can be cool enough to false-
-        # flag.
+        # brightness. 280 K catches warm maritime stratus that sits on
+        # Atlantic island summits (Faial caldera at 275-285 K) — the
+        # earlier 270 K default leaked this cloud through the bright
+        # conjunction test. Raise to ~285-295 K for hot / arid AOIs
+        # (Cape Verde, Angola) where surface BT runs warmer; lower to
+        # ~255-265 K for very cold / high-altitude AOIs where ground
+        # can be cool enough to false-flag.
         bt_threshold_k = arcpy.Parameter(
             displayName=(
                 "Thermal Cloud Threshold (K) — pixels colder than this "
                 "are flagged as cloud when AST_08 is paired. Default "
-                "270 K (Faial / mid-latitude); raise for hot AOIs, lower "
-                "for high-altitude AOIs."
+                "280 K (Faial / mid-latitude maritime; catches warm "
+                "low cloud sitting on Atlantic island summits); raise "
+                "for hot AOIs, lower for high-altitude AOIs."
             ),
             name="bt_threshold_k",
             datatype="GPDouble",
@@ -5884,7 +5907,7 @@ class AsterMosaic(object):
             direction="Input",
             category="Advanced Options",
         )
-        bt_threshold_k.value = _ASTER_CLOUD_BT_MAX_K  # 270.0 K
+        bt_threshold_k.value = _ASTER_CLOUD_BT_MAX_K
 
         return [
             gdb, mosaic_name, data_folder, thermal_folder,
@@ -6661,6 +6684,42 @@ class AsterMosaic(object):
             cloud_mask = cloud_vis_swir | (bt_kelvin < bt_threshold)
         else:
             cloud_mask = cloud_vis_swir
+
+        # Per-scene cloud diagnostic. Materialises the lazy cloud mask
+        # once and reads it via numpy to get the flagged-pixel fraction;
+        # also surfaces the AST_08 BT min/median/max so threshold tuning
+        # can be done from log evidence rather than guesswork. Saving
+        # ``cloud_mask`` to disk first avoids re-evaluating the
+        # raster-math expression downstream when it's used in SetNull.
+        cloud_mask_path = os.path.join(scratch_dir, f"{scene_id}_cloudmask.tif")
+        try:
+            cloud_mask.save(cloud_mask_path)
+            cloud_mask = arcpy.sa.Raster(cloud_mask_path)
+            cm_arr = arcpy.RasterToNumPyArray(cloud_mask, nodata_to_value=0)
+            cm_total = int(cm_arr.size)
+            cm_flagged = int(cm_arr.sum())
+            cm_pct = 100.0 * cm_flagged / cm_total if cm_total else 0.0
+            bt_stats = ""
+            if bt_kelvin is not None:
+                try:
+                    bt_arr = arcpy.RasterToNumPyArray(bt_kelvin)
+                    bt_valid = bt_arr[bt_arr > _ASTER_TIR_VALID_K_FLOOR]
+                    if bt_valid.size:
+                        bt_stats = (
+                            f", BT[K] min={float(np.min(bt_valid)):.1f}"
+                            f"/med={float(np.median(bt_valid)):.1f}"
+                            f"/max={float(np.max(bt_valid)):.1f}"
+                            f" (cut {bt_threshold:.0f})"
+                        )
+                except Exception:
+                    pass
+            arcpy.AddMessage(
+                f"    cloud mask: {cm_pct:.1f}% of pixels flagged{bt_stats}"
+            )
+        except Exception as e:
+            arcpy.AddWarning(
+                f"    cloud diagnostic failed ({e}); proceeding"
+            )
 
         # Combine QA mask (non-cloud quality issues) with the cloud mask.
         # Either condition is enough to drop the pixel.
@@ -9985,10 +10044,11 @@ class TemporalStatistics(object):
 
         stack_pattern = arcpy.Parameter(
             displayName=(
-                "Stack Filename Pattern (advanced; defaults to "
-                "`*_stack.tif`, the S2 / ASTER 9-band convention; use "
-                "`*_stack_vnir.tif` for the ASTER 3-band VNIR-only "
-                "subset; use `*_composite.tif` for Landsat 7-band)"
+                "Stack Filename Pattern (advanced; default auto-detects "
+                "across the three mosaic conventions — `*_stack.tif` "
+                "(S2 / ASTER 9-band), `*_stack_vnir.tif` (ASTER VNIR), "
+                "and `*_composite.tif` (Landsat). Pick a single pattern "
+                "to restrict the scan."
             ),
             name="stack_pattern",
             datatype="GPString",
@@ -9997,11 +10057,12 @@ class TemporalStatistics(object):
             category="Advanced Options",
         )
         stack_pattern.filter.list = [
+            _TOOL07_AUTO_LABEL,
             "*_stack.tif",
             "*_stack_vnir.tif",
             "*_composite.tif",
         ]
-        stack_pattern.value = "*_stack.tif"
+        stack_pattern.value = _TOOL07_AUTO_LABEL
 
         mask_feature = arcpy.Parameter(
             displayName="Optional AOI Mask Feature (polygon)",
@@ -10056,16 +10117,26 @@ class TemporalStatistics(object):
             sensor_param = parameters[3].valueAsText
             region = parameters[4].valueAsText
             stratification = parameters[5].valueAsText or "All scenes"
-            stack_pattern = parameters[6].valueAsText or "*_stack.tif"
+            stack_pattern = parameters[6].valueAsText or _TOOL07_AUTO_LABEL
             mask_feature = parameters[7].valueAsText
             save_stats = bool(parameters[8].value)
+
+            if stack_pattern == _TOOL07_AUTO_LABEL:
+                discovery_patterns = list(_TOOL07_AUTO_PATTERNS)
+                pattern_display = (
+                    f"{_TOOL07_AUTO_LABEL} → "
+                    + ", ".join(_TOOL07_AUTO_PATTERNS)
+                )
+            else:
+                discovery_patterns = [stack_pattern]
+                pattern_display = stack_pattern
 
             arcpy.AddMessage("=" * 60)
             arcpy.AddMessage(f"TEMPORAL STATISTICS — prefix: {out_prefix}")
             arcpy.AddMessage("=" * 60)
             arcpy.AddMessage(f"  Scratch:        {scratch_dir}")
             arcpy.AddMessage(f"  Output:         {out_workspace}")
-            arcpy.AddMessage(f"  Pattern:        {stack_pattern}")
+            arcpy.AddMessage(f"  Pattern:        {pattern_display}")
             arcpy.AddMessage(f"  Stratification: {stratification}")
 
             if mask_feature and arcpy.Exists(mask_feature):
@@ -10077,11 +10148,15 @@ class TemporalStatistics(object):
                     f"  AOI: {mask_feature!r} NOT FOUND — full extent"
                 )
 
-            # Discover stacks
-            stacks = sorted(glob.glob(os.path.join(scratch_dir, stack_pattern)))
+            # Discover stacks across all selected patterns and union.
+            found = []
+            for pat in discovery_patterns:
+                found.extend(glob.glob(os.path.join(scratch_dir, pat)))
+            stacks = sorted(set(found))
             if not stacks:
                 arcpy.AddError(
-                    f"No stacks matching {stack_pattern!r} in {scratch_dir}."
+                    f"No stacks matching {discovery_patterns!r} in "
+                    f"{scratch_dir}."
                 )
                 return None
             arcpy.AddMessage(f"  Scenes found:   {len(stacks)}")
