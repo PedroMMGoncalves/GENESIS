@@ -2132,7 +2132,14 @@ class IndicesComposites(object):
             direction="Input",
             multiValue=True,
         )
-        # Initial filter list — populated/filtered in updateParameters.
+        # ``filter.type = "ValueList"`` MUST be set explicitly before
+        # ``filter.list`` on a multi-value parameter. Without it Pro
+        # picks a default filter type that is not fully compatible
+        # with the multi-value checkbox control, and the user's tick
+        # state silently disappears on every UI interaction (folder
+        # browse, Run click, etc.) — the same pattern that works in
+        # the sibling era5land toolbox uses this explicit assignment.
+        indices.filter.type = "ValueList"
         indices.filter.list = []
 
         composites = arcpy.Parameter(
@@ -2143,6 +2150,7 @@ class IndicesComposites(object):
             direction="Input",
             multiValue=True,
         )
+        composites.filter.type = "ValueList"
         composites.filter.list = []
 
         out_workspace = arcpy.Parameter(
@@ -2185,35 +2193,56 @@ class IndicesComposites(object):
         ]
 
     def updateParameters(self, parameters):
-        """Watch sensor + input changes; rebuild the indices/composites
-        dropdowns whenever either changes. Also resolve Auto-detect to a
-        concrete sensor so the user sees what they're getting."""
+        """Rebuild the indices / composites filter lists only when the
+        desired content differs from what is currently in the dialog.
+
+        Same pattern as the sibling ``era5land-arcgis-tools`` toolbox:
+        a direct ``filter.list != desired`` comparison with no
+        wrapping, no ``str()`` coercion, no instance / class cache.
+        Combined with the explicit ``filter.type = "ValueList"``
+        declarations in ``getParameterInfo``, Pro keeps the user's
+        tick state intact through every dialog interaction.
+
+        Identical-list re-assignment of a multi-value ``filter.list``
+        is what causes Pro to wipe ``.value`` underneath the user.
+        The conditional re-assignment below is the single defence
+        against that — when the resolved sensor has not changed the
+        method is a no-op and the ticks survive untouched.
+        """
         try:
             input_raster = parameters[0]
             sensor_param = parameters[1]
             indices = parameters[2]
             composites = parameters[3]
 
-            # If Auto-detect AND we have an input raster, detect now and
-            # update the sensor dropdown so the filter list matches what
-            # the user is about to compute against.
+            # Resolve the effective sensor: honour an explicit choice;
+            # otherwise auto-detect from the input raster.
             effective_sensor = sensor_param.valueAsText
             if effective_sensor == SENSOR_AUTO and input_raster.valueAsText:
                 detected = detect_sensor(input_raster.valueAsText)
                 if detected is not None:
                     effective_sensor = detected
 
-            # If the effective sensor is still Auto (no input or undetectable),
-            # show no indices / composites — better than showing all and
-            # then failing at execute time.
+            # Desired filter content for this sensor.
             if effective_sensor and effective_sensor != SENSOR_AUTO:
-                indices.filter.list = applicable_index_labels_flat(effective_sensor)
-                composites.filter.list = applicable_composite_labels_flat(effective_sensor)
+                desired_idx = applicable_index_labels_flat(effective_sensor)
+                desired_cmp = applicable_composite_labels_flat(effective_sensor)
             else:
-                indices.filter.list = []
-                composites.filter.list = []
+                desired_idx = []
+                desired_cmp = []
+
+            # Only touch ``filter.list`` when its content genuinely
+            # needs to change. arcpy's own equality on the ``ValueList``
+            # wrapper works correctly when ``filter.type`` is the
+            # canonical ``"ValueList"`` declared up in
+            # ``getParameterInfo``.
+            if indices.filter.list != desired_idx:
+                indices.filter.list = desired_idx
+            if composites.filter.list != desired_cmp:
+                composites.filter.list = desired_cmp
         except Exception:
-            # updateParameters must never raise — it runs on every keystroke.
+            # updateParameters must never raise — it runs on every
+            # keystroke and an exception would freeze the dialog.
             pass
 
     def updateMessages(self, parameters):
