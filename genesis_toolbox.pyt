@@ -8123,14 +8123,24 @@ class Transformations(object):
             arcpy.management.CompositeBands(temp_component_paths, out_path)
             output_path = out_path
             
-            # Clean up temporary files
+            # Clean up temporary files + the per-run scratch dir
+            # itself. ``arcpy.management.Delete`` removes each .tif
+            # along with its auxiliary sidecars (.aux.xml, .tfw, ...),
+            # but leaves the parent directory empty. ``os.rmdir``
+            # closes it out cleanly — fails silently if the directory
+            # still has unexpected residue (kept defensive so a
+            # CompositeBands edge case can't break the whole tool).
             arcpy.AddMessage("Cleaning up temporary files...")
             for temp_path in temp_component_paths:
                 try:
                     arcpy.management.Delete(temp_path)
                 except arcpy.ExecuteError:
                     pass
-            
+            try:
+                os.rmdir(temp_dir)
+            except OSError:
+                pass
+
             return output_path
             
         except Exception as e:
@@ -8288,7 +8298,7 @@ class Transformations(object):
             if mixing.size:
                 plot_blocks.append(
                     self._loadings_heatmap_block(
-                        "ICA mixing matrix (A)", mixing,
+                        plt, "ICA mixing matrix (A)", mixing,
                         input_band_labels, n_components=n_show,
                     )
                 )
