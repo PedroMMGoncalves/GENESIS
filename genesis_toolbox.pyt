@@ -2385,6 +2385,17 @@ class IndicesComposites(object):
 
         from arcpy.sa import ExtractByMask, SetNull, Float
 
+        # Self-mask the implicit NoData footprint of the input. Mosaic
+        # rasters in a file geodatabase commonly carry no explicit
+        # NoData metadata; the fill pixels outside the AOI sit at
+        # value 0 (the U16 default fill written by Pro on save). Using
+        # the first available band as a sentinel ("data wherever
+        # band 1 > 0"), we drop those fill pixels from every index
+        # output — eliminates the green/pink rectangles that
+        # otherwise appear at the corners of the result extent.
+        any_band_key = next(iter(bands)) if bands else None
+        self_mask = bands[any_band_key] > 0 if any_band_key is not None else None
+
         written = 0
         for label in selected_labels:
             clean = str(label).strip("'\"")
@@ -2409,6 +2420,11 @@ class IndicesComposites(object):
                     result,
                 )
 
+                # Drop the input's implicit NoData footprint (pixels
+                # where the source bands sit at 0 — outside-AOI fill).
+                if self_mask is not None:
+                    result = SetNull(~self_mask, result)
+
                 if rescale:
                     result = self._rescale_to_0_255(result)
 
@@ -2428,7 +2444,13 @@ class IndicesComposites(object):
         if not selected_labels:
             return 0
 
-        from arcpy.sa import ExtractByMask
+        from arcpy.sa import ExtractByMask, SetNull
+
+        # Self-mask the implicit NoData footprint (see _calculate_indices
+        # docstring for the same reasoning — composites suffer the same
+        # corner-rectangle artefact from outside-AOI fill pixels).
+        any_band_key = next(iter(bands)) if bands else None
+        self_mask = bands[any_band_key] > 0 if any_band_key is not None else None
 
         written = 0
         for label in selected_labels:
@@ -2445,6 +2467,8 @@ class IndicesComposites(object):
                     b = get_band(bands, role, sensor)
                     if mask_obj is not None:
                         b = ExtractByMask(b, mask_obj)
+                    if self_mask is not None:
+                        b = SetNull(~self_mask, b)
                     channels.append(b)
 
                 name = f"{out_prefix}{meta['output_suffix']}" if out_prefix else meta["output_suffix"]
@@ -7478,8 +7502,9 @@ class Transformations(object):
                     # Handle NoData values
                     arcpy.AddMessage("Handling NoData values...")
                     data_array = data_array.astype(float)
-                    
-                    # Check for NoData using a safer approach
+
+                    # Apply the raster's explicit NoData value when
+                    # one is set in the source's metadata.
                     try:
                         if hasattr(raster_obj, 'noDataValue') and raster_obj.noDataValue is not None:
                             no_data = raster_obj.noDataValue
@@ -7487,11 +7512,37 @@ class Transformations(object):
                                 data_array[:, :, i][data_array[:, :, i] == no_data] = np.nan
                             arcpy.AddMessage(f"Applied NoData value: {no_data}")
                         else:
-                            arcpy.AddMessage("No explicit NoData value found, continuing with all data")
+                            arcpy.AddMessage("No explicit NoData value in raster metadata.")
                     except Exception as e:
-                        arcpy.AddWarning(f"Error handling NoData values: {str(e)}")
-                        arcpy.AddMessage("Continuing without NoData handling")
-                    
+                        arcpy.AddWarning(f"Error applying explicit NoData: {str(e)}")
+
+                    # Defensive implicit-NoData detection: file-
+                    # geodatabase rasters frequently arrive with no
+                    # ``noDataValue`` set in metadata, but their
+                    # outside-AOI fill pixels are written with all
+                    # bands at zero (the U16 default fill). Without
+                    # this guard the transform treats those fill
+                    # pixels as valid samples — the PCA / MNF / ICA
+                    # eigendecomposition then learns from them and the
+                    # output has visibly anomalous values in the
+                    # corners of the result extent (the
+                    # green / pink rectangles the user reported).
+                    # Mark all-zero pixels as NaN so the transforms
+                    # skip them and the NoData footprint propagates
+                    # to every component.
+                    try:
+                        all_zero = np.all(np.nan_to_num(data_array) == 0, axis=-1)
+                        n_zero = int(all_zero.sum())
+                        if n_zero:
+                            data_array[all_zero] = np.nan
+                            n_total = all_zero.size
+                            arcpy.AddMessage(
+                                f"Implicit NoData: {n_zero} ({100*n_zero/n_total:.1f}%) "
+                                f"all-band-zero pixel(s) treated as NoData."
+                            )
+                    except Exception as e:
+                        arcpy.AddWarning(f"Implicit NoData detection failed: {e}")
+
                     arcpy.AddMessage("Handled NoData values")
                     
                     # Perform transformation
