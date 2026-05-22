@@ -302,6 +302,112 @@ def _sanity_check_output(raster_path, sensor_hint=None, label=None,
 
 
 # ---------------------------------------------------------------------------
+# Per-sensor band map + sidecar writer
+# ---------------------------------------------------------------------------
+
+# Canonical band layout for each mosaic output. Used by
+# ``_write_band_sidecar_csv`` to document Band_N → satellite-band
+# mapping so the mosaic stays interpretable when the GDB raster format
+# can't carry per-band descriptions. Order matches the stack order
+# each tool writes; positions are 1-indexed (matches ArcGIS's
+# ``raster/Band_N`` convention).
+_BAND_LAYOUT = {
+    "landsat": [
+        # SR_B1..SR_B7 — Landsat 8/9 Collection 2 Level 2 SR.
+        (1, "SR_B1", "Coastal", 443, 30),
+        (2, "SR_B2", "Blue", 482, 30),
+        (3, "SR_B3", "Green", 561, 30),
+        (4, "SR_B4", "Red", 655, 30),
+        (5, "SR_B5", "NIR", 865, 30),
+        (6, "SR_B6", "SWIR1", 1609, 30),
+        (7, "SR_B7", "SWIR2", 2201, 30),
+    ],
+    "sentinel-2": [
+        # 12-band L2A in wavelength order — B10 absent (Sen2Cor strips
+        # it during atmospheric correction). Native resolutions: 10m,
+        # 20m or 60m; all bands are resampled to 10m in the mosaic.
+        (1,  "B01", "Coastal",     443, 60),
+        (2,  "B02", "Blue",        490, 10),
+        (3,  "B03", "Green",       560, 10),
+        (4,  "B04", "Red",         665, 10),
+        (5,  "B05", "RedEdge1",    705, 20),
+        (6,  "B06", "RedEdge2",    740, 20),
+        (7,  "B07", "RedEdge3",    783, 20),
+        (8,  "B08", "NIR",         842, 10),
+        (9,  "B8A", "NarrowNIR",   865, 20),
+        (10, "B09", "WaterVapour", 945, 60),
+        (11, "B11", "SWIR1",       1610, 20),
+        (12, "B12", "SWIR2",       2190, 20),
+    ],
+    "aster": [
+        # AST_07XT V004 VNIR+SWIR — 9-band stack. Wavelengths are band
+        # midpoints (the ASTER bands are bandpass-shaped, not point
+        # measurements). B03 is the nadir-looking 3N variant.
+        (1, "B01",  "Green",         560,  15),
+        (2, "B02",  "Red",           661,  15),
+        (3, "B03N", "NIR",           807,  15),
+        (4, "B04",  "SWIR1",         1656, 30),
+        (5, "B05",  "SWIR2_2165",    2167, 30),
+        (6, "B06",  "SWIR2_2205",    2209, 30),
+        (7, "B07",  "SWIR2_2260",    2262, 30),
+        (8, "B08",  "SWIR2_2330",    2336, 30),
+        (9, "B09",  "SWIR2",         2400, 30),
+    ],
+    "aster-vnir": [
+        # VNIR-only ASTER (post-Apr-2008 SWIR failure). 3-band subset
+        # of the AST_07XT VNIR group.
+        (1, "B01",  "Green", 560, 15),
+        (2, "B02",  "Red",   661, 15),
+        (3, "B03N", "NIR",   807, 15),
+    ],
+}
+
+
+def _write_band_sidecar_csv(output_raster_path, sensor_key, suffix="_bands.csv"):
+    """Write a ``{output}_bands.csv`` sidecar documenting which stack
+    position holds which satellite band.
+
+    The file format is intentionally minimal — one header line + one
+    row per band — so it opens cleanly in any text editor or
+    spreadsheet, and so a downstream script can parse it with
+    ``csv.DictReader`` without sensor-specific logic. Columns:
+
+    - ``band_index``       Stack position (1-indexed; matches Pro's
+                           ``raster/Band_N`` band navigation).
+    - ``satellite_band``   Original band name from the source product
+                           (e.g., ``B04``, ``B8A``, ``SR_B5``).
+    - ``role``             GENESIS band-role label (``Red``, ``NIR``,
+                           ``SWIR1``…) — the same key used by
+                           ``SENSOR_BAND_ROLES`` and by the indices /
+                           composites catalogue in Tool 04.
+    - ``wavelength_nm``    Approximate band centre in nanometres.
+    - ``native_res_m``     Native sensor resolution before any
+                           resampling in the mosaic pipeline.
+
+    Returns the sidecar path on success, or ``None`` if no layout is
+    registered for ``sensor_key`` (in which case nothing is written).
+    """
+    layout = _BAND_LAYOUT.get(sensor_key)
+    if not output_raster_path or not layout:
+        return None
+    csv_path = f"{output_raster_path}{suffix}"
+    try:
+        with open(csv_path, "w", encoding="utf-8", newline="") as fh:
+            writer = csv.writer(fh, quoting=csv.QUOTE_MINIMAL)
+            writer.writerow([
+                "band_index", "satellite_band", "role",
+                "wavelength_nm", "native_res_m",
+            ])
+            for band_index, name, role, wl, native_res in layout:
+                writer.writerow([band_index, name, role, wl, native_res])
+        arcpy.AddMessage(f"  Band-mapping CSV: {csv_path}")
+        return csv_path
+    except OSError as e:
+        arcpy.AddWarning(f"  Could not write band-mapping CSV ({e})")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Arcpy-safe identifier sanitisation
 # ---------------------------------------------------------------------------
 
@@ -323,6 +429,29 @@ def _sanitize_arcpy_name(name):
     if not name:
         return ""
     return str(name).translate(_ARCPY_NAME_TRANSLATIONS)
+
+
+def _build_workspace_subfolder_path(out_workspace, name, subfolder):
+    """Route a raster output into a workspace-appropriate path.
+
+    Folder workspaces default to ESRI GRID, which caps raster names at
+    13 characters; appending ``.tif`` forces GeoTIFF and lifts that
+    limit. For folder workspaces the output is also routed into the
+    given ``subfolder`` (created on demand) so different product
+    families don't visually mix in the catalog — Tool 04 uses
+    ``indices/`` + ``composites/``; Tool 05 uses ``pca/`` / ``mnf/`` /
+    ``ica/``.
+
+    File geodatabases (.gdb) and SDE workspaces have no name length
+    limit and don't support nested folders, so the output is saved flat
+    into the workspace root with no extension.
+    """
+    ws_lower = (out_workspace or "").lower().rstrip("\\/")
+    if ws_lower.endswith(".gdb") or ws_lower.endswith(".sde"):
+        return os.path.join(out_workspace, name)
+    target_dir = os.path.join(out_workspace, subfolder)
+    os.makedirs(target_dir, exist_ok=True)
+    return os.path.join(target_dir, f"{name}.tif")
 
 
 # ---------------------------------------------------------------------------
@@ -1134,16 +1263,24 @@ SENSOR_BAND_ROLES = {
         "SWIR2": 7,
     },
     SENSOR_SENTINEL2: {
-        "Blue": 1,        # B02 490nm
-        "Green": 2,       # B03 560nm
-        "Red": 3,         # B04 665nm
-        "RedEdge1": 4,    # B05 705nm
-        "RedEdge2": 5,    # B06 740nm
-        "RedEdge3": 6,    # B07 783nm
-        "NIR": 7,         # B08 842nm
-        "NarrowNIR": 8,   # B8A 865nm
-        "SWIR1": 9,       # B11 1610nm
-        "SWIR2": 10,      # B12 2190nm
+        # 12-band L2A stack in S2 wavelength order. B01 + B09 are
+        # included so the output Band_N count and order match the
+        # native L2A product 1:1 (Band_N = BNN nativa) for all bands
+        # except B8A which sits between B08 and B09 in wavelength.
+        # B10 is excluded — Sen2Cor strips it during L1C→L2A
+        # atmospheric correction so it does not exist in L2A.
+        "Coastal": 1,       # B01 443nm  (60m native → resampled to 10m)
+        "Blue": 2,          # B02 490nm
+        "Green": 3,         # B03 560nm
+        "Red": 4,           # B04 665nm
+        "RedEdge1": 5,      # B05 705nm
+        "RedEdge2": 6,      # B06 740nm
+        "RedEdge3": 7,      # B07 783nm
+        "NIR": 8,           # B08 842nm
+        "NarrowNIR": 9,     # B8A 865nm
+        "WaterVapour": 10,  # B09 945nm  (60m native → resampled to 10m)
+        "SWIR1": 11,        # B11 1610nm
+        "SWIR2": 12,        # B12 2190nm
     },
     SENSOR_ASTER: {
         # AST_07XT V004 9-band stack: VNIR B1-B3N + crosstalk-corrected SWIR B4-B9
@@ -1217,7 +1354,7 @@ def detect_sensor(raster_path):
       2. Band count (less reliable; only used if path/filename gives no
          hint):
            7 bands  → Landsat 8/9
-           10 bands → Sentinel-2
+           12 bands → Sentinel-2 (10-band legacy stack still accepted)
            9 bands  → ASTER
     """
     if not raster_path:
@@ -1238,7 +1375,9 @@ def detect_sensor(raster_path):
             count = int(desc.bandCount)
             if count == 7:
                 return SENSOR_LANDSAT_89
-            if count == 10:
+            # 12-band current S2 (B01..B12 minus B10) plus 10-band legacy
+            # output (pre-multi-spectral expansion) — both resolve to S2.
+            if count in (10, 12):
                 return SENSOR_SENTINEL2
             if count == 9:
                 return SENSOR_ASTER
@@ -2123,23 +2262,13 @@ class IndicesComposites(object):
     def _build_out_path(self, out_workspace, name, kind):
         """Build the output path for an index or composite raster.
 
-        Folder workspaces default to ESRI GRID, which caps raster names
-        at 13 characters; appending .tif forces GeoTIFF and lifts that
-        limit. For folder workspaces we also split outputs into two
-        sibling subfolders — ``indices/`` and ``composites/`` — so the
-        two product families don't visually mix in the catalog.
-
-        File geodatabases (.gdb) and SDE workspaces have no name length
-        limit and don't support nested folders, so we save flat into
-        the workspace root.
+        Thin wrapper around ``_build_workspace_subfolder_path`` that
+        chooses the subfolder name from this tool's two product
+        families. The underlying helper handles the .gdb / folder
+        dispatch and the .tif extension.
         """
-        ws_lower = (out_workspace or "").lower().rstrip("\\/")
-        if ws_lower.endswith(".gdb") or ws_lower.endswith(".sde"):
-            return os.path.join(out_workspace, name)
         subfolder = "indices" if kind == "index" else "composites"
-        target_dir = os.path.join(out_workspace, subfolder)
-        os.makedirs(target_dir, exist_ok=True)
-        return os.path.join(target_dir, f"{name}.tif")
+        return _build_workspace_subfolder_path(out_workspace, name, subfolder)
 
     def _rescale_to_0_255(self, raster):
         """Linear rescale a raster to [0, 255] using its own min/max."""
@@ -3001,6 +3130,7 @@ class LandsatMosaic(object):
                     self._write_provenance_csv(final_mosaic, all_scenes_used, stats)
                 except Exception as e:
                     arcpy.AddWarning(f"  Provenance CSV write failed (non-fatal): {e}")
+                _write_band_sidecar_csv(final_mosaic, "landsat")
 
                 total_elapsed = (datetime.now() - stats['start_time']).total_seconds()
                 mins, secs = divmod(int(total_elapsed), 60)
@@ -4066,12 +4196,20 @@ _S2_SCL_CLOUD_CLASSES = _S2_SCL_PRESETS["Aggressive"]
 # Sentinel-2 L2A scale factor: DN * 0.0001 = surface reflectance.
 _S2_REFLECTANCE_SCALE = 0.0001
 
-# 10-band L2A stack order matching SENSOR_BAND_ROLES[SENSOR_SENTINEL2].
+# 12-band L2A stack order matching SENSOR_BAND_ROLES[SENSOR_SENTINEL2].
+# Wavelength-ordered: B01 (Coastal, 60m) → B12 (SWIR2, 20m).  B10 is
+# absent because L2A does not carry it (Sen2Cor strips B10 from L1C
+# during atmospheric correction). The atmospheric bands B01 and B09
+# are included for native band-numbering parity with the S2 user
+# guide and traceability when the mosaic is opened in a third-party
+# tool — surface-analysis pipelines (Tool 04 indices, Tool 05
+# transforms) resolve bands by role name via SENSOR_BAND_ROLES and
+# so do not need to know which physical bands are present.
 _S2_STACK_ORDER = [
-    "B02", "B03", "B04", "B05", "B06", "B07",
-    "B08", "B8A", "B11", "B12",
+    "B01", "B02", "B03", "B04", "B05", "B06",
+    "B07", "B08", "B8A", "B09", "B11", "B12",
 ]
-_S2_NATIVE_10M = {"B02", "B03", "B04", "B08"}  # the rest are 20m → resampled
+_S2_NATIVE_10M = {"B02", "B03", "B04", "B08"}  # the rest are 20m or 60m → resampled
 
 
 class Sentinel2Mosaic(object):
@@ -4083,15 +4221,20 @@ class Sentinel2Mosaic(object):
       b) Already-extracted `.SAFE` folders.
 
     For each scene the tool reads the 10m bands (B02, B03, B04, B08) at
-    native resolution and the 20m bands (B05, B06, B07, B8A, B11, B12)
-    resampled to 10m via BILINEAR. Cloud masking uses the SCL layer
-    (classes 3, 8, 9, 10). Surface reflectance is scaled to [0, 1] via
-    the 0.0001 factor.
+    native resolution, the 20m bands (B05, B06, B07, B8A, B11, B12)
+    resampled to 10m via BILINEAR, and the 60m bands (B01, B09)
+    aggressively upsampled to 10m via BILINEAR. Cloud masking uses the
+    SCL layer (classes 3, 8, 9, 10). Surface reflectance is scaled to
+    [0, 1] via the 0.0001 factor.
 
-    The cloud-masked, scaled 10-band stack from each scene is then fed
+    The cloud-masked, scaled 12-band stack from each scene is then fed
     to arcpy.ia.GeometricMedian per MGRS tile. Multi-tile regions are
     merged after per-tile median composites are built. A provenance CSV
-    is written alongside the output documenting every contributing scene.
+    and a band-mapping CSV are written alongside the output — the
+    band-mapping documents which stack position corresponds to each S2
+    native band name, role and wavelength, so the mosaic stays
+    interpretable when the GDB raster format can't carry band
+    descriptions.
     """
 
     def __init__(self):
@@ -4674,6 +4817,7 @@ class Sentinel2Mosaic(object):
 
                 if save_stats:
                     self._write_provenance_csv(final_mosaic, all_scenes_used)
+                _write_band_sidecar_csv(final_mosaic, "sentinel-2")
 
             _sanity_check_output(
                 final_mosaic, sensor_hint="sentinel-2",
@@ -4785,6 +4929,16 @@ class Sentinel2Mosaic(object):
                 continue
             for band in ("B05", "B06", "B07", "B8A", "B11", "B12"):
                 if basename.endswith(f"_{band}_20m.jp2"):
+                    out[band] = f"{base}/{member}"
+                    matched = True
+                    break
+            if matched:
+                continue
+            # B01 (Coastal Aerosol) and B09 (Water Vapour) only exist
+            # in the 60m product. Pulled from R60m so the output stack
+            # preserves native S2 band parity with the L2A user guide.
+            for band in ("B01", "B09"):
+                if basename.endswith(f"_{band}_60m.jp2"):
                     out[band] = f"{base}/{member}"
                     matched = True
                     break
@@ -4970,6 +5124,7 @@ class Sentinel2Mosaic(object):
         img_data = os.path.join(granule_dirs[0], "IMG_DATA")
         r10 = os.path.join(img_data, "R10m")
         r20 = os.path.join(img_data, "R20m")
+        r60 = os.path.join(img_data, "R60m")
 
         out = {}
         for band in ("B02", "B03", "B04", "B08"):
@@ -4980,6 +5135,11 @@ class Sentinel2Mosaic(object):
             matches = glob.glob(os.path.join(r20, f"*_{band}_20m.jp2"))
             if matches:
                 out[band] = matches[0]
+        # B01 (Coastal Aerosol) and B09 (Water Vapour) — 60m natives.
+        for band in ("B01", "B09"):
+            matches = glob.glob(os.path.join(r60, f"*_{band}_60m.jp2"))
+            if matches:
+                out[band] = matches[0]
         scl = glob.glob(os.path.join(r20, "*_SCL_20m.jp2"))
         if scl:
             out["SCL"] = scl[0]
@@ -4988,7 +5148,7 @@ class Sentinel2Mosaic(object):
     def _process_scene(self, scene, scratch_dir,
                        scl_classes=None, buffer_pixels=0):
         """Apply SCL mask + scale + resample-to-10m + stack into a single
-        10-band float32 raster. Returns the saved raster path or None.
+        12-band float32 raster. Returns the saved raster path or None.
 
         Reads bands from either an extracted `.SAFE/` folder (disk JP2)
         or a Copernicus `.zip` archive via GDAL VSI (`/vsizip/...`).
@@ -5048,18 +5208,26 @@ class Sentinel2Mosaic(object):
             buffered.save(buffered_path)
             cloud_expr = arcpy.sa.Raster(buffered_path) > 0
 
-        # Process each band: resample if 20m, scale to reflectance,
-        # apply cloud mask, save.
+        # Process each band: resample if 20m or 60m, scale to reflectance,
+        # apply cloud mask, save. ``SetNull(< 0)`` after Resample
+        # neutralises the float32 NoData sentinel (~-3.4e+38) that
+        # BILINEAR can introduce near scene edges — without it the
+        # sentinel flows through ``Float() * scale`` and contaminates
+        # downstream statistics. The aggressive upsample on the 60m
+        # bands (B01/B09) is the main beneficiary of this guard.
         masked_paths = []
         for band in _S2_STACK_ORDER:
             band_src = bands[band]
             if band not in _S2_NATIVE_10M:
-                # Resample 20m → 10m via BILINEAR (continuous reflectance).
+                # 20m or 60m → 10m via BILINEAR (continuous reflectance).
                 resampled_path = os.path.join(
                     scratch_dir, f"{scene_id}_{band}_10m.tif"
                 )
                 arcpy.management.Resample(band_src, resampled_path, 10, "BILINEAR")
-                band_raster = arcpy.sa.Raster(resampled_path)
+                resampled_raster = arcpy.sa.Raster(resampled_path)
+                band_raster = arcpy.sa.SetNull(
+                    resampled_raster < 0, resampled_raster,
+                )
             else:
                 band_raster = arcpy.sa.Raster(band_src)
 
@@ -5069,7 +5237,7 @@ class Sentinel2Mosaic(object):
             masked.save(out_path)
             masked_paths.append(out_path)
 
-        # Composite into a single 10-band raster.
+        # Composite into a single 12-band raster (B01..B12 minus B10).
         stacked_path = os.path.join(scratch_dir, f"{scene_id}_stack.tif")
         arcpy.management.CompositeBands(masked_paths, stacked_path)
 
@@ -5877,6 +6045,10 @@ class AsterMosaic(object):
 
             if save_stats:
                 self._write_provenance_csv(final_path, scenes_used)
+            _write_band_sidecar_csv(
+                final_path,
+                "aster-vnir" if mode == _ASTER_MODE_VNIR else "aster",
+            )
 
         return final_path
 
@@ -6907,8 +7079,13 @@ class Transformations(object):
                     stats_file = None
                     stats_folder = None
                 
-                # Output path for result
-                out_path = os.path.join(out_workspace, out_name)
+                # Output path for result. Folder workspaces route the
+                # raster into a per-transform subfolder (``pca/`` /
+                # ``mnf/`` / ``ica/``) with a forced ``.tif`` extension;
+                # .gdb / .sde workspaces save flat at the workspace root.
+                out_path = _build_workspace_subfolder_path(
+                    out_workspace, out_name, transform_type.lower(),
+                )
                 
                 # All transforms (PCA, MNF, ICA) share the in-tree NumPy implementation.
                 arcpy.AddMessage("Using custom implementation...")
@@ -7134,9 +7311,8 @@ class Transformations(object):
                     output_path = self._create_multiband_output(
                         transformed_data,
                         raster_info,
-                        out_workspace,
-                        out_name,
-                        preserve_mask
+                        out_path,
+                        preserve_mask,
                     )
                     arcpy.AddMessage(
                         f"  Output written in "
@@ -7525,45 +7701,50 @@ class Transformations(object):
             stats['errors'].append(f"ICA Error: {str(e)}")
             raise
         
-    def _create_multiband_output(self, component_arrays, raster_info, out_workspace, out_name, preserve_mask=True):
+    def _create_multiband_output(self, component_arrays, raster_info, out_path, preserve_mask=True):
         """
         Create a multiband raster from component arrays
-        
+
         Parameters:
         -----------
         component_arrays : ndarray
             Component arrays of shape (height, width, components)
         raster_info : dict
             Raster information containing extent, cell size, etc.
-        out_workspace : str
-            Output workspace path
-        out_name : str
-            Output raster name
+        out_path : str
+            Final destination for the multiband raster (already resolved
+            by the caller via ``_build_workspace_subfolder_path`` —
+            includes the ``pca`` / ``mnf`` / ``ica`` subfolder + ``.tif``
+            for folder workspaces, or the flat workspace path for .gdb).
         preserve_mask : bool
             Whether to preserve the input mask
-            
+
         Returns:
         --------
         str
-            Path to the output multiband raster
+            Path to the output multiband raster (same as ``out_path``).
         """
         try:
             arcpy.AddMessage("\nCreating multiband output...")
-            
+
             # Extract raster information
             extent = raster_info['extent']
             cell_size = raster_info['cell_size']
             spatial_ref = raster_info['spatial_ref']
             mask = raster_info.get('mask', None)
-            
+
             # Paths for temporary component rasters
             temp_component_paths = []
 
-            # Scratch dir for per-component temp TIFFs lives next to the
-            # output workspace (same-disk-as-output, avoids OneDrive sync
-            # overhead from arcpy.env.scratchFolder).
+            # Scratch dir for per-component temp TIFFs. We anchor it to
+            # the parent of the final output path's *workspace* (one
+            # level up from the .tif's containing subfolder, or the .gdb
+            # / folder workspace itself when saving flat) — same-disk-as-
+            # output, avoids OneDrive sync overhead from
+            # arcpy.env.scratchFolder.
+            out_dir = os.path.dirname(os.path.normpath(out_path))
             temp_dir = os.path.join(
-                os.path.dirname(os.path.normpath(out_workspace)),
+                os.path.dirname(out_dir) or out_dir,
                 f"_genesis_components_{uuid.uuid4().hex[:8]}",
             )
             if not os.path.exists(temp_dir):
@@ -7615,10 +7796,11 @@ class Transformations(object):
                 temp_component_paths.append(temp_path)
                 arcpy.AddMessage(f"  Created component {i+1}")
             
-            # Create multiband raster using Composite Bands
-            output_path = os.path.join(out_workspace, out_name)
-            arcpy.AddMessage(f"Creating final multiband raster: {output_path}")
-            arcpy.management.CompositeBands(temp_component_paths, output_path)
+            # Create multiband raster using Composite Bands at the
+            # caller-resolved destination.
+            arcpy.AddMessage(f"Creating final multiband raster: {out_path}")
+            arcpy.management.CompositeBands(temp_component_paths, out_path)
+            output_path = out_path
             
             # Clean up temporary files
             arcpy.AddMessage("Cleaning up temporary files...")

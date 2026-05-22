@@ -58,11 +58,13 @@ Tools 04, 05, and 06 take a `Sensor Type` parameter (Auto-detect / Landsat 8/9 /
 
 | Sensor | Canonical band stack | Specific indices |
 | --- | --- | --- |
-| **Landsat 8/9** | 7 bands: Coastal, Blue, Green, Red, NIR, SWIR1, SWIR2 | NDVI, NDWI, NDMI, NDBI, geological mineral ratios with Blue |
-| **Sentinel-2** | 10 bands: B02, B03, B04, B05, B06, B07, B08, B8A, B11, B12 | All of the above + NDRE, CIred-edge, IRECI |
+| **Landsat 8/9** | 7 bands: SR_B1..SR_B7 (Coastal, Blue, Green, Red, NIR, SWIR1, SWIR2) | NDVI, NDWI, NDMI, NDBI, geological mineral ratios with Blue |
+| **Sentinel-2** | 12 bands in wavelength order: B01, B02, B03, B04, B05, B06, B07, B08, B8A, B09, B11, B12 (B10 absent — Sen2Cor strips it during L1C→L2A atmospheric correction). 60 m bands (B01, B09) and 20 m bands are resampled to 10 m via BILINEAR; 10 m bands (B02, B03, B04, B08) are kept at native resolution. | NDVI, NDWI, NDMI, NDBI, geological mineral ratios with Blue, plus NDRE, CIred-edge, IRECI (red-edge) |
 | **ASTER** | 9 bands: B01, B02, B03N, B04, B05, B06, B07, B08, B09 ¹ | Geological staples + Alunite, Kaolinite, Muscovite, Calcite, Hydrothermal Alteration (Cudahy) |
 
-¹ Tool 03 emits **two outputs**: `{name}_VnirSwir` is the canonical 9-band mosaic built from pre-April-2008 scenes only (full VNIR + crosstalk-corrected SWIR), and `{name}_Vnir` is a 3-band (B01, B02, B03N) mosaic built from the full archive — the ASTER SWIR detector failed in April 2008 and any post-failure scene contributes only to the VNIR-only product. Tool 04 detects the band count of its input automatically and skips indices that need SWIR roles when handed the 3-band variant.
+Each mosaic is shipped with a `{name}_bands.csv` sidecar documenting `band_index → satellite_band → role → wavelength_nm → native_res_m`. The CSV is the canonical map between the stack position the user sees in ArcGIS Pro's *Symbology* dropdown (e.g. `Band_4`) and the original sensor band name (e.g. `B04` / `SR_B4` / `ASTER B02`) — file-geodatabase rasters can't carry per-band descriptions, so the sidecar is the durable source of truth across both GeoTIFF and GDB outputs.
+
+¹ Tool 03 emits **two outputs**: `{name}_VnirSwir` is the canonical 9-band mosaic built from pre-April-2008 scenes only (full VNIR + crosstalk-corrected SWIR), and `{name}_Vnir` is a 3-band (B01, B02, B03N) mosaic built from the full archive — the ASTER SWIR detector failed in April 2008 and any post-failure scene contributes only to the VNIR-only product. Tool 04 detects the band count of its input automatically and skips indices that need SWIR roles when handed the 3-band variant. The 3-band output ships with its own `_bands.csv` (`aster-vnir` layout).
 
 ---
 
@@ -100,9 +102,10 @@ Tools 04, 05, and 06 take a `Sensor Type` parameter (Auto-detect / Landsat 8/9 /
 
 - Reflectance: **float 0–1** (analysis-friendly; Sentinel-2 ×0.0001, ASTER ×0.001 applied during ingestion)
 - Mosaic CRS: inherited from input (UTM for Landsat / S2; resample-aligned for ASTER)
-- Each mosaic: **multi-band GeoTIFF or geodatabase raster + `_provenance.csv`**
+- Each mosaic: **multi-band GeoTIFF or geodatabase raster + `_provenance.csv` + `_bands.csv`** (band-mapping sidecar documenting which stack position is which satellite band)
 - Transformation statistics: **`.npz` (NumPy archive)** for re-applying to new AOIs
 - Tool 04 outputs: when the workspace is a **folder**, indices and composites are written to sibling `indices/` and `composites/` subfolders (forced GeoTIFF, no 13-character ESRI-GRID name limit). When the workspace is a **`.gdb`**, both products are saved flat at the workspace root with no extension (geodatabases have no name-length limit and don't support nested folders).
+- Tool 05 outputs: the same folder / `.gdb` split applies. Folder workspaces get a per-transform subfolder (`pca/`, `mnf/`, or `ica/`) with the result saved as a `.tif`; `.gdb` workspaces save flat at the workspace root with no extension. Statistics (`.npz` for PCA, `.txt` for MNF/ICA) continue to land in the explicit *Statistics Folder* parameter regardless of workspace type.
 - Each mosaic's median output is sanity-checked after save: per-band MIN / MEAN / MAX are logged, and a warning is emitted if any band's mean is suspiciously close to zero for that sensor's expected reflectance range — catches the class of NoData-handling regression that would otherwise pass type-checking and structural validation while producing visually-broken outputs.
 
 ---
