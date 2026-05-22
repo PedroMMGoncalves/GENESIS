@@ -267,6 +267,17 @@ def _sanity_check_output(raster_path, sensor_hint=None, label=None,
     """
     msg = message_callback or arcpy.AddMessage
     label = label or os.path.basename(raster_path)
+    # Newly-saved file-geodatabase rasters arrive without statistics
+    # computed, which makes every GetRasterProperties call below fail
+    # with ERROR 001100 ("no statistics available"). One BUILD pass
+    # over the saved raster fixes it; cheap relative to the geomedian
+    # we just ran. Wrapped in try / except so a failure here only
+    # demotes the sanity check to "stats unavailable" instead of
+    # bringing the run down.
+    try:
+        arcpy.management.CalculateStatistics(raster_path)
+    except Exception:
+        pass
     try:
         band_count = int(arcpy.Raster(raster_path).bandCount)
     except Exception as e:
@@ -390,7 +401,7 @@ def _write_band_sidecar_csv(output_raster_path, sensor_key, suffix="_bands.csv")
     layout = _BAND_LAYOUT.get(sensor_key)
     if not output_raster_path or not layout:
         return None
-    csv_path = f"{output_raster_path}{suffix}"
+    csv_path = _sidecar_path_for_raster(output_raster_path, suffix)
     try:
         with open(csv_path, "w", encoding="utf-8", newline="") as fh:
             writer = csv.writer(fh, quoting=csv.QUOTE_MINIMAL)
@@ -429,6 +440,31 @@ def _sanitize_arcpy_name(name):
     if not name:
         return ""
     return str(name).translate(_ARCPY_NAME_TRANSLATIONS)
+
+
+def _sidecar_path_for_raster(raster_path, suffix):
+    """Resolve where a text sidecar (.csv / .npz / .html / .txt /
+    ...) should be written for a given saved raster.
+
+    Rasters inside a file geodatabase (or SDE) can't carry text
+    sidecars in the same workspace — opening
+    ``D:\\foo.gdb\\bar_provenance.csv`` is a write into the .gdb
+    directory which ArcGIS hides from its catalog view, so the user
+    never sees the file. The sidecar is therefore routed to the
+    parent folder of the .gdb / .sde, named after the raster's
+    basename. Folder workspaces (.tif outputs) put the sidecar
+    alongside the raster, with the raster's extension stripped from
+    the prefix so we don't end up with ``name.tif_provenance.csv``.
+    """
+    norm = os.path.normpath(raster_path)
+    parent = os.path.dirname(norm)
+    parent_lower = parent.lower()
+    stem, _ = os.path.splitext(os.path.basename(norm))
+    if parent_lower.endswith(".gdb") or parent_lower.endswith(".sde"):
+        sidecar_dir = os.path.dirname(parent) or parent
+    else:
+        sidecar_dir = parent
+    return os.path.join(sidecar_dir, stem + suffix)
 
 
 def _build_workspace_subfolder_path(out_workspace, name, subfolder):
@@ -582,20 +618,29 @@ _ASTER_CLOUD_B04_MIN = 0.25
 # Optional brightness-temperature cloud channel. When AST_08 (Surface
 # Kinetic Temperature, V004) scenes are paired with the AST_07XT input
 # by scene ID, pixels colder than this threshold are flagged as cloud
-# regardless of VIS/SWIR brightness. 295 K matches Hulley & Hook
-# (2008)'s ACCA-on-ASTER warm-cloud screen — catches thin cirrus
-# (cold but VIS-dim) and warm marine cumulus that the VIS+SWIR
-# conjunction would miss, while still leaving daytime forest canopy
-# / bare basalt (typically 290-310 K) safely above the line. AST_08
-# V004 COG TIFFs export already-scaled Kelvin values, so no scale
-# factor is applied.
-_ASTER_CLOUD_BT_MAX_K = 295.0
+# regardless of VIS/SWIR brightness. The May 2026 Faial diagnostic
+# showed that Hulley & Hook (2008)'s 295 K threshold — calibrated for
+# tropical scenes — over-masks mid-latitude Atlantic land, where
+# daytime surface temperatures legitimately sit in the 275-296 K range
+# (cool forest canopy, north-facing slopes, early-morning passes).
+# 270 K is well below the typical Faial land floor and still captures
+# clear cumulus tops over the Azores (which sit at 250-275 K).
+_ASTER_CLOUD_BT_MAX_K = 270.0
+
+# AST_08 V004 stores Surface Kinetic Temperature as Int16 with a scale
+# factor of 0.1 (DN × 0.1 = Kelvin). The earlier comment in this
+# module claimed COG TIFFs export already-scaled Kelvin — the
+# diagnostic on Faial scratch showed otherwise (raw values 2700-3000,
+# the literal DN). Applied inside ``_load_bt_kelvin`` immediately
+# after the 90 m → 15 m Resample.
+_ASTER_TIR_SCALE = 0.1
 
 # Lower validity bound for AST_08 Surface Kinetic Temperature, in
-# Kelvin. AST_08 NoData is stored as 0 K (V004 COG) and Resample
-# can introduce float32 NoData sentinels (~ -3.4e+38) near scene
-# edges; both fall well below this floor. Daytime land brightness
-# temperatures over Earth's surface are very rarely below 200 K.
+# Kelvin. AST_08 NoData is stored as 0 DN (which scales to 0 K) and
+# Resample can introduce float32 NoData sentinels (~ -3.4e+38) near
+# scene edges; both fall well below this floor. Daytime land
+# brightness temperatures over Earth's surface are very rarely below
+# 200 K.
 _ASTER_TIR_VALID_K_FLOOR = 200.0
 
 # Pure-numpy FastICA defaults (Hyvärinen parallel, logcosh). Match the
@@ -4118,7 +4163,7 @@ class LandsatMosaic(object):
             return
 
         try:
-            csv_path = f"{output_raster_path}_provenance.csv"
+            csv_path = _sidecar_path_for_raster(output_raster_path, "_provenance.csv")
             now_iso = datetime.now().isoformat(timespec="seconds")
             with open(csv_path, "w", encoding="utf-8", newline="") as fh:
                 writer = csv.writer(fh, quoting=csv.QUOTE_MINIMAL)
@@ -4344,15 +4389,6 @@ class Sentinel2Mosaic(object):
             direction="Input",
         )
 
-        apply_temporal = arcpy.Parameter(
-            displayName="Apply Temporal Cloud Refinement (optional, slower)",
-            name="apply_temporal_refinement",
-            datatype="GPBoolean",
-            parameterType="Optional",
-            direction="Input",
-        )
-        apply_temporal.value = False
-
         # SCL aggressiveness preset. The Aggressive default (1, 3, 7, 8,
         # 9, 10, 11) catches the cloud-edge halo Sen2Cor leaves as
         # "Unclassified" + the snow/ice false positives the original
@@ -4413,7 +4449,7 @@ class Sentinel2Mosaic(object):
 
         return [
             gdb, mosaic_name, data_folder, region, time_type,
-            year, month, season, apply_temporal,
+            year, month, season,
             cloud_aggressiveness, cloud_buffer,
             mask_feature, save_stats, preserve_scratch,
         ]
@@ -4475,12 +4511,11 @@ class Sentinel2Mosaic(object):
             year = parameters[5].value
             month = parameters[6].value
             season = parameters[7].valueAsText
-            apply_temporal = bool(parameters[8].value)
-            cloud_aggressiveness = parameters[9].valueAsText or "Aggressive"
-            cloud_buffer_pixels = parameters[10].value if parameters[10].value is not None else 2
-            mask_feature = parameters[11].valueAsText
-            save_stats = bool(parameters[12].value)
-            preserve_scratch = bool(parameters[13].value)
+            cloud_aggressiveness = parameters[8].valueAsText or "Aggressive"
+            cloud_buffer_pixels = parameters[9].value if parameters[9].value is not None else 2
+            mask_feature = parameters[10].valueAsText
+            save_stats = bool(parameters[11].value)
+            preserve_scratch = bool(parameters[12].value)
 
             # Resolve aggressiveness preset → SCL class tuple. The dropdown
             # constrains the value to the preset keys; fall back defensively
@@ -4696,15 +4731,6 @@ class Sentinel2Mosaic(object):
                 f"({stack_elapsed/max(1,len(all_scenes_used)):.1f}s/scene) — "
                 f"tiles: {sorted(scenes_by_tile.keys())}"
             )
-
-            # Optional Step 3b: multitemporal cloud refinement layer.
-            if apply_temporal:
-                arcpy.AddMessage("\nStep 3b — Applying multitemporal cloud refinement...")
-                arcpy.AddWarning(
-                    "  Multitemporal refinement is a stub in this build — "
-                    "the per-scene SCL mask is already applied; an explicit "
-                    "temporal anomaly pass will land in a follow-up phase."
-                )
 
             # Step 4: per-tile geometric median.
             tile_mosaics = []
@@ -5262,7 +5288,7 @@ class Sentinel2Mosaic(object):
         if not output_raster_path or not scenes_used:
             return
         try:
-            csv_path = f"{output_raster_path}_provenance.csv"
+            csv_path = _sidecar_path_for_raster(output_raster_path, "_provenance.csv")
             now_iso = datetime.now().isoformat(timespec="seconds")
             with open(csv_path, "w", encoding="utf-8", newline="") as fh:
                 writer = csv.writer(fh, quoting=csv.QUOTE_MINIMAL)
@@ -5464,7 +5490,8 @@ class AsterMosaic(object):
     folder pointed to by the optional "ASTER Thermal Data Folder"
     parameter (the natural LP DAAC by-product download layout). When
     present, the thermal channel is folded into the per-scene cloud test
-    — pixels colder than ~295 K are flagged as cloud regardless of
+    — pixels colder than ~270 K (well below typical mid-latitude land
+    BT but above cumulus tops) are flagged as cloud regardless of
     VIS/SWIR brightness, which catches thin cirrus and reduces false
     positives over warm bare ground.
 
@@ -5475,9 +5502,10 @@ class AsterMosaic(object):
       3. Apply QA cloud mask from the QA Data Plane layers (best-effort
          bit decoding — exact layout per ASTER User Handbook V004).
       4. Build a multi-spectral cloud mask
-         ``(B02 > 0.45 AND B04 > 0.25) OR (BT < 295 K)`` — Hulley & Hook
-         (2008)-style ACCA-on-ASTER. The thermal term is dropped when no
-         AST_08 is paired; the SWIR term is dropped for VNIR-only scenes.
+         ``(B02 > 0.45 AND B04 > 0.25) OR (BT < 270 K)`` — Hulley & Hook
+         (2008)-style ACCA-on-ASTER with a mid-latitude-adjusted thermal
+         threshold. The thermal term is dropped when no AST_08 is paired;
+         the SWIR term is dropped for VNIR-only scenes.
       5. Stack into a 9-band float32 raster (3-band for VNIR-only mode).
 
     Mosaicking: Esri arcpy.ia.GeometricMedian across the cloud-masked
@@ -5643,10 +5671,35 @@ class AsterMosaic(object):
         )
         preserve_scratch.value = False
 
+        # Per-scene thermal cloud threshold. Only consulted when an
+        # AST_08 scene is paired with the AST_07XT input — pixels colder
+        # than this value are flagged as cloud regardless of VIS/SWIR
+        # brightness. 270 K is well below typical mid-latitude land BT
+        # and above cumulus tops, matching the Faial diagnostic; raise
+        # to ~280-295 K for hot / arid AOIs (Cape Verde, Angola) where
+        # surface BT runs warmer, lower to ~255-265 K for very cold /
+        # high-altitude AOIs where ground can be cool enough to false-
+        # flag.
+        bt_threshold_k = arcpy.Parameter(
+            displayName=(
+                "Thermal Cloud Threshold (K) — pixels colder than this "
+                "are flagged as cloud when AST_08 is paired. Default "
+                "270 K (Faial / mid-latitude); raise for hot AOIs, lower "
+                "for high-altitude AOIs."
+            ),
+            name="bt_threshold_k",
+            datatype="GPDouble",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        bt_threshold_k.value = _ASTER_CLOUD_BT_MAX_K  # 270.0 K
+
         return [
             gdb, mosaic_name, data_folder, thermal_folder,
             region, time_type, year, month, season,
             use_qa_planes, mask_feature, save_stats, preserve_scratch,
+            bt_threshold_k,
         ]
 
     def updateParameters(self, parameters):
@@ -5697,6 +5750,15 @@ class AsterMosaic(object):
             mask_feature = parameters[10].valueAsText
             save_stats = bool(parameters[11].value)
             preserve_scratch = bool(parameters[12].value)
+            # Thermal cloud threshold (Advanced Options) — falls back
+            # to the module default when the user leaves the field
+            # empty. Read as float, not int, since 295.5 K etc. are
+            # valid thresholds.
+            bt_threshold_k = (
+                float(parameters[13].value)
+                if len(parameters) > 13 and parameters[13].value is not None
+                else _ASTER_CLOUD_BT_MAX_K
+            )
 
             # ----------------------------------------------------------------
             # AOI-first scoping. See LandsatMosaic.execute() for the full
@@ -5727,7 +5789,7 @@ class AsterMosaic(object):
                 f"  Options:    QA mask = {use_qa}, "
                 f"per-scene cloud test = on "
                 f"(B02 > {_ASTER_CLOUD_B02_MIN}, B04 > {_ASTER_CLOUD_B04_MIN}, "
-                f"BT < {_ASTER_CLOUD_BT_MAX_K:.0f} K when AST_08 paired)"
+                f"BT < {bt_threshold_k:.0f} K when AST_08 paired)"
             )
 
             if mask_feature and arcpy.Exists(mask_feature):
@@ -5838,6 +5900,7 @@ class AsterMosaic(object):
                     full_scenes, gdb_path, f"{mosaic_name}_VnirSwir",
                     scratch_dir, use_qa, mask_feature,
                     save_stats, _ASTER_MODE_FULL, "VNIR+SWIR (9-band)",
+                    bt_threshold_k=bt_threshold_k,
                 )
                 if output_full:
                     outputs.append(output_full)
@@ -5853,6 +5916,7 @@ class AsterMosaic(object):
                 kept_scenes, gdb_path, f"{mosaic_name}_Vnir",
                 scratch_dir, use_qa, mask_feature,
                 save_stats, _ASTER_MODE_VNIR, "VNIR-only (3-band)",
+                bt_threshold_k=bt_threshold_k,
             )
             if output_vnir:
                 outputs.append(output_vnir)
@@ -5894,6 +5958,7 @@ class AsterMosaic(object):
     def _run_mosaic_pipeline(
         self, scenes, gdb_path, output_name, scratch_dir,
         use_qa, mask_feature, save_stats, mode, label,
+        bt_threshold_k=None,
     ):
         """Run Phases 3-5 over a scene list in one of the supported modes.
 
@@ -5952,7 +6017,10 @@ class AsterMosaic(object):
             )
             scene_start = datetime.now()
             try:
-                stacked = self._process_scene(scene, scratch_dir, use_qa, mode)
+                stacked = self._process_scene(
+                    scene, scratch_dir, use_qa, mode,
+                    bt_threshold_k=bt_threshold_k,
+                )
             except Exception as e:
                 arcpy.AddWarning(f"  ✗ {scene['scene_id']}: {e}")
                 arcpy.SetProgressorPosition(idx)
@@ -6259,7 +6327,8 @@ class AsterMosaic(object):
         files = scene.get("files") or {}
         return all(b in files for b in _ASTER_SWIR_BANDS)
 
-    def _process_scene(self, scene, scratch_dir, use_qa, mode):
+    def _process_scene(self, scene, scratch_dir, use_qa, mode,
+                       bt_threshold_k=None):
         """Apply scale + resample + QA mask + stack → single multi-band raster.
 
         Parameters
@@ -6379,9 +6448,13 @@ class AsterMosaic(object):
         # (cold but not bright) and reduces false positives over warm
         # bare ground. Combined with VIS/SWIR via OR: either signal is
         # sufficient.
+        bt_threshold = (
+            float(bt_threshold_k) if bt_threshold_k is not None
+            else _ASTER_CLOUD_BT_MAX_K
+        )
         bt_kelvin = self._load_bt_kelvin(scene.get("thermal"), scratch_dir, scene_id)
         if bt_kelvin is not None:
-            cloud_mask = cloud_vis_swir | (bt_kelvin < _ASTER_CLOUD_BT_MAX_K)
+            cloud_mask = cloud_vis_swir | (bt_kelvin < bt_threshold)
         else:
             cloud_mask = cloud_vis_swir
 
@@ -6538,10 +6611,14 @@ class AsterMosaic(object):
         test. Returns ``None`` when no thermal pairing exists or the
         load fails (the caller falls back to VIS/SWIR-only cloud detection).
 
-        AST_08 V004 COG TIFFs export already-scaled Kelvin, so no scale
-        factor is applied. NoData (stored as 0 K, and the float32 sentinel
-        Resample can introduce near scene edges) is screened with a
-        single ``SetNull`` against ``_ASTER_TIR_VALID_K_FLOOR``.
+        AST_08 V004 stores Surface Kinetic Temperature as Int16 with a
+        scale factor of 0.1 (DN × 0.1 = Kelvin) — the LP DAAC product
+        spec confirmed by the May 2026 Faial diagnostic that found raw
+        BT values of 2700-3000 instead of the 270-300 K range expected.
+        We multiply by ``_ASTER_TIR_SCALE`` after the Resample and then
+        screen NoData (stored as 0 DN and the float32 sentinel
+        Resample can introduce near scene edges) with a single
+        ``SetNull`` against ``_ASTER_TIR_VALID_K_FLOOR``.
         """
         if not thermal_meta:
             return None
@@ -6564,8 +6641,9 @@ class AsterMosaic(object):
         try:
             resampled = os.path.join(scratch_dir, f"{scene_id}_BT_15m.tif")
             arcpy.management.Resample(bt_src, resampled, 15, "BILINEAR")
-            bt_raster = Float(arcpy.sa.Raster(resampled))
-            return arcpy.sa.SetNull(bt_raster < _ASTER_TIR_VALID_K_FLOOR, bt_raster)
+            bt_dn = Float(arcpy.sa.Raster(resampled))
+            bt_kelvin = bt_dn * _ASTER_TIR_SCALE
+            return arcpy.sa.SetNull(bt_kelvin < _ASTER_TIR_VALID_K_FLOOR, bt_kelvin)
         except Exception as e:
             arcpy.AddWarning(
                 f"  ✗ {scene_id}: AST_08 BT load failed ({e}); "
@@ -6582,7 +6660,7 @@ class AsterMosaic(object):
         if not output_raster_path or not scenes_used:
             return
         try:
-            csv_path = f"{output_raster_path}_provenance.csv"
+            csv_path = _sidecar_path_for_raster(output_raster_path, "_provenance.csv")
             now_iso = datetime.now().isoformat(timespec="seconds")
             with open(csv_path, "w", encoding="utf-8", newline="") as fh:
                 writer = csv.writer(fh, quoting=csv.QUOTE_MINIMAL)
