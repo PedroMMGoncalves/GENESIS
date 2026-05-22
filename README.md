@@ -73,7 +73,7 @@ Each mosaic is shipped with a `{name}_bands.csv` sidecar documenting `band_index
 - **ArcGIS Pro 3.0 or higher**
 - **Spatial Analyst** extension (required for all six tools)
 - **Image Analyst** extension (used by Mosaic and Transformations)
-- Python 3.9+ with `numpy` and `scipy` — both included with ArcGIS Pro's bundled Python (no other ML or scientific-computing dependencies; the FastICA used in Tool 05 is a pure-numpy in-house implementation)
+- Python 3.9+ with `numpy`, `scipy` and `matplotlib` — all three included with ArcGIS Pro's bundled Python (no other ML or scientific-computing dependencies; the FastICA used in Tool 05 is a pure-numpy in-house implementation, and `matplotlib` is used only by Tool 05's HTML report generator with the headless `Agg` backend)
 - `osgeo.gdal` (also bundled with ArcGIS Pro) — used by Tool 03 for HDF input
 
 ---
@@ -103,9 +103,9 @@ Each mosaic is shipped with a `{name}_bands.csv` sidecar documenting `band_index
 - Reflectance: **float 0–1** (analysis-friendly; Sentinel-2 ×0.0001, ASTER ×0.001 applied during ingestion)
 - Mosaic CRS: inherited from input (UTM for Landsat / S2; resample-aligned for ASTER)
 - Each mosaic: **multi-band GeoTIFF or geodatabase raster + `_provenance.csv` + `_bands.csv`** (band-mapping sidecar documenting which stack position is which satellite band)
-- Transformation statistics: **`.npz` (NumPy archive)** for re-applying to new AOIs
+- Transformation statistics: each Tool 05 run emits THREE sidecars sharing the output raster's basename — a **`.npz`** (NumPy archive — machine-reloadable, so the fitted PCA/MNF/ICA can be re-applied to a new AOI without refitting), a **`.txt`** (human-readable numerical summary: eigenvalues, eigenvectors / mixing matrices, variance explained, mutual information, kurtosis — whichever applies) and a **`_report.html`** (self-contained dashboard with embedded matplotlib PNGs: scree / SNR / kurtosis plots and a loadings heatmap labelled with the satellite band names from `_bands.csv`). The HTML opens in any browser, works offline, and ships no external assets
 - Tool 04 outputs: when the workspace is a **folder**, indices and composites are written to sibling `indices/` and `composites/` subfolders (forced GeoTIFF, no 13-character ESRI-GRID name limit). When the workspace is a **`.gdb`**, both products are saved flat at the workspace root with no extension (geodatabases have no name-length limit and don't support nested folders).
-- Tool 05 outputs: the same folder / `.gdb` split applies. Folder workspaces get a per-transform subfolder (`pca/`, `mnf/`, or `ica/`) with the result saved as a `.tif`; `.gdb` workspaces save flat at the workspace root with no extension. Statistics (`.npz` for PCA, `.txt` for MNF/ICA) continue to land in the explicit *Statistics Folder* parameter regardless of workspace type.
+- Tool 05 outputs: the same folder / `.gdb` split applies. Folder workspaces get a per-transform subfolder (`pca/`, `mnf/`, or `ica/`) with the result saved as a `.tif`; `.gdb` workspaces save flat at the workspace root with no extension. Statistics (the `.npz` reloadable archive, the `.txt` human summary, and the `_report.html` dashboard, all three emitted for every transform) are co-located with the data by default — same folder as the `.tif` for folder workspaces, parent folder of the `.gdb` for geodatabase workspaces (GDB cannot store these sidecars). Set the optional *Statistics Folder* parameter explicitly to override the placement.
 - Each mosaic's median output is sanity-checked after save: per-band MIN / MEAN / MAX are logged, and a warning is emitted if any band's mean is suspiciously close to zero for that sensor's expected reflectance range — catches the class of NoData-handling regression that would otherwise pass type-checking and structural validation while producing visually-broken outputs.
 
 ---

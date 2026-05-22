@@ -6856,9 +6856,15 @@ class Transformations(object):
         )
         save_stats.value = True
         
-        # Statistics folder
+        # Statistics folder. Empty by default — the tool co-locates the
+        # .npz / .txt sidecar with the output raster (same folder for
+        # folder workspaces, GDB's parent folder for .gdb / .sde). Set
+        # explicitly only to override that placement.
         stats_folder = arcpy.Parameter(
-            displayName="Statistics Folder",
+            displayName=(
+                "Statistics Folder (optional — leave empty to co-locate "
+                "the .npz / .txt with the output raster)"
+            ),
             name="stats_folder",
             datatype="DEFolder",
             parameterType="Optional",
@@ -6953,19 +6959,13 @@ class Transformations(object):
                 except Exception as e:
                     arcpy.AddWarning(f"Error counting bands: {str(e)}")
             
-            # Set default stats folder if save_stats is enabled but folder not specified
-            if save_stats.value and not stats_folder.altered:
-                # Default to user documents
-                default_folder = os.path.expanduser("~/Documents/ArcGIS/Statistics")
-                if not os.path.exists(default_folder):
-                    try:
-                        os.makedirs(default_folder)
-                    except OSError:
-                        pass
-                
-                if os.path.exists(default_folder):
-                    stats_folder.value = default_folder
-        
+            # Statistics Folder: left empty by default. The execute() path
+            # derives a sensible default — same folder as the output raster
+            # (folder workspace) or the GDB's parent folder (GDB
+            # workspace) — so the .npz / .txt always lands next to the
+            # data it describes. The user can still override by filling
+            # in the parameter explicitly.
+
         except Exception as e:
             arcpy.AddWarning(f"Error updating parameters: {str(e)}")
             
@@ -7059,26 +7059,6 @@ class Transformations(object):
             }
             
             try:
-                # Create or use specified statistics folder
-                if save_stats:
-                    if stats_folder_param:
-                        stats_folder = stats_folder_param
-                        # Ensure the folder exists
-                        if not os.path.exists(stats_folder):
-                            os.makedirs(stats_folder)
-                    else:
-                        # Default to user's documents folder if not specified
-                        stats_folder = os.path.expanduser("~/Documents/ArcGIS/Statistics")
-                        if not os.path.exists(stats_folder):
-                            os.makedirs(stats_folder)
-                    
-                    # PCA persists a PCAStatistics .npz (reloadable); MNF/ICA write a .txt summary.
-                    stats_ext = "npz" if transform_type == "PCA" else "txt"
-                    stats_file = os.path.join(stats_folder, f"{out_name}_{transform_type}_stats.{stats_ext}")
-                else:
-                    stats_file = None
-                    stats_folder = None
-                
                 # Output path for result. Folder workspaces route the
                 # raster into a per-transform subfolder (``pca/`` /
                 # ``mnf/`` / ``ica/``) with a forced ``.tif`` extension;
@@ -7086,6 +7066,52 @@ class Transformations(object):
                 out_path = _build_workspace_subfolder_path(
                     out_workspace, out_name, transform_type.lower(),
                 )
+
+                # Statistics file destination. Honour an explicit
+                # ``Statistics Folder`` if the user supplied one;
+                # otherwise co-locate with the output raster — same
+                # folder as the .tif for folder workspaces, GDB's
+                # parent folder for .gdb / .sde (GDBs can't store
+                # .npz / .txt sidecars). Named after the output raster
+                # so the pairing is obvious in the file browser.
+                if save_stats:
+                    if stats_folder_param:
+                        stats_folder = stats_folder_param
+                    else:
+                        ws_lower = (out_workspace or "").lower().rstrip("\\/")
+                        if ws_lower.endswith(".gdb") or ws_lower.endswith(".sde"):
+                            stats_folder = os.path.dirname(os.path.normpath(out_workspace))
+                        else:
+                            stats_folder = os.path.dirname(out_path)
+                    os.makedirs(stats_folder, exist_ok=True)
+                    # All three transforms emit THREE artifacts:
+                    #   .npz  — binary numpy archive, machine-reloadable
+                    #           so the fitted transform can be re-applied
+                    #           to a new AOI without refitting (see the
+                    #           module-level transform_pca / transform_mnf
+                    #           / transform_ica helpers — they accept a
+                    #           loaded {PCA,MNF,ICA}Statistics object).
+                    #   .txt  — human-readable summary (eigenvalues,
+                    #           variance explained, mixing matrices,
+                    #           independence metrics — whichever applies).
+                    #   .html — self-contained dashboard with embedded
+                    #           matplotlib PNGs (scree / SNR / kurtosis
+                    #           plots + loadings heatmap labelled with
+                    #           satellite band names when available).
+                    stats_file_npz = os.path.join(
+                        stats_folder, f"{out_name}_{transform_type}_stats.npz",
+                    )
+                    stats_file_txt = os.path.join(
+                        stats_folder, f"{out_name}_{transform_type}_stats.txt",
+                    )
+                    stats_file_html = os.path.join(
+                        stats_folder, f"{out_name}_{transform_type}_report.html",
+                    )
+                else:
+                    stats_file_npz = None
+                    stats_file_txt = None
+                    stats_file_html = None
+                    stats_folder = None
                 
                 # All transforms (PCA, MNF, ICA) share the in-tree NumPy implementation.
                 arcpy.AddMessage("Using custom implementation...")
@@ -7325,20 +7351,57 @@ class Transformations(object):
                         'output_path': output_path
                     }
                     
-                    # Save statistics if requested. PCA persists the full
-                    # PCAStatistics as .npz (reloadable for re-application);
-                    # MNF/ICA write human-readable .txt summaries.
+                    # Save statistics if requested. Always write BOTH a
+                    # reloadable .npz (so the fitted transform can be
+                    # re-applied to a new AOI) and a human-readable .txt
+                    # summary (for at-a-glance inspection in any editor).
                     if save_stats:
-                        arcpy.AddMessage(f"Saving statistics to: {stats_file}")
+                        arcpy.AddMessage(f"Reloadable statistics: {stats_file_npz}")
+                        if not transform_stats.save(stats_file_npz):
+                            for err in transform_stats.errors:
+                                arcpy.AddWarning(
+                                    f"{transform_type}Statistics.save: {err}"
+                                )
 
+                        arcpy.AddMessage(f"Human-readable summary: {stats_file_txt}")
                         if transform_type == "PCA":
-                            if not transform_stats.save(stats_file):
-                                for err in transform_stats.errors:
-                                    arcpy.AddWarning(f"PCAStatistics.save: {err}")
+                            self._save_pca_statistics_txt(
+                                stats_file_txt, data_info, transform_stats,
+                            )
                         elif transform_type == "MNF":
-                            self._save_mnf_statistics_txt(stats_file, data_info, transform_stats)
+                            self._save_mnf_statistics_txt(
+                                stats_file_txt, data_info, transform_stats,
+                            )
                         else:  # ICA
-                            self._save_ica_statistics_txt(stats_file, data_info, transform_stats)
+                            self._save_ica_statistics_txt(
+                                stats_file_txt, data_info, transform_stats,
+                            )
+
+                        # HTML dashboard. Detect the sensor from the first
+                        # input raster so the loadings heatmap can label
+                        # rows with satellite band names ("B04 (Red)")
+                        # rather than generic "Band 4".
+                        try:
+                            sensor_const = detect_sensor(input_rasters[0]) if input_rasters else None
+                            sensor_to_layout = {
+                                SENSOR_LANDSAT_89: "landsat",
+                                SENSOR_SENTINEL2: "sentinel-2",
+                                SENSOR_ASTER: "aster",
+                            }
+                            sensor_key = sensor_to_layout.get(sensor_const)
+                            # 3-band ASTER VNIR mosaics use a separate layout.
+                            if sensor_key == "aster" and (
+                                stats_obj_bands := getattr(transform_stats, "band_means", None)
+                            ) is not None and len(stats_obj_bands) == 3:
+                                sensor_key = "aster-vnir"
+                            self._generate_html_report(
+                                stats_file_html, transform_type, transform_stats,
+                                data_info, sensor_key=sensor_key,
+                            )
+                        except Exception as e:
+                            arcpy.AddWarning(
+                                f"HTML report generation failed (non-fatal): {e}"
+                            )
                     
                     # Update final statistics
                     stats['end_time'] = datetime.now()
@@ -7818,6 +7881,366 @@ class Transformations(object):
             arcpy.AddError(traceback.format_exc())
             return None
     
+    @staticmethod
+    def _get_pyplot():
+        """Lazy headless-matplotlib import. Returns ``pyplot`` on
+        success or ``None`` if matplotlib is missing (in which case
+        callers skip HTML report generation with a warning). Re-imports
+        are cheap — Python caches the module after the first call.
+        """
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            return plt
+        except Exception:
+            return None
+
+    @staticmethod
+    def _plot_to_base64_png(plt, fig, dpi=120):
+        """Render a Matplotlib figure to a base64-encoded PNG data URI.
+
+        Used by ``_generate_html_report`` to embed every plot directly
+        in the HTML output — no sidecar PNGs to ship, the report is one
+        self-contained file. Closes the figure to release backend
+        resources so a long ICA/MNF run does not accumulate handles.
+        """
+        import base64
+        from io import BytesIO
+        buf = BytesIO()
+        fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        return f"data:image/png;base64,{b64}"
+
+    def _generate_html_report(self, html_file, transform_type, stats_obj,
+                               data_info, sensor_key=None):
+        """Write a self-contained HTML dashboard summarising a fitted
+        PCA / MNF / ICA result.
+
+        The report is a static HTML page with embedded base64 PNGs —
+        renders in any browser, works offline, no external assets. It
+        complements (does not replace) the ``.npz`` reloadable archive
+        and the ``.txt`` numerical summary that the tool also writes.
+        When ``sensor_key`` is supplied, loadings heatmap rows are
+        labelled with the satellite band names from ``_BAND_LAYOUT``
+        (``B04 (Red)`` rather than ``Band 4``) — the same UX win the
+        ``_bands.csv`` sidecar gives outside this report.
+        """
+        plt = self._get_pyplot()
+        if plt is None:
+            arcpy.AddWarning(
+                "HTML report skipped — matplotlib not available in this "
+                "Python environment."
+            )
+            return
+
+        layout = _BAND_LAYOUT.get(sensor_key or "") if sensor_key else None
+        input_band_labels = (
+            [f"{row[1]} ({row[2]})" for row in layout] if layout else None
+        )
+
+        # ---- Build the per-transform plots ----
+        plot_blocks = []  # list of (title, data_uri, optional caption)
+
+        if transform_type == "PCA":
+            ev = np.asarray(stats_obj.eigenvalues, dtype=float)
+            evec = np.asarray(stats_obj.eigenvectors, dtype=float)
+            total = ev.sum() if ev.sum() else 1.0
+            var_pct = 100.0 * ev / total
+            cumvar = np.cumsum(var_pct)
+
+            # Scree plot
+            n_show = min(20, len(ev))
+            fig, ax1 = plt.subplots(figsize=(10, 5))
+            ax1.bar(range(1, n_show + 1), var_pct[:n_show],
+                    color="#3498db", label="Variance per component (%)")
+            ax1.set_xlabel("Component"); ax1.set_ylabel("Variance (%)", color="#3498db")
+            ax1.tick_params(axis="y", labelcolor="#3498db")
+            ax2 = ax1.twinx()
+            ax2.plot(range(1, n_show + 1), cumvar[:n_show],
+                     color="#e74c3c", marker="o", label="Cumulative (%)")
+            ax2.set_ylabel("Cumulative (%)", color="#e74c3c")
+            ax2.set_ylim(0, 105)
+            ax2.tick_params(axis="y", labelcolor="#e74c3c")
+            fig.suptitle(f"PCA Scree Plot — top {n_show} components")
+            fig.tight_layout()
+            plot_blocks.append((
+                "Scree plot",
+                self._plot_to_base64_png(plt, fig),
+                f"Variance per component + cumulative ({cumvar[n_show-1]:.1f}% at PC{n_show}).",
+            ))
+
+            # Loadings heatmap
+            plot_blocks.append(
+                self._loadings_heatmap_block(
+                    plt, "PCA loadings", evec, input_band_labels, n_components=n_show,
+                )
+            )
+
+        elif transform_type == "MNF":
+            ev = np.asarray(stats_obj.eigenvalues, dtype=float)
+            evec = np.asarray(stats_obj.eigenvectors, dtype=float)
+            snr = ev - 1.0
+            n_show = min(20, len(ev))
+
+            # SNR (signal-to-noise) plot — eigenvalue minus 1 in whitened space.
+            fig, ax = plt.subplots(figsize=(10, 5))
+            colors = ["#27ae60" if s >= 1.0 else "#bdc3c7" for s in snr[:n_show]]
+            ax.bar(range(1, n_show + 1), snr[:n_show], color=colors)
+            ax.axhline(1.0, color="red", linestyle="--", linewidth=1, label="SNR = 1")
+            ax.set_xlabel("MNF component"); ax.set_ylabel("SNR (eigenvalue − 1)")
+            ax.set_title(f"MNF SNR — top {n_show} components")
+            ax.legend(loc="upper right")
+            fig.tight_layout()
+            plot_blocks.append((
+                "Signal-to-noise plot",
+                self._plot_to_base64_png(plt, fig),
+                "Components above the red line (SNR ≥ 1) carry more signal than noise.",
+            ))
+
+            plot_blocks.append(
+                self._loadings_heatmap_block(
+                    plt, "MNF loadings", evec, input_band_labels, n_components=n_show,
+                )
+            )
+
+        else:  # ICA
+            kurt = (np.asarray(stats_obj.kurtosis_values, dtype=float)
+                    if stats_obj.kurtosis_values is not None else np.array([]))
+            mixing = np.asarray(stats_obj.mixing_matrix, dtype=float)
+            n_show = mixing.shape[1] if mixing.size else 0
+
+            if kurt.size:
+                fig, ax = plt.subplots(figsize=(10, 5))
+                colors = ["#27ae60" if abs(k) > 1.0 else "#bdc3c7" for k in kurt]
+                ax.bar(range(1, len(kurt) + 1), kurt, color=colors)
+                ax.axhline(0, color="black", linewidth=0.5)
+                ax.set_xlabel("ICA component")
+                ax.set_ylabel("Kurtosis (Gaussian → 0)")
+                ax.set_title("ICA kurtosis — non-Gaussianity per component")
+                fig.tight_layout()
+                plot_blocks.append((
+                    "Kurtosis",
+                    self._plot_to_base64_png(plt, fig),
+                    "Components with |kurtosis| > 1 (green) are reliably non-Gaussian — "
+                    "the ICA target.",
+                ))
+
+            if mixing.size:
+                plot_blocks.append(
+                    self._loadings_heatmap_block(
+                        "ICA mixing matrix (A)", mixing,
+                        input_band_labels, n_components=n_show,
+                    )
+                )
+
+        # ---- Compose the HTML ----
+        run_ts = datetime.now().isoformat(timespec="seconds")
+        n_components = (
+            len(stats_obj.eigenvalues) if hasattr(stats_obj, "eigenvalues")
+            and stats_obj.eigenvalues is not None else "-"
+        )
+        n_input_bands = (
+            len(stats_obj.band_means) if stats_obj.band_means is not None else "-"
+        )
+        inputs_html = "".join(
+            f"<li><code>{p}</code></li>" for p in data_info.get("input_rasters", [])
+        ) or "<li>(none recorded)</li>"
+
+        html_chunks = []
+        html_chunks.append(f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>{transform_type} report — {os.path.basename(data_info.get('output_path', 'output'))}</title>
+<style>
+  body {{ font-family: 'Segoe UI', Arial, sans-serif; margin: 20px; background: #f5f5f5; color: #2c3e50; }}
+  .container {{ max-width: 1200px; margin: 0 auto; }}
+  h1 {{ color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 8px; }}
+  h2 {{ color: #34495e; margin-top: 30px; }}
+  .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                  gap: 12px; margin: 18px 0; }}
+  .stat-card {{ background: white; border-radius: 8px; padding: 14px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.08); text-align: center; }}
+  .stat-value {{ font-size: 1.9em; font-weight: 600; color: #2980b9; }}
+  .stat-label {{ color: #7f8c8d; font-size: 0.85em; margin-top: 4px; }}
+  .plot-card {{ background: white; border-radius: 8px; padding: 16px; margin: 18px 0;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.08); }}
+  .plot-card img {{ max-width: 100%; height: auto; display: block; margin: 0 auto; }}
+  .caption {{ color: #7f8c8d; font-size: 0.9em; margin-top: 8px; text-align: center; }}
+  table {{ border-collapse: collapse; width: 100%; margin: 10px 0;
+           background: white; border-radius: 8px; overflow: hidden;
+           box-shadow: 0 2px 4px rgba(0,0,0,0.08); }}
+  th {{ background: #3498db; color: white; padding: 10px; text-align: left; }}
+  td {{ padding: 8px 10px; border-bottom: 1px solid #eee; }}
+  tr:hover td {{ background: #f0f7ff; }}
+  .meta {{ font-size: 0.9em; color: #5d6d7e; }}
+  code {{ font-family: Consolas, monospace; font-size: 0.9em; color: #2c3e50; }}
+</style></head><body><div class="container">
+<h1>{transform_type} report</h1>
+<div class="meta">
+  Output raster: <code>{data_info.get('output_path', '?')}</code><br>
+  Generated: {run_ts}
+</div>
+<div class="stats-grid">
+  <div class="stat-card"><div class="stat-value">{transform_type}</div>
+    <div class="stat-label">Transform</div></div>
+  <div class="stat-card"><div class="stat-value">{n_input_bands}</div>
+    <div class="stat-label">Input bands</div></div>
+  <div class="stat-card"><div class="stat-value">{n_components}</div>
+    <div class="stat-label">Components fitted</div></div>
+  <div class="stat-card"><div class="stat-value">{sensor_key or "?"}</div>
+    <div class="stat-label">Sensor</div></div>
+</div>
+<h2>Input rasters</h2>
+<ul>{inputs_html}</ul>
+""")
+
+        # Top-N component table (eigenvalue / variance / cumulative)
+        if hasattr(stats_obj, "eigenvalues") and stats_obj.eigenvalues is not None:
+            ev = np.asarray(stats_obj.eigenvalues, dtype=float)
+            total = ev.sum() if ev.sum() else 1.0
+            var_pct = 100.0 * ev / total
+            cumvar = np.cumsum(var_pct)
+            n_top = min(20, len(ev))
+            row_html = []
+            for i in range(n_top):
+                row_html.append(
+                    f"<tr><td>{transform_type}{i+1}</td>"
+                    f"<td>{ev[i]:.6f}</td>"
+                    f"<td>{var_pct[i]:.4f}</td>"
+                    f"<td>{cumvar[i]:.2f}</td></tr>"
+                )
+            html_chunks.append(
+                "<h2>Top components</h2><table>"
+                "<tr><th>Component</th><th>Eigenvalue</th><th>Variance (%)</th>"
+                "<th>Cumulative (%)</th></tr>"
+                + "".join(row_html) + "</table>"
+            )
+
+        for title, img_uri, caption in plot_blocks:
+            html_chunks.append(
+                f'<div class="plot-card"><h2>{title}</h2>'
+                f'<img src="{img_uri}" alt="{title}">'
+                f'<div class="caption">{caption}</div></div>'
+            )
+
+        html_chunks.append("</div></body></html>")
+        try:
+            with open(html_file, "w", encoding="utf-8") as fh:
+                fh.write("".join(html_chunks))
+            arcpy.AddMessage(f"HTML report: {html_file}")
+        except OSError as e:
+            arcpy.AddWarning(f"Could not write HTML report ({e})")
+
+    def _loadings_heatmap_block(self, plt, title, matrix, input_band_labels,
+                                 n_components=20):
+        """Render the input-band → component loadings as a heatmap PNG
+        and return a ``(title, data_uri, caption)`` tuple ready for
+        ``_generate_html_report`` to drop into the HTML.
+
+        ``matrix`` is the eigenvector / mixing matrix with shape
+        ``(input_bands, components)``. When ``input_band_labels`` is
+        supplied (from ``_BAND_LAYOUT``), the y-axis is labelled with
+        the satellite band names — otherwise generic ``Band N``.
+        """
+        m = np.asarray(matrix, dtype=float)
+        if m.size == 0:
+            return (title, "", "(no data)")
+        n_comp = min(int(n_components), m.shape[1])
+        m_show = m[:, :n_comp]
+        n_input = m_show.shape[0]
+        labels = (input_band_labels[:n_input] if input_band_labels
+                  else [f"Band {i+1}" for i in range(n_input)])
+
+        height = max(3.0, 0.35 * n_input + 1.2)
+        fig, ax = plt.subplots(figsize=(min(12, 0.6 * n_comp + 3), height))
+        vmax = float(np.abs(m_show).max() or 1.0)
+        im = ax.imshow(m_show, cmap="RdBu_r", vmin=-vmax, vmax=vmax,
+                       aspect="auto")
+        ax.set_xticks(range(n_comp))
+        ax.set_xticklabels([f"C{i+1}" for i in range(n_comp)])
+        ax.set_yticks(range(n_input))
+        ax.set_yticklabels(labels)
+        ax.set_xlabel("Component")
+        ax.set_title(title)
+        fig.colorbar(im, ax=ax, shrink=0.85, label="loading")
+        fig.tight_layout()
+        return (
+            title,
+            self._plot_to_base64_png(plt, fig),
+            "Diverging palette — blue = negative loading, red = positive. "
+            "Strong colours mark which input bands drive each component.",
+        )
+
+    def _save_pca_statistics_txt(self, stats_file, data_info, pca_stats):
+        """Save PCA statistics as a human-readable .txt summary.
+
+        Mirror of ``_save_mnf_statistics_txt`` / ``_save_ica_statistics_txt`` —
+        the fitted matrices live alongside this in the ``.npz``
+        reloadable archive; the ``.txt`` is the at-a-glance summary that
+        opens in any text editor and lists the band means, covariance
+        matrix, eigenvalues + eigenvectors and the percent / cumulative
+        variance explained.
+        """
+        try:
+            with open(stats_file, 'w', encoding='utf-8') as f:
+                # Header
+                f.write("# Data file produced by Principal Component Analysis (PCA) Transform\n")
+                f.write("#\tInput raster(s):\n")
+                for raster_path in data_info.get('input_rasters', []):
+                    f.write(f"#\t\t{raster_path}\n")
+                f.write(f"#\tThe number of components = {len(pca_stats.eigenvalues)}\n")
+                f.write(f"#\tOutput raster(s):\n")
+                f.write(f"#\t\t{data_info.get('output_path', 'Not specified')}\n\n")
+
+                num_bands = len(pca_stats.band_means)
+
+                # Band Means
+                f.write("#                    BAND MEANS\n\n")
+                f.write("# Input Band   Mean\n")
+                f.write("#  --------------------------------------------------------------------------\n")
+                for i, mean in enumerate(pca_stats.band_means):
+                    f.write(f"        {i+1:d}       {mean:14.6e}\n")
+                f.write("#  ==========================================================================\n\n")
+
+                # Covariance Matrix
+                if pca_stats.covariance_matrix is not None:
+                    f.write("#                    COVARIANCE MATRIX\n\n")
+                    f.write("#    Layer         " + "".join([f"{i+1:14d}" for i in range(num_bands)]) + "\n")
+                    f.write("#  --------------------------------------------------------------------------\n")
+                    for i in range(pca_stats.covariance_matrix.shape[0]):
+                        f.write(f"        {i+1:d}       " + "".join([f"{x:14.6e}" for x in pca_stats.covariance_matrix[i,:]]) + "\n")
+                    f.write("#  ==========================================================================\n\n")
+
+                # Eigenvalues + Eigenvectors
+                f.write("#                    EIGENVALUES + EIGENVECTORS\n\n")
+                f.write("# Number of Input Layers     Number of PCA Component Layers\n")
+                f.write(f"            {num_bands:d}                              {len(pca_stats.eigenvalues):d}\n")
+                f.write("# PCA Layer        " + "".join([f"{i+1:14d}" for i in range(len(pca_stats.eigenvalues))]) + "\n")
+                f.write("#  --------------------------------------------------------------------------\n")
+                f.write("# Eigenvalues\n")
+                f.write("               " + "".join([f"{x:14.5f}" for x in pca_stats.eigenvalues]) + "\n")
+
+                f.write("# Eigenvectors (input-band loadings; columns = components)\n")
+                f.write("# Input Layer\n")
+                for i in range(pca_stats.eigenvectors.shape[0]):
+                    f.write(f"        {i+1:d}       " + "".join([f"{x:14.5f}" for x in pca_stats.eigenvectors[i,:]]) + "\n")
+                f.write("#  ==========================================================================\n\n")
+
+                # Percent and Accumulative Variance Explained
+                f.write("#                 PERCENT AND ACCUMULATIVE VARIANCE EXPLAINED\n\n")
+                f.write("# PCA Layer   EigenValue   Percent of Variance   Accumulative of Variance\n")
+
+                total_var = sum(pca_stats.eigenvalues)
+                cumulative = 0.0
+                for i, ev in enumerate(pca_stats.eigenvalues):
+                    percent = (ev / total_var) * 100.0 if total_var else 0.0
+                    cumulative += percent
+                    f.write(f"        {i+1:d} {ev:14.5f}          {percent:7.4f}               {cumulative:7.4f}\n")
+                f.write("#  ==========================================================================\n")
+        except Exception as e:
+            arcpy.AddWarning(f"Error saving PCA statistics to text file: {str(e)}")
+
     def _save_mnf_statistics_txt(self, stats_file, data_info, mnf_stats):
         """
         Save MNF statistics in text format
