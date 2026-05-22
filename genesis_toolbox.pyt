@@ -7331,6 +7331,16 @@ class Transformations(object):
                 if len(parameters) > 10 and parameters[10].value is not None
                 else 42
             )
+            # parameters[11] is the sensor selector (read inline via
+            # ``resolve_sensor`` later). parameters[12] is the optional
+            # AOI mask feature applied to the final multiband output
+            # via ``ExtractByMask`` once the eigendecomposition + save
+            # have finished.
+            aoi_mask_feature = (
+                parameters[12].valueAsText
+                if len(parameters) > 12 and parameters[12].value is not None
+                else None
+            )
             
             # Initialize statistics
             stats = {
@@ -7499,12 +7509,37 @@ class Transformations(object):
                     
                     arcpy.AddMessage(f"  Final array shape: {data_array.shape}")
                     
-                    # Handle NoData values
+                    # Handle NoData values via three layered defences,
+                    # because file-geodatabase rasters expose NoData
+                    # inconsistently:
+                    #
+                    #   1. ``raster_obj.noDataValue`` — the easy case;
+                    #      when arcpy reports an explicit fill value
+                    #      we mask exactly those pixels.
+                    #   2. ``arcpy.sa.IsNull`` on band 1 — the canonical
+                    #      Pro way to detect NoData, works regardless
+                    #      of whether the value is stored in band-level
+                    #      metadata, raster-level metadata, or via the
+                    #      raster's mask layer. The (1) branch above
+                    #      misses many GDB configs where
+                    #      ``raster_obj.noDataValue`` returns ``None``
+                    #      even though the band carries a real NoData
+                    #      mask — ``IsNull`` finds those.
+                    #   3. All-band-zero numpy check — catches the
+                    #      remaining case where the input was
+                    #      AOI-masked but the outside-AOI pixels were
+                    #      written at value 0 with no NoData metadata
+                    #      at all.
+                    #
+                    # Each defence sets the corresponding pixels to
+                    # ``np.nan`` in ``data_array`` so the PCA / MNF /
+                    # ICA eigendecomposition skips them and the
+                    # NoData footprint propagates to every component
+                    # via ``NumPyArrayToRaster(value_to_nodata=np.nan)``.
                     arcpy.AddMessage("Handling NoData values...")
                     data_array = data_array.astype(float)
 
-                    # Apply the raster's explicit NoData value when
-                    # one is set in the source's metadata.
+                    # Defence 1 — explicit raster-level noDataValue.
                     try:
                         if hasattr(raster_obj, 'noDataValue') and raster_obj.noDataValue is not None:
                             no_data = raster_obj.noDataValue
@@ -7512,24 +7547,48 @@ class Transformations(object):
                                 data_array[:, :, i][data_array[:, :, i] == no_data] = np.nan
                             arcpy.AddMessage(f"Applied NoData value: {no_data}")
                         else:
-                            arcpy.AddMessage("No explicit NoData value in raster metadata.")
+                            arcpy.AddMessage("No explicit raster-level NoData value.")
                     except Exception as e:
                         arcpy.AddWarning(f"Error applying explicit NoData: {str(e)}")
 
-                    # Defensive implicit-NoData detection: file-
-                    # geodatabase rasters frequently arrive with no
-                    # ``noDataValue`` set in metadata, but their
-                    # outside-AOI fill pixels are written with all
-                    # bands at zero (the U16 default fill). Without
-                    # this guard the transform treats those fill
-                    # pixels as valid samples — the PCA / MNF / ICA
-                    # eigendecomposition then learns from them and the
-                    # output has visibly anomalous values in the
-                    # corners of the result extent (the
-                    # green / pink rectangles the user reported).
-                    # Mark all-zero pixels as NaN so the transforms
-                    # skip them and the NoData footprint propagates
-                    # to every component.
+                    # Defence 2 — ``arcpy.sa.IsNull`` on the whole
+                    # multi-band raster, then OR across bands to get
+                    # a single 2D "any band is NoData" mask. This is
+                    # Pro's native NoData detection: it sees through
+                    # band-level masks, GDB raster fill values and
+                    # any other storage form that ``Raster.noDataValue``
+                    # might fail to surface. Calling on the multi-band
+                    # raster directly avoids the ``{path}/Band_1``
+                    # syntax that fails for layer-name inputs
+                    # (``ERROR 000732`` we hit earlier in this
+                    # session).
+                    try:
+                        is_null_raster = arcpy.sa.IsNull(arcpy.Raster(raster_path))
+                        null_arr_raw = arcpy.RasterToNumPyArray(is_null_raster)
+                        # Collapse the multi-band IsNull result into
+                        # a single (h, w) "any band is NoData" mask.
+                        if null_arr_raw.ndim == 3:
+                            # Bands axis is the leading one in arcpy's
+                            # ``RasterToNumPyArray`` multi-band output.
+                            null_2d = null_arr_raw.any(axis=0).astype(bool)
+                        else:
+                            null_2d = null_arr_raw.astype(bool)
+                        n_null = int(null_2d.sum())
+                        if n_null:
+                            data_array[null_2d] = np.nan
+                            n_total = null_2d.size
+                            arcpy.AddMessage(
+                                f"IsNull NoData: {n_null} "
+                                f"({100*n_null/n_total:.1f}%) pixel(s) masked."
+                            )
+                    except Exception as e:
+                        arcpy.AddWarning(f"IsNull NoData detection failed: {e}")
+
+                    # Defence 3 — all-band-zero numpy check. Last
+                    # resort for rasters with no NoData metadata at
+                    # all but with outside-AOI fill at value 0 (the
+                    # U16 default Pro writes when there is no
+                    # ``noDataValue`` declared).
                     try:
                         all_zero = np.all(np.nan_to_num(data_array) == 0, axis=-1)
                         n_zero = int(all_zero.sum())
@@ -7537,11 +7596,11 @@ class Transformations(object):
                             data_array[all_zero] = np.nan
                             n_total = all_zero.size
                             arcpy.AddMessage(
-                                f"Implicit NoData: {n_zero} ({100*n_zero/n_total:.1f}%) "
-                                f"all-band-zero pixel(s) treated as NoData."
+                                f"All-band-zero NoData: {n_zero} "
+                                f"({100*n_zero/n_total:.1f}%) pixel(s) masked."
                             )
                     except Exception as e:
-                        arcpy.AddWarning(f"Implicit NoData detection failed: {e}")
+                        arcpy.AddWarning(f"All-band-zero detection failed: {e}")
 
                     arcpy.AddMessage("Handled NoData values")
                     
