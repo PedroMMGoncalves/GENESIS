@@ -9,18 +9,25 @@ abstract: >
   GENESIS is an ArcGIS Pro Python Toolbox for remote-sensing analysis of
   Sentinel-2 L2A, Landsat 8/9 Collection 2 Level 2, and ASTER L2 (AST_07XT)
   imagery in a single unified workflow. It provides cloud-masked
-  mosaicking with provenance tracking, sensor-aware spectral indices and
-  composites (~25 indices + ~8 composites covering vegetation, water,
-  built-up, and mineralogical / hydrothermal alteration targets),
-  PCA / MNF / ICA statistical transformations, and Spectral Angle Mapper
-  classification. Used to support analytical work for the GENESIS
+  mosaicking with provenance tracking and per-mosaic band-mapping
+  sidecars; sensor-aware spectral indices and composites (~25 indices
+  + ~8 composites covering vegetation, water, built-up, and
+  mineralogical / hydrothermal alteration targets);
+  PCA / MNF / ICA statistical transformations with reloadable
+  ``.npz`` archives, human-readable ``.txt`` summaries and a
+  self-contained HTML dashboard per run; Spectral Angle Mapper
+  classification; and per-pixel temporal statistics over a mosaic
+  scratch (NDVI moments + persistence, NDWI water occurrence, the
+  Lv 2013 GDV ratio and the Eamus/Naumburg dry-season floor — all
+  groundwater-dependent-vegetation indicators with published
+  precedent). Used to support analytical work for the GENESIS
   Horizon Europe project (genesisnbs.eu, grant agreement Nº 101157447),
   in particular processing satellite imagery over the Faial (Azores)
   demonstrator site — an aquifer storage and recovery study at
   Furo das Cancelas targeting saltwater intrusion mitigation.
 type: software
-version: "1.0.0"
-date-released: "2026-05-20"
+version: "2.0.0"
+date-released: "2026-05-22"
 license: Apache-2.0
 authors:
   - family-names: "Gonçalves"
@@ -41,6 +48,9 @@ keywords:
   - "cloud masking"
   - "geometric median"
   - "spectral angle mapper"
+  - "temporal statistics"
+  - "groundwater-dependent vegetation"
+  - "phreatophyte mapping"
 identifiers:
   # After minting the Zenodo DOI for your first release, paste the
   # concept DOI here (the one that always points to the latest version).

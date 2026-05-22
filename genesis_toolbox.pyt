@@ -442,6 +442,40 @@ def _sanitize_arcpy_name(name):
     return str(name).translate(_ARCPY_NAME_TRANSLATIONS)
 
 
+def _check_scratch_schema(reused_paths, expected_band_count, sensor_label):
+    """Refuse to resume from a scratch whose stacks have an
+    unexpected band count. Indicates the scratch was written by an
+    earlier code version with an incompatible layout (e.g., 10-band
+    S2 stacks when the current code emits 12 bands, or ASTER stacks
+    built before the BT scale fix).
+
+    Returns True when resume is safe to proceed (band counts match,
+    or there is nothing to reuse). Returns False when the caller
+    should abort and ask the user to delete the scratch folder.
+    """
+    if not reused_paths:
+        return True
+    try:
+        actual = int(arcpy.Raster(reused_paths[0]).bandCount)
+    except Exception as e:
+        arcpy.AddWarning(
+            f"  Resume schema check could not inspect "
+            f"{os.path.basename(reused_paths[0])} ({e}). "
+            "Continuing — please verify the final output visually."
+        )
+        return True
+    if actual != expected_band_count:
+        arcpy.AddError(
+            f"  Resume aborted: existing {sensor_label} stacks in "
+            f"scratch have {actual} band(s) but this code emits "
+            f"{expected_band_count}. The scratch was produced by an "
+            "earlier version of the toolbox and is incompatible. "
+            "Delete the scratch folder and re-run to rebuild."
+        )
+        return False
+    return True
+
+
 def _sidecar_path_for_raster(raster_path, suffix):
     """Resolve where a text sidecar (.csv / .npz / .html / .txt /
     ...) should be written for a given saved raster.
@@ -488,6 +522,78 @@ def _build_workspace_subfolder_path(out_workspace, name, subfolder):
     target_dir = os.path.join(out_workspace, subfolder)
     os.makedirs(target_dir, exist_ok=True)
     return os.path.join(target_dir, f"{name}.tif")
+
+
+# ---------------------------------------------------------------------------
+# Tool 07 helpers — temporal statistics over per-scene scratch stacks
+# ---------------------------------------------------------------------------
+
+# Dry-month sets per regional climate pattern. Mirrors
+# _seasonal_pattern_for_region (defined on each mosaic tool) but bucketed
+# into a single binary dry/wet axis suitable for Tool 07's temporal
+# stratification. Wet = not dry.
+_DRY_MONTHS_BY_PATTERN = {
+    "temperate":  {6, 7, 8, 9},               # Azores / Portugal / Madeira summer
+    "angola":     {5, 6, 7, 8, 9, 10},        # Southern Africa dry season
+    "cape_verde": {12, 1, 2, 3, 4, 5, 6, 7},  # Sahel-style long dry
+    "mozambique": {4, 5, 6, 7, 8, 9},
+}
+
+
+def _classify_season_bucket(d, seasonal_pattern):
+    """Return ``"dry"`` or ``"wet"`` for the given date + regional pattern.
+    Returns ``None`` when ``d`` is None (date couldn't be parsed from a
+    scratch filename); the caller drops un-dated scenes from per-season
+    grouping.
+    """
+    if d is None:
+        return None
+    months = _DRY_MONTHS_BY_PATTERN.get(seasonal_pattern, {6, 7, 8, 9})
+    return "dry" if d.month in months else "wet"
+
+
+# Per-sensor regex set for extracting the acquisition date from a
+# stratched stack filename. The mosaic tools encode the date inside the
+# scene_id of the saved stack TIFF (no separate sidecar manifest, so
+# the filename IS the source of truth). Each pattern returns the
+# acquisition date via the year/month/day capture groups.
+_STACK_DATE_PATTERNS = (
+    # Sentinel-2: PRODUCT_URI starts with S2[ABC]_MSIL2A_YYYYMMDDTHHMMSS_
+    re.compile(
+        r"^S2[A-Z]_MSIL2A_(?P<YYYY>\d{4})(?P<MM>\d{2})(?P<DD>\d{2})T\d{6}_",
+        re.IGNORECASE,
+    ),
+    # Landsat C2L2: LC0[89]_L2S[PR]_PPPRRR_YYYYMMDD_...
+    re.compile(
+        r"^LC0[89]_L2S[PR]_\d{6}_(?P<YYYY>\d{4})(?P<MM>\d{2})(?P<DD>\d{2})_",
+        re.IGNORECASE,
+    ),
+    # ASTER AST_07XT: 17-char scene_id = PPP MM DD YYYY HHMMSS (US-style),
+    # used as the stem of {scene_id}_stack.tif (or _stack_vnir.tif).
+    re.compile(
+        r"^\d{3}(?P<MM>\d{2})(?P<DD>\d{2})(?P<YYYY>\d{4})\d{6}_stack",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _scene_date_from_stack_filename(filename):
+    """Parse the acquisition date out of a per-scene scratch stack
+    filename. Returns a ``datetime.date`` or ``None`` if no known pattern
+    matches.
+    """
+    base = os.path.basename(filename)
+    for pat in _STACK_DATE_PATTERNS:
+        m = pat.match(base)
+        if not m:
+            continue
+        try:
+            return datetime(
+                int(m.group("YYYY")), int(m.group("MM")), int(m.group("DD")),
+            ).date()
+        except (ValueError, TypeError):
+            return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +748,18 @@ _ASTER_TIR_SCALE = 0.1
 # brightness temperatures over Earth's surface are very rarely below
 # 200 K.
 _ASTER_TIR_VALID_K_FLOOR = 200.0
+
+# Tool 07 — temporal-statistics tunables. ``NDVI_PERSISTENCE_THRESHOLD``
+# is the cut-off used to count how many scenes had "vegetated" canopy
+# at a pixel — Howard & Merrifield (2010) GDV-mapping uses 0.5 for
+# temperate / Mediterranean biomes, 0.3 for arid / semi-arid; raise for
+# tropical dense forest. ``NDWI_WATER_THRESHOLD`` follows McFeeters
+# (1996): NDWI > 0 marks open water. ``GDV_DRY_FLOOR`` is the
+# dry-season NDVI floor that Eamus / Naumburg use to flag persistent
+# canopy (groundwater-dependent vegetation candidates).
+_NDVI_PERSISTENCE_THRESHOLD = 0.5
+_NDWI_WATER_THRESHOLD = 0.0
+_GDV_DRY_FLOOR = 0.3
 
 # Pure-numpy FastICA defaults (Hyvärinen parallel, logcosh). Match the
 # previous sklearn defaults so the convergence behaviour is unchanged
@@ -1426,6 +1544,12 @@ def detect_sensor(raster_path):
                 return SENSOR_SENTINEL2
             if count == 9:
                 return SENSOR_ASTER
+            # 3-band stacks are the ASTER VNIR-only product (B01, B02,
+            # B03N), produced by Tool 03 when the SWIR detector failed
+            # for that scene's epoch. Tool 07 and friends need to know
+            # this is still ASTER so the band-role resolution works.
+            if count == 3:
+                return SENSOR_ASTER
     except Exception:
         pass
     return None
@@ -1959,6 +2083,7 @@ class Toolbox(object):
             IndicesComposites,      # 04
             Transformations,        # 05
             SpectralAngleMapper,    # 06
+            TemporalStatistics,     # 07
         ]
 
 
@@ -2800,6 +2925,10 @@ class LandsatMosaic(object):
                     resumed_count += 1
                 else:
                     to_process.append(scene)
+            # Schema defence: refuse to resume incompatible scratch
+            # (e.g., from a code version with a different band layout).
+            if not _check_scratch_schema(multiband_rasters, 7, "Landsat"):
+                return None
             if resumed_count:
                 arcpy.AddMessage(
                     f"  ✓ Resume: {resumed_count}/{len(eligible_scenes)} "
@@ -4658,6 +4787,15 @@ class Sentinel2Mosaic(object):
                     resumed_count += 1
                 else:
                     to_process.append(scene)
+            # Schema defence: refuse to resume from a scratch built by
+            # an earlier code version with a different band layout (the
+            # May 2026 expansion from 10 to 12 bands is the classic
+            # trigger — old 10-band stacks would silently mix into the
+            # geomedian and fail Phase 4).
+            if not _check_scratch_schema(
+                composite_temp_paths, len(_S2_STACK_ORDER), "Sentinel-2",
+            ):
+                return None
             if resumed_count:
                 arcpy.AddMessage(
                     f"  ✓ Resume: {resumed_count}/{len(kept_scenes)} scene "
@@ -5992,6 +6130,19 @@ class AsterMosaic(object):
                 resumed_count += 1
             else:
                 to_process.append(scene)
+        # Schema defence: 9 bands for VNIR+SWIR mode, 3 for VNIR-only.
+        # Scratch from before the May 2026 BT scale fix has the correct
+        # band count but a silently-broken cloud mask (thermal channel
+        # was disabled); the band-count check at least catches the
+        # cross-mode and cross-version layout mismatches.
+        expected_bands = (
+            len(_ASTER_VNIR_BANDS) if mode == _ASTER_MODE_VNIR
+            else len(_ASTER_STACK_ORDER)
+        )
+        if not _check_scratch_schema(
+            stacked_paths, expected_bands, f"ASTER [{label}]",
+        ):
+            return None
         if resumed_count:
             arcpy.AddMessage(
                 f"  ✓ Resume: {resumed_count}/{n_scenes} stack(s) reused "
@@ -9233,3 +9384,582 @@ class SpectralAngleMapper(object):
             return (int(t * 255), int(p * 255), int(v * 255))
         else:
             return (int(v * 255), int(p * 255), int(q * 255))
+
+
+# ---------------------------------------------------------------------------
+# Tool 07 — Temporal Composites & Statistics
+# ---------------------------------------------------------------------------
+
+
+class TemporalStatistics(object):
+    """Tool 07 — Per-pixel temporal statistics over a mosaic scratch.
+
+    Takes a preserved scratch folder from Tool 01 / 02 / 03 (the
+    per-scene cloud-masked multiband stacks) and produces standalone
+    single-band rasters summarising the temporal behaviour of each
+    pixel. Targeted at the Faial demonstrator's groundwater workflow:
+    persistent-canopy mapping (phreatophyte / GDV indicators) plus
+    water-occurrence statistics inspired by the JRC Global Surface
+    Water mapping framework — but built purely on ``arcpy.sa``
+    CellStatistics + Con (cleanroom Apache-licensed implementation).
+
+    Each output indicator maps to a remote-sensing GDV reference so the
+    products are bibliographically defensible:
+
+      - ``NDVI_min``, ``NDVI_max``, ``NDVI_mean``, ``NDVI_std``:
+        per-pixel temporal moments. Underpin every GDV mapping
+        workflow (Pérez Hoyos et al., 2018 review).
+      - ``NDVI_persistence``: fraction of scenes with NDVI above a
+        biome-tunable threshold. Howard & Merrifield (2010) — California
+        GDE mapping.
+      - ``NDWI_freq``: fraction of scenes with NDWI > 0. Equivalent to
+        the JRC GSW Water Occurrence Frequency (Pekel et al., 2016)
+        but per-AOI and computed locally.
+      - ``NDWI_max``: extent of any-time open water (max NDWI).
+      - ``obs_count``: number of cloud-mask-survived scenes per pixel.
+        Confidence map for all the other indicators.
+
+    Per-season mode adds two cross-group composites:
+
+      - ``GDV_ratio = NDVI_mean_dry / NDVI_mean_wet`` (Lv et al., 2013
+        — values ≈ 1 indicate no seasonal stress, the GDV signature).
+      - ``GDV_dry_floor = NDVI_mean_dry > 0.3`` (Eamus / Naumburg
+        framing — sustained dry-season canopy).
+    """
+
+    def __init__(self):
+        self.label = "07 — Temporal Composites & Statistics"
+        self.description = (
+            "Per-pixel temporal statistics over a mosaic-tool scratch "
+            "folder. Emits NDVI moments (min/max/mean/std + biome-tunable "
+            "persistence), NDWI water occurrence and an observation count "
+            "map; with Per-season stratification, also emits the Lv (2013) "
+            "GDV ratio and the Eamus/Naumburg dry-season NDVI floor. All "
+            "outputs are single-band rasters routed into a `temporal/` "
+            "subfolder for folder workspaces, or flat at the workspace "
+            "root for `.gdb` / `.sde`. Built on arcpy.sa.CellStatistics."
+        )
+        self.canRunInBackground = True
+
+    # ------------------------------------------------------------------
+    # GP parameters
+    # ------------------------------------------------------------------
+
+    def getParameterInfo(self):
+        scratch = arcpy.Parameter(
+            displayName=(
+                "Mosaic Scratch Folder (the `_genesis_*_scratch_*` "
+                "directory written by Tools 01-03 when Preserve Scratch "
+                "is on)"
+            ),
+            name="scratch_dir",
+            datatype="DEFolder",
+            parameterType="Required",
+            direction="Input",
+        )
+
+        out_workspace = arcpy.Parameter(
+            displayName="Output Workspace",
+            name="out_workspace",
+            datatype="DEWorkspace",
+            parameterType="Required",
+            direction="Input",
+        )
+
+        out_prefix = arcpy.Parameter(
+            displayName="Output Name Prefix",
+            name="out_prefix",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input",
+        )
+
+        sensor_type = make_sensor_parameter()
+
+        region = arcpy.Parameter(
+            displayName=(
+                "Region (only consulted when stratification = "
+                "Per season — drives the dry / wet month buckets)"
+            ),
+            name="region",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input",
+        )
+        region.filter.list = [
+            "Portugal Mainland",
+            "Azores Western (Flores, Corvo)",
+            "Azores Central (Faial, Pico, São Jorge, Graciosa, Terceira)",
+            "Azores Eastern (São Miguel, Santa Maria)",
+            "Madeira",
+            "Cape Verde Western (Santo Antão, São Vicente, São Nicolau)",
+            "Cape Verde Eastern (Sal, Boa Vista, Santiago, Fogo)",
+            "Angola",
+            "Mozambique",
+        ]
+
+        stratification = arcpy.Parameter(
+            displayName="Temporal Stratification",
+            name="stratification",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input",
+        )
+        stratification.filter.list = ["All scenes", "Per season"]
+        stratification.value = "All scenes"
+
+        stack_pattern = arcpy.Parameter(
+            displayName=(
+                "Stack Filename Pattern (advanced; defaults to "
+                "`*_stack.tif`, the S2 / ASTER 9-band convention; use "
+                "`*_stack_vnir.tif` for the ASTER 3-band VNIR-only "
+                "subset; use `*_composite.tif` for Landsat 7-band)"
+            ),
+            name="stack_pattern",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        stack_pattern.filter.list = [
+            "*_stack.tif",
+            "*_stack_vnir.tif",
+            "*_composite.tif",
+        ]
+        stack_pattern.value = "*_stack.tif"
+
+        mask_feature = arcpy.Parameter(
+            displayName="Optional AOI Mask Feature (polygon)",
+            name="mask_feature",
+            datatype="GPFeatureLayer",
+            parameterType="Optional",
+            direction="Input",
+        )
+        mask_feature.filter.list = ["Polygon"]
+
+        save_stats = arcpy.Parameter(
+            displayName="Save Provenance CSV",
+            name="save_stats",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input",
+        )
+        save_stats.value = True
+
+        return [
+            scratch, out_workspace, out_prefix, sensor_type, region,
+            stratification, stack_pattern, mask_feature, save_stats,
+        ]
+
+    def updateParameters(self, parameters):
+        """Enable Region only when stratification = Per season."""
+        try:
+            stratification = parameters[5]
+            region = parameters[4]
+            if stratification.valueAsText == "Per season":
+                region.enabled = True
+            else:
+                region.enabled = False
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Execute
+    # ------------------------------------------------------------------
+
+    def execute(self, parameters, messages):
+        try:
+            if arcpy.CheckExtension("Spatial") != "Available":
+                arcpy.AddError("Spatial Analyst extension is required.")
+                return None
+            arcpy.CheckOutExtension("Spatial")
+            arcpy.env.overwriteOutput = True
+
+            scratch_dir = parameters[0].valueAsText
+            out_workspace = parameters[1].valueAsText
+            out_prefix = (parameters[2].valueAsText or "").strip()
+            sensor_param = parameters[3].valueAsText
+            region = parameters[4].valueAsText
+            stratification = parameters[5].valueAsText or "All scenes"
+            stack_pattern = parameters[6].valueAsText or "*_stack.tif"
+            mask_feature = parameters[7].valueAsText
+            save_stats = bool(parameters[8].value)
+
+            arcpy.AddMessage("=" * 60)
+            arcpy.AddMessage(f"TEMPORAL STATISTICS — prefix: {out_prefix}")
+            arcpy.AddMessage("=" * 60)
+            arcpy.AddMessage(f"  Scratch:        {scratch_dir}")
+            arcpy.AddMessage(f"  Output:         {out_workspace}")
+            arcpy.AddMessage(f"  Pattern:        {stack_pattern}")
+            arcpy.AddMessage(f"  Stratification: {stratification}")
+
+            if mask_feature and arcpy.Exists(mask_feature):
+                arcpy.env.mask = mask_feature
+                arcpy.env.extent = mask_feature
+                arcpy.AddMessage(f"  AOI:            {mask_feature}")
+            elif mask_feature:
+                arcpy.AddWarning(
+                    f"  AOI: {mask_feature!r} NOT FOUND — full extent"
+                )
+
+            # Discover stacks
+            stacks = sorted(glob.glob(os.path.join(scratch_dir, stack_pattern)))
+            if not stacks:
+                arcpy.AddError(
+                    f"No stacks matching {stack_pattern!r} in {scratch_dir}."
+                )
+                return None
+            arcpy.AddMessage(f"  Scenes found:   {len(stacks)}")
+
+            # Detect sensor from band count of first stack (or honour the
+            # user's explicit selection).
+            sensor = resolve_sensor(sensor_param, stacks[0])
+            if sensor is None:
+                arcpy.AddError(
+                    "Could not detect sensor. Pick one explicitly via the "
+                    "Sensor Type parameter."
+                )
+                return None
+            roles = SENSOR_BAND_ROLES.get(sensor, {})
+            if "NIR" not in roles or "Red" not in roles:
+                arcpy.AddError(
+                    f"Sensor {sensor!r} has no NIR / Red band roles; "
+                    "cannot compute NDVI."
+                )
+                return None
+            arcpy.AddMessage(f"  Sensor:         {sensor}")
+
+            # Parse acquisition dates per scene (None when filename
+            # doesn't match a known sensor pattern).
+            dated = [(p, _scene_date_from_stack_filename(p)) for p in stacks]
+            n_dated = sum(1 for _, d in dated if d is not None)
+            if n_dated < len(dated):
+                arcpy.AddWarning(
+                    f"  Dated:          {n_dated}/{len(dated)} scenes "
+                    "have a parseable date — the rest will be excluded "
+                    "from per-season grouping."
+                )
+
+            # Build groups: {"all": [...]} or {"dry": [...], "wet": [...]}.
+            seasonal_pattern = self._seasonal_pattern_for_region(region or "")
+            groups = self._group_scenes(dated, stratification, seasonal_pattern)
+            for g, paths in groups.items():
+                arcpy.AddMessage(f"  Group {g!r}: {len(paths)} scene(s)")
+                if len(paths) < 2:
+                    arcpy.AddWarning(
+                        f"  Group {g!r} has only {len(paths)} scene(s); "
+                        "stats need ≥ 2 — group will be skipped."
+                    )
+
+            # Per-group outputs
+            arcpy.AddMessage("\n▶ Computing temporal statistics per group...")
+            group_outputs = {}
+            for group_name, paths in groups.items():
+                if len(paths) < 2:
+                    continue
+                group_start = datetime.now()
+                arcpy.SetProgressor(
+                    "default",
+                    f"Computing temporal statistics [{group_name}]...",
+                )
+                outs = self._compute_group_outputs(
+                    group_name, paths, sensor, out_prefix, out_workspace,
+                    stratified=(stratification == "Per season"),
+                )
+                arcpy.ResetProgressor()
+                group_outputs[group_name] = outs
+                arcpy.AddMessage(
+                    f"  ✓ Group {group_name!r}: {len(outs)} raster(s) in "
+                    f"{(datetime.now() - group_start).total_seconds():.1f}s"
+                )
+
+            # Cross-group GDV composites (Per season only)
+            if stratification == "Per season" and {"dry", "wet"} <= set(group_outputs.keys()):
+                arcpy.AddMessage("\n▶ Computing cross-season GDV composites...")
+                gdv_outs = self._compute_gdv_compounds(
+                    out_prefix, out_workspace,
+                    group_outputs["dry"].get("NDVI_mean"),
+                    group_outputs["wet"].get("NDVI_mean"),
+                )
+                if gdv_outs:
+                    arcpy.AddMessage(
+                        f"  ✓ {len(gdv_outs)} GDV composite(s) written"
+                    )
+
+            # Provenance
+            if save_stats:
+                self._write_provenance_csv(
+                    out_workspace, out_prefix, sensor, stratification,
+                    groups, region,
+                )
+
+            arcpy.AddMessage("\n" + "=" * 60)
+            arcpy.AddMessage("DONE")
+            arcpy.AddMessage("=" * 60)
+
+        except Exception as e:
+            arcpy.AddError(f"Tool 07 failed: {e}")
+            import traceback
+            arcpy.AddError(traceback.format_exc())
+            return None
+        finally:
+            if arcpy.CheckExtension("Spatial") == "Available":
+                arcpy.CheckInExtension("Spatial")
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _seasonal_pattern_for_region(region):
+        """Same dispatch as the mosaic tools."""
+        if region in (
+            "Portugal Mainland",
+            "Azores Western (Flores, Corvo)",
+            "Azores Central (Faial, Pico, São Jorge, Graciosa, Terceira)",
+            "Azores Eastern (São Miguel, Santa Maria)",
+            "Madeira",
+        ):
+            return "temperate"
+        if "Cape Verde" in (region or ""):
+            return "cape_verde"
+        if region == "Angola":
+            return "angola"
+        if region == "Mozambique":
+            return "mozambique"
+        return "temperate"
+
+    @staticmethod
+    def _group_scenes(dated_pairs, stratification, seasonal_pattern):
+        """Bucket ``(path, date)`` pairs into groups."""
+        if stratification == "All scenes":
+            return {"all": [p for p, _ in dated_pairs]}
+        groups = {"dry": [], "wet": []}
+        for path, date in dated_pairs:
+            bucket = _classify_season_bucket(date, seasonal_pattern)
+            if bucket is not None:
+                groups[bucket].append(path)
+        return groups
+
+    def _compute_group_outputs(self, group_name, scene_paths, sensor,
+                                prefix, out_workspace, stratified):
+        """Build and save the per-group output rasters.
+
+        Returns a dict mapping the indicator name to its on-disk path,
+        so the caller (Per-season GDV composites) can look up the dry /
+        wet ``NDVI_mean`` paths without re-resolving the names.
+        """
+        roles = SENSOR_BAND_ROLES[sensor]
+        nir_idx = roles["NIR"]
+        red_idx = roles["Red"]
+        green_idx = roles.get("Green")
+
+        # Suffix only when stratified: "" in All-scenes mode keeps the
+        # output names short and unambiguous.
+        suffix = f"_{group_name}" if stratified else ""
+
+        # Build lazy NDVI rasters (one per scene). Con guards the
+        # division by zero where NIR + Red is null/zero.
+        ndvi_list = []
+        ndwi_list = []
+        valid_mask = []  # for obs_count + as denominator of frequencies
+        for path in scene_paths:
+            nir = arcpy.sa.Float(arcpy.ia.ExtractBand(path, [nir_idx]))
+            red = arcpy.sa.Float(arcpy.ia.ExtractBand(path, [red_idx]))
+            denom_v = nir + red
+            ndvi = arcpy.sa.SetNull(denom_v == 0, (nir - red) / denom_v)
+            ndvi_list.append(ndvi)
+            valid_mask.append(
+                arcpy.sa.Con(arcpy.sa.IsNull(ndvi), 0, 1)
+            )
+            if green_idx is not None:
+                green = arcpy.sa.Float(arcpy.ia.ExtractBand(path, [green_idx]))
+                denom_w = green + nir
+                ndwi = arcpy.sa.SetNull(denom_w == 0, (green - nir) / denom_w)
+                ndwi_list.append(ndwi)
+
+        outputs = {}
+
+        # ---- NDVI moments ----
+        for stat_tag, method in (
+            ("NDVI_min", "MINIMUM"),
+            ("NDVI_max", "MAXIMUM"),
+            ("NDVI_mean", "MEAN"),
+            ("NDVI_std", "STD"),
+        ):
+            out_path = _build_workspace_subfolder_path(
+                out_workspace, f"{prefix}_{stat_tag}{suffix}", "temporal",
+            )
+            try:
+                arcpy.sa.CellStatistics(
+                    ndvi_list, statistics_type=method, ignore_nodata="DATA",
+                ).save(out_path)
+                outputs[stat_tag] = out_path
+                arcpy.AddMessage(f"    → {os.path.basename(out_path)}")
+            except arcpy.ExecuteError as e:
+                arcpy.AddWarning(f"    ✗ {stat_tag} failed: {e}")
+
+        # ---- NDVI persistence ----
+        above_list = [
+            arcpy.sa.Con(ndvi > _NDVI_PERSISTENCE_THRESHOLD, 1, 0)
+            for ndvi in ndvi_list
+        ]
+        n_above = arcpy.sa.CellStatistics(
+            above_list, statistics_type="SUM", ignore_nodata="DATA",
+        )
+        n_valid = arcpy.sa.CellStatistics(
+            valid_mask, statistics_type="SUM", ignore_nodata="DATA",
+        )
+        # obs_count is reused below; save the persistence ratio.
+        persistence = arcpy.sa.Con(n_valid > 0, n_above / n_valid)
+        persistence_path = _build_workspace_subfolder_path(
+            out_workspace, f"{prefix}_NDVI_persistence{suffix}", "temporal",
+        )
+        try:
+            persistence.save(persistence_path)
+            outputs["NDVI_persistence"] = persistence_path
+            arcpy.AddMessage(f"    → {os.path.basename(persistence_path)}")
+        except arcpy.ExecuteError as e:
+            arcpy.AddWarning(f"    ✗ NDVI_persistence failed: {e}")
+
+        # ---- obs_count ----
+        obs_count_path = _build_workspace_subfolder_path(
+            out_workspace, f"{prefix}_obs_count{suffix}", "temporal",
+        )
+        try:
+            n_valid.save(obs_count_path)
+            outputs["obs_count"] = obs_count_path
+            arcpy.AddMessage(f"    → {os.path.basename(obs_count_path)}")
+        except arcpy.ExecuteError as e:
+            arcpy.AddWarning(f"    ✗ obs_count failed: {e}")
+
+        # ---- NDWI products (when Green role exists) ----
+        if ndwi_list:
+            try:
+                ndwi_max = arcpy.sa.CellStatistics(
+                    ndwi_list, statistics_type="MAXIMUM", ignore_nodata="DATA",
+                )
+                ndwi_max_path = _build_workspace_subfolder_path(
+                    out_workspace, f"{prefix}_NDWI_max{suffix}", "temporal",
+                )
+                ndwi_max.save(ndwi_max_path)
+                outputs["NDWI_max"] = ndwi_max_path
+                arcpy.AddMessage(f"    → {os.path.basename(ndwi_max_path)}")
+            except arcpy.ExecuteError as e:
+                arcpy.AddWarning(f"    ✗ NDWI_max failed: {e}")
+
+            try:
+                ndwi_above = [
+                    arcpy.sa.Con(ndwi > _NDWI_WATER_THRESHOLD, 1, 0)
+                    for ndwi in ndwi_list
+                ]
+                n_water = arcpy.sa.CellStatistics(
+                    ndwi_above, statistics_type="SUM", ignore_nodata="DATA",
+                )
+                ndwi_freq = arcpy.sa.Con(n_valid > 0, n_water / n_valid)
+                ndwi_freq_path = _build_workspace_subfolder_path(
+                    out_workspace, f"{prefix}_NDWI_freq{suffix}", "temporal",
+                )
+                ndwi_freq.save(ndwi_freq_path)
+                outputs["NDWI_freq"] = ndwi_freq_path
+                arcpy.AddMessage(f"    → {os.path.basename(ndwi_freq_path)}")
+            except arcpy.ExecuteError as e:
+                arcpy.AddWarning(f"    ✗ NDWI_freq failed: {e}")
+        else:
+            arcpy.AddMessage(
+                "    (NDWI products skipped — sensor has no Green band role)"
+            )
+
+        return outputs
+
+    def _compute_gdv_compounds(self, prefix, out_workspace,
+                                ndvi_mean_dry_path, ndvi_mean_wet_path):
+        """GDV-family cross-season composites (Lv 2013 + Eamus/Naumburg)."""
+        outputs = []
+        if not (ndvi_mean_dry_path and ndvi_mean_wet_path):
+            arcpy.AddWarning(
+                "  Missing dry or wet NDVI_mean — GDV composites skipped."
+            )
+            return outputs
+
+        dry = arcpy.sa.Raster(ndvi_mean_dry_path)
+        wet = arcpy.sa.Raster(ndvi_mean_wet_path)
+
+        # Lv 2013 GDV ratio: NDVI_mean_dry / NDVI_mean_wet. Cap the
+        # denominator at 0.1 so pixels with near-zero wet-season NDVI
+        # (water, bare soil) don't blow up the ratio.
+        try:
+            gdv_ratio = arcpy.sa.Con(wet > 0.1, dry / wet)
+            gdv_ratio_path = _build_workspace_subfolder_path(
+                out_workspace, f"{prefix}_GDV_ratio", "temporal",
+            )
+            gdv_ratio.save(gdv_ratio_path)
+            outputs.append(gdv_ratio_path)
+            arcpy.AddMessage(f"    → {os.path.basename(gdv_ratio_path)}")
+        except arcpy.ExecuteError as e:
+            arcpy.AddWarning(f"    ✗ GDV_ratio failed: {e}")
+
+        # Eamus / Naumburg dry-season NDVI floor → binary candidate mask.
+        try:
+            gdv_dry_floor = arcpy.sa.Con(dry > _GDV_DRY_FLOOR, 1, 0)
+            gdv_floor_path = _build_workspace_subfolder_path(
+                out_workspace, f"{prefix}_GDV_dry_floor", "temporal",
+            )
+            gdv_dry_floor.save(gdv_floor_path)
+            outputs.append(gdv_floor_path)
+            arcpy.AddMessage(f"    → {os.path.basename(gdv_floor_path)}")
+        except arcpy.ExecuteError as e:
+            arcpy.AddWarning(f"    ✗ GDV_dry_floor failed: {e}")
+
+        return outputs
+
+    @staticmethod
+    def _write_provenance_csv(out_workspace, prefix, sensor,
+                               stratification, groups, region):
+        """One CSV per Tool 07 run listing the scenes that contributed
+        to each group, plus the run metadata. Lives next to the first
+        temporal output (or alongside the workspace for .gdb)."""
+        # Anchor the CSV to the first written output path so it lands
+        # in the same folder / sibling location as the rasters.
+        anchor = _build_workspace_subfolder_path(
+            out_workspace, prefix, "temporal",
+        )
+        csv_path = _sidecar_path_for_raster(anchor, "_temporal_provenance.csv")
+        try:
+            with open(csv_path, "w", encoding="utf-8", newline="") as fh:
+                writer = csv.writer(fh, quoting=csv.QUOTE_MINIMAL)
+                writer.writerow([
+                    "group", "scene_path", "scene_date",
+                ])
+                for group_name, paths in groups.items():
+                    for p in paths:
+                        d = _scene_date_from_stack_filename(p)
+                        writer.writerow([
+                            group_name, p,
+                            d.isoformat() if d else "",
+                        ])
+                writer.writerow([])
+                writer.writerow(["run_metadata"])
+                writer.writerow(["prefix", prefix])
+                writer.writerow(["sensor", sensor])
+                writer.writerow(["stratification", stratification])
+                writer.writerow(["region", region or ""])
+                writer.writerow(["toolbox_version", TOOLBOX_VERSION])
+                writer.writerow([
+                    "ndvi_persistence_threshold",
+                    f"{_NDVI_PERSISTENCE_THRESHOLD}",
+                ])
+                writer.writerow([
+                    "ndwi_water_threshold",
+                    f"{_NDWI_WATER_THRESHOLD}",
+                ])
+                writer.writerow([
+                    "gdv_dry_floor",
+                    f"{_GDV_DRY_FLOOR}",
+                ])
+                writer.writerow([
+                    "generated", datetime.now().isoformat(timespec="seconds"),
+                ])
+            arcpy.AddMessage(f"  Provenance CSV: {csv_path}")
+        except OSError as e:
+            arcpy.AddWarning(f"  Could not write provenance CSV ({e})")

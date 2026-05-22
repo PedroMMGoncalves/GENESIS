@@ -11,9 +11,11 @@
 
 GENESIS is an ArcGIS Pro toolbox for analysing **Sentinel-2 L2A**,
 **Landsat 8/9 Collection 2 Level 2**, and **ASTER L2 (AST_07XT)** imagery.
-It has six tools: a cloud-removed mosaicker for each sensor, plus three
-sensor-agnostic tools for spectral indices and composites, PCA / MNF / ICA
-statistical transformations, and Spectral Angle Mapper classification.
+It has seven tools: a cloud-removed mosaicker for each sensor, plus
+four sensor-agnostic tools for spectral indices and composites,
+PCA / MNF / ICA statistical transformations, Spectral Angle Mapper
+classification, and per-pixel temporal statistics built over the
+mosaic scratch.
 A `Sensor Type` parameter on the analysis tools selects the correct band
 roles, indices, and reflectance scaling for the input data.
 
@@ -27,7 +29,7 @@ in the Azores.
 
 ## Tools
 
-The toolbox exposes six tools in workflow order:
+The toolbox exposes seven tools in workflow order:
 
 | # | Tool | Purpose |
 | --- | --- | --- |
@@ -37,6 +39,7 @@ The toolbox exposes six tools in workflow order:
 | **04** | Spectral Indices & Composites | ~25 indices + ~8 RGB composites, sensor-filtered to what each sensor can compute (red-edge for S2; per-wavelength SWIR minerals for ASTER) |
 | **05** | Statistical Transformations | PCA, MNF, and ICA — sensor-agnostic algorithm with persisted `.npz` statistics for cross-AOI re-application |
 | **06** | Spectral Angle Mapper | Reference-spectra classification (table / training samples / endmember pixels) |
+| **07** | Temporal Composites & Statistics | Per-pixel statistics over a mosaic-tool scratch folder — NDVI moments (min / max / mean / std + biome-tunable persistence), NDWI water occurrence frequency and an observation count map. With per-season stratification, also emits the Lv (2013) GDV ratio and the Eamus/Naumburg dry-season NDVI floor — both groundwater-dependent-vegetation indicators with published precedent. Built on `arcpy.sa.CellStatistics` (cleanroom Apache-licensed). |
 
 All three mosaic tools write a `_provenance.csv` next to the output documenting every scene that contributed (scene ID, acquisition date, cloud cover, input path, processing baseline, toolbox version).
 
@@ -71,7 +74,7 @@ Each mosaic is shipped with a `{name}_bands.csv` sidecar documenting `band_index
 ## Requirements
 
 - **ArcGIS Pro 3.0 or higher**
-- **Spatial Analyst** extension (required for all six tools)
+- **Spatial Analyst** extension (required for all seven tools)
 - **Image Analyst** extension (used by Mosaic and Transformations)
 - Python 3.9+ with `numpy`, `scipy` and `matplotlib` — all three included with ArcGIS Pro's bundled Python (no other ML or scientific-computing dependencies; the FastICA used in Tool 05 is a pure-numpy in-house implementation, and `matplotlib` is used only by Tool 05's HTML report generator with the headless `Agg` backend)
 - `osgeo.gdal` (also bundled with ArcGIS Pro) — used by Tool 03 for HDF input
@@ -84,7 +87,7 @@ Each mosaic is shipped with a `{name}_bands.csv` sidecar documenting `band_index
 2. Open **ArcGIS Pro**.
 3. In the **Catalog** pane, right-click **Toolboxes** → **Add Toolbox**.
 4. Navigate to `genesis_toolbox.pyt` and select it.
-5. The six tools appear under "GENESIS — Satellite Analysis Toolbox" in workflow order (01–06).
+5. The seven tools appear under "GENESIS — Satellite Analysis Toolbox" in workflow order (01–07).
 
 ---
 
@@ -106,6 +109,7 @@ Each mosaic is shipped with a `{name}_bands.csv` sidecar documenting `band_index
 - Transformation statistics: each Tool 05 run emits THREE sidecars sharing the output raster's basename — a **`.npz`** (NumPy archive — machine-reloadable, so the fitted PCA/MNF/ICA can be re-applied to a new AOI without refitting), a **`.txt`** (human-readable numerical summary: eigenvalues, eigenvectors / mixing matrices, variance explained, mutual information, kurtosis — whichever applies) and a **`_report.html`** (self-contained dashboard with embedded matplotlib PNGs: scree / SNR / kurtosis plots and a loadings heatmap labelled with the satellite band names from `_bands.csv`). The HTML opens in any browser, works offline, and ships no external assets
 - Tool 04 outputs: when the workspace is a **folder**, indices and composites are written to sibling `indices/` and `composites/` subfolders (forced GeoTIFF, no 13-character ESRI-GRID name limit). When the workspace is a **`.gdb`**, both products are saved flat at the workspace root with no extension (geodatabases have no name-length limit and don't support nested folders).
 - Tool 05 outputs: the same folder / `.gdb` split applies. Folder workspaces get a per-transform subfolder (`pca/`, `mnf/`, or `ica/`) with the result saved as a `.tif`; `.gdb` workspaces save flat at the workspace root with no extension. Statistics (the `.npz` reloadable archive, the `.txt` human summary, and the `_report.html` dashboard, all three emitted for every transform) are co-located with the data by default — same folder as the `.tif` for folder workspaces, parent folder of the `.gdb` for geodatabase workspaces (GDB cannot store these sidecars). Set the optional *Statistics Folder* parameter explicitly to override the placement.
+- Tool 07 outputs: a `temporal/` subfolder for folder workspaces (forced GeoTIFF) or flat at the workspace root for `.gdb`. Each indicator is a single-band raster prefixed with the user-chosen *Output Name Prefix*. *All scenes* stratification → 6-8 rasters (`{prefix}_NDVI_min/max/mean/std`, `{prefix}_NDVI_persistence`, `{prefix}_NDWI_max`, `{prefix}_NDWI_freq`, `{prefix}_obs_count`). *Per season* stratification → 12-16 rasters with `_dry` / `_wet` suffixes plus two cross-season composites (`{prefix}_GDV_ratio`, `{prefix}_GDV_dry_floor`). A `_temporal_provenance.csv` sidecar lists the scenes that contributed to each group + the threshold tunables used.
 - Each mosaic's median output is sanity-checked after save: per-band MIN / MEAN / MAX are logged, and a warning is emitted if any band's mean is suspiciously close to zero for that sensor's expected reflectance range — catches the class of NoData-handling regression that would otherwise pass type-checking and structural validation while producing visually-broken outputs.
 
 ---
