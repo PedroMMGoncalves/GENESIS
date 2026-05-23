@@ -137,6 +137,322 @@ def _apply_aoi_mask_and_save(unmasked_path, mask_feature, gdb_path,
 
 
 # ---------------------------------------------------------------------------
+# Temporal outlier rejection (Tmask reduction)
+# ---------------------------------------------------------------------------
+#
+# Per-pixel temporal outlier rejection for the per-scene stacks that feed
+# the GeometricMedian compositor. Per-scene spectral thresholds cannot
+# separate warm low cloud (Azorean marine stratocumulus over Faial) from
+# warm land because their BT and reflectance distributions overlap. This
+# helper sidesteps that wall by changing the unit of analysis from the
+# scene to the pixel time series: a scene-pixel is flagged not by looking
+# like a cloud in absolute terms but by being anomalous against that
+# pixel's own clear-sky history.
+#
+# Method: collect a single brightness band across the co-registered scene
+# stack, compute the per-pixel temporal median and a MAD-derived robust
+# sigma, and flag any scene whose value deviates by more than ``k`` robust
+# sigmas (bright = cloud, dark = shadow). The flag is then applied to
+# every band of that scene-pixel via SetNull; the downstream
+# GeometricMedian composites only the survivors.
+#
+# Reference: Zhu, Z. & Woodcock, C.E. (2014). Automated cloud, cloud
+# shadow, and snow detection in multitemporal Landsat data. Remote Sens.
+# Environ. 152, 217-234. doi:10.1016/j.rse.2014.06.012. Full Tmask uses
+# RIRLS harmonic regression; this is the robust-z reduction.
+#
+# Why it transfers: nothing is pinned to a site. The median and MAD are
+# derived per pixel from the location's own observations, so the same
+# code and the same ``k`` work over Faial marine cloud and over the drier
+# South Portuguese / Ossa-Morena zones without re-tuning fixed thresholds.
+#
+# Assumptions: all input stacks share an identical grid (extent, cell
+# size, CRS). This holds when the mosaic tool runs with an AOI because
+# env.extent + env.snapRaster + cellSize make every per-scene
+# CompositeBands output identical. A defensive grid check raises early
+# if not.
+
+_TMASK_K = 2.5             # robust z-score threshold, in MAD-sigma units
+_TMASK_MIN_OBS = 4         # min valid obs per pixel to attempt cleaning
+_TMASK_BLOCK_ROWS = 1024   # row-stripe height to bound peak memory
+_TMASK_MAD_FLOOR = 1e-4    # lower bound on robust sigma (stable pixels: MAD~0)
+
+
+def _tmask_reference_grid(raster_path):
+    """Return ``(ncols, nrows, lower_left Point, cell_w, cell_h)``."""
+    r = arcpy.Raster(raster_path)
+    return (
+        r.width, r.height,
+        arcpy.Point(r.extent.XMin, r.extent.YMin),
+        r.meanCellWidth, r.meanCellHeight,
+    )
+
+
+def _tmask_assert_common_grid(stack_paths, tol=1e-6):
+    """Raise if the stacks are not on an identical grid.
+
+    Triggers when an AOI is not active (env.extent + env.snapRaster +
+    cellSize is what aligns every per-scene CompositeBands output).
+    """
+    ref = _tmask_reference_grid(stack_paths[0])
+    for sp in stack_paths[1:]:
+        g = _tmask_reference_grid(sp)
+        same = (
+            g[0] == ref[0] and g[1] == ref[1]
+            and abs(g[2].X - ref[2].X) < tol
+            and abs(g[2].Y - ref[2].Y) < tol
+            and abs(g[3] - ref[3]) < tol
+            and abs(g[4] - ref[4]) < tol
+        )
+        if not same:
+            raise ValueError(
+                "Temporal cleaning requires all per-scene stacks on one "
+                "grid. Run the mosaic tool with an AOI so env.extent + "
+                "env.snapRaster align every stack. Mismatch: "
+                f"{stack_paths[0]} vs {sp}"
+            )
+    return ref
+
+
+def _tmask_setnull_multiband(stack_path, flag_raster, out_path):
+    """Set every band of ``stack_path`` to NoData where flag_raster == 1."""
+    r = arcpy.Raster(stack_path)
+    masked = []
+    for b in range(1, r.bandCount + 1):
+        band = arcpy.ia.ExtractBand(r, band_ids=[b])
+        masked.append(arcpy.sa.SetNull(flag_raster == 1, band))
+    arcpy.management.CompositeBands(masked, out_path)
+    return out_path
+
+
+def _temporal_outlier_clean(
+    stack_paths, brightness_band_index, scratch_dir,
+    k=_TMASK_K, min_obs=_TMASK_MIN_OBS,
+    block_rows=_TMASK_BLOCK_ROWS, mad_floor=_TMASK_MAD_FLOOR,
+    obs_count_path=None, cloud_freq_path=None,
+    clean_suffix="_clean.tif", log=None,
+):
+    """Clean per-scene stacks by per-pixel temporal outlier rejection.
+
+    Parameters
+    ----------
+    stack_paths : list[str]
+        Co-registered multiband per-scene stacks (the same list normally
+        passed to GeometricMedian). Order is preserved in the return.
+    brightness_band_index : int
+        1-based band used as cloud/shadow proxy. For the ASTER stack
+        order (B01, B02, B03N, ...) B02 (red) is band 2; the VNIR-only
+        stack (B01, B02, B03N) also has B02 at band 2. Red is preferred
+        over NIR: cloud is bright in red while vegetation is dark in red.
+    scratch_dir : str
+        Folder for the brightness extracts, flag rasters, and cleaned
+        stacks.
+    k : float
+        Robust z-score threshold (MAD-sigma units). Lower = more
+        aggressive.
+    min_obs : int
+        Pixels with fewer valid observations are not cleaned (left as-is).
+    obs_count_path, cloud_freq_path : str or None
+        Optional outputs. obs_count is the per-pixel count of valid
+        observations (Int32); cloud_freq is the flagged fraction
+        ``1 - (obs_count / n_scenes)`` (Float32). Pixels never observed
+        (obs_count == 0) are written as NoData in BOTH layers so the
+        pair is internally consistent (never-observed ≠ always-cloudy).
+        Treat both as evidence-quality layers, not QA to discard.
+    clean_suffix : str
+        Suffix for cleaned stack filenames.
+    log : callable or None
+        Message sink (defaults to ``arcpy.AddMessage``).
+
+    Returns
+    -------
+    list[str]
+        Cleaned stack paths (feed these to GeometricMedian). With fewer
+        than two scenes the inputs are returned unchanged.
+
+    Notes
+    -----
+    Two-pass implementation. Pass 1 walks the AOI in row stripes,
+    loading every scene's brightness extract into a single cube of shape
+    ``(n, block_rows, ncols)`` and accumulating per-pixel ``med``,
+    ``sigma`` and ``obs`` into full ``(nrows, ncols)`` arrays. Pass 2
+    iterates over scenes; for each scene it re-walks the row stripes
+    loading only that scene's brightness, derives the per-scene drop
+    mask from the pass-1 statistics, accumulates it into a single
+    ``(nrows, ncols)`` flag array, saves the flag raster to scratch,
+    and applies it via SetNull + CompositeBands. Peak memory is
+    bounded by the larger of the pass-1 cube and the pass-2 per-scene
+    flag array — the previous single-pass design held an
+    ``(n, nrows, ncols)`` flag tensor which becomes multi-GB at
+    continental AOIs.
+    """
+    say = log or arcpy.AddMessage
+    n = len(stack_paths)
+    if n < 2:
+        say("  temporal clean: <2 scenes, skipping (no time series).")
+        return list(stack_paths)
+
+    ncols, nrows, ll, cw, ch = _tmask_assert_common_grid(stack_paths)
+    say(
+        f"  temporal clean: {n} scenes on {ncols}x{nrows} grid, "
+        f"band {brightness_band_index}, k={k}, min_obs={min_obs}"
+    )
+
+    # 1) Extract the brightness band of each scene to a single-band
+    #    raster (cheaper to block-read than the full multiband stack,
+    #    and persisted so pass 2 can re-read without recomputation).
+    bright_paths = []
+    for sp in stack_paths:
+        base = os.path.splitext(os.path.basename(sp))[0]
+        bp = os.path.join(scratch_dir, base + "_bright.tif")
+        arcpy.ia.ExtractBand(
+            arcpy.Raster(sp), band_ids=[brightness_band_index],
+        ).save(bp)
+        bright_paths.append(bp)
+
+    # 2) Pass 1 — walk the AOI in row stripes; accumulate per-pixel
+    #    temporal median, robust sigma, and observation count into
+    #    full-extent arrays. The cube allocation is bounded by
+    #    ``block_rows``; obs_full is Int32 so it survives multi-decade
+    #    Sentinel-2 stacks without wraparound (Int16 caps at 32767).
+    med_full = np.empty((nrows, ncols), dtype=np.float32)
+    sigma_full = np.empty((nrows, ncols), dtype=np.float32)
+    obs_full = np.zeros((nrows, ncols), dtype=np.int32)
+
+    for r0 in range(0, nrows, block_rows):
+        rh = min(block_rows, nrows - r0)
+        # Lower-left of this top-anchored stripe (RasterToNumPyArray
+        # windows are anchored at the top of the source raster).
+        blk_ll = arcpy.Point(ll.X, ll.Y + (nrows - r0 - rh) * ch)
+
+        cube = np.empty((n, rh, ncols), dtype=np.float32)
+        for i, bp in enumerate(bright_paths):
+            cube[i] = arcpy.RasterToNumPyArray(
+                arcpy.Raster(bp), blk_ll, ncols, rh,
+                nodata_to_value=np.nan,
+            )
+
+        valid = ~np.isnan(cube)
+        obs_full[r0:r0 + rh, :] = valid.sum(axis=0).astype(np.int32)
+
+        # ``nanmedian`` over a pixel where every scene is NaN returns
+        # NaN; the downstream z computation then yields NaN comparisons
+        # which are False, so the pixel can't be flagged. Suppress the
+        # RuntimeWarning that nanmedian emits for those columns.
+        with np.errstate(invalid="ignore"):
+            med = np.nanmedian(cube, axis=0)
+            mad = np.nanmedian(np.abs(cube - med), axis=0) * 1.4826
+        sigma = np.maximum(mad, mad_floor)
+
+        med_full[r0:r0 + rh, :] = med
+        sigma_full[r0:r0 + rh, :] = sigma
+
+    # Free pass-1 cube allocations before pass 2 ramps up.
+    del cube, valid, med, mad, sigma
+
+    # 3) Pass 2 — per scene, derive the drop mask stripe by stripe from
+    #    the pass-1 statistics; accumulate into one ``(nrows, ncols)``
+    #    flag array; save explicitly so SetNull receives a materialised
+    #    raster (no lazy raster shadowing across loop iterations);
+    #    apply via SetNull + CompositeBands.
+    cleaned = []
+    total_flagged = 0
+    total_eligible = 0
+    arcpy.SetProgressor(
+        "step", "Temporal clean: writing cleaned stacks", 0, n, 1,
+    )
+    try:
+        for i, sp in enumerate(stack_paths):
+            base = os.path.splitext(os.path.basename(sp))[0]
+            flag_arr = np.zeros((nrows, ncols), dtype=np.uint8)
+
+            for r0 in range(0, nrows, block_rows):
+                rh = min(block_rows, nrows - r0)
+                blk_ll = arcpy.Point(ll.X, ll.Y + (nrows - r0 - rh) * ch)
+
+                scene_stripe = arcpy.RasterToNumPyArray(
+                    arcpy.Raster(bright_paths[i]),
+                    blk_ll, ncols, rh, nodata_to_value=np.nan,
+                )
+
+                valid = ~np.isnan(scene_stripe)
+                med_s = med_full[r0:r0 + rh, :]
+                sigma_s = sigma_full[r0:r0 + rh, :]
+                obs_s = obs_full[r0:r0 + rh, :]
+                enough = obs_s >= min_obs
+                eligible = valid & enough
+
+                with np.errstate(invalid="ignore"):
+                    z = (scene_stripe - med_s) / sigma_s
+                    drop = ((z > k) | (z < -k)) & eligible
+
+                flag_arr[r0:r0 + rh, :] = drop.astype(np.uint8)
+                total_eligible += int(eligible.sum())
+
+            total_flagged += int(flag_arr.sum())
+
+            # Save the flag raster explicitly. The earlier lazy-raster
+            # idiom (NumPyArrayToRaster held only as a local) risked
+            # SetNull resolving against a stale ``==1`` Raster object
+            # if the GP driver ever deferred evaluation across loop
+            # iterations; explicit save removes the ambiguity.
+            flag_path = os.path.join(scratch_dir, base + "_flag.tif")
+            arcpy.NumPyArrayToRaster(
+                flag_arr, ll, cw, ch,
+            ).save(flag_path)
+            flag_ras = arcpy.sa.Raster(flag_path)
+
+            out = os.path.join(scratch_dir, base + clean_suffix)
+            _tmask_setnull_multiband(sp, flag_ras, out)
+            cleaned.append(out)
+            arcpy.SetProgressorPosition(i + 1)
+    finally:
+        arcpy.ResetProgressor()
+
+    # ``total_eligible`` excludes NaN pixels and pixels where coverage
+    # was below ``min_obs``; reporting against eligible pixels (not the
+    # full scene-pixel count) gives the rate at which the cleaner
+    # actually flagged something it had the data to flag.
+    if total_eligible > 0:
+        flagged_frac = 100.0 * total_flagged / total_eligible
+        say(
+            f"  temporal clean: {flagged_frac:.1f}% of eligible "
+            f"scene-pixels flagged as cloud/shadow "
+            f"({total_flagged:,} of {total_eligible:,})"
+        )
+    else:
+        say(
+            "  temporal clean: no eligible scene-pixels "
+            "(coverage too sparse everywhere) — nothing flagged."
+        )
+
+    # 4) Evidence-quality layers. Both rasters use a NaN sentinel at
+    #    obs == 0 so the never-observed footprint is NoData in BOTH
+    #    layers (matching semantics for downstream joins). obs_full is
+    #    Int32 in memory but saved as a float Raster via the NaN-bearing
+    #    array; the value range still fits well within float32.
+    if obs_count_path is not None:
+        obs_float = obs_full.astype(np.float32)
+        obs_float[obs_full == 0] = np.nan
+        arcpy.NumPyArrayToRaster(
+            obs_float, ll, cw, ch,
+        ).save(obs_count_path)
+        thin = int(((obs_full > 0) & (obs_full < min_obs)).sum())
+        say(
+            f"  temporal clean: obs_count written; {thin} pixels below "
+            f"min_obs={min_obs} (coverage too sparse to trust)"
+        )
+    if cloud_freq_path is not None:
+        freq = 1.0 - (obs_full.astype(np.float32) / float(n))
+        freq[obs_full == 0] = np.nan
+        arcpy.NumPyArrayToRaster(freq, ll, cw, ch).save(cloud_freq_path)
+        say(f"  temporal clean: cloud_freq written → "
+            f"{os.path.basename(cloud_freq_path)}")
+
+    return cleaned
+
+
+# ---------------------------------------------------------------------------
 # Phase-logging context manager
 # ---------------------------------------------------------------------------
 
@@ -5896,10 +6212,11 @@ class AsterMosaic(object):
         bt_threshold_k = arcpy.Parameter(
             displayName=(
                 "Thermal Cloud Threshold (K) — pixels colder than this "
-                "are flagged as cloud when AST_08 is paired. Default "
-                "280 K (Faial / mid-latitude maritime; catches warm "
-                "low cloud sitting on Atlantic island summits); raise "
-                "for hot AOIs, lower for high-altitude AOIs."
+                "are flagged as cloud when AST_08 is paired AND "
+                "'Use AST_08 thermal cloud test' is enabled below. "
+                "Default 280 K (Faial / mid-latitude maritime; catches "
+                "warm low cloud sitting on Atlantic island summits); "
+                "raise for hot AOIs, lower for high-altitude AOIs."
             ),
             name="bt_threshold_k",
             datatype="GPDouble",
@@ -5909,11 +6226,77 @@ class AsterMosaic(object):
         )
         bt_threshold_k.value = _ASTER_CLOUD_BT_MAX_K
 
+        # AST_08 (Surface Kinetic Temperature) is produced by the TES
+        # algorithm AFTER the operational L2 cloud mask is already
+        # applied — over a cloud it is NoData or a corrupted retrieval,
+        # so it fails on precisely the pixels a cloud test needs. The
+        # warm-low-cloud / warm-land BT distributions also overlap, so
+        # no scalar threshold separates them. The path is preserved
+        # behind this opt-in switch (default OFF); prefer the temporal
+        # cleaner below for the actual cloud removal.
+        use_ast08_thermal = arcpy.Parameter(
+            displayName=(
+                "Use AST_08 thermal cloud test (OFF by default — AST_08 "
+                "is clear-sky-only and overlaps warm land; kept for "
+                "experimentation)"
+            ),
+            name="use_ast08_thermal",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        use_ast08_thermal.value = False
+
+        disable_temporal_clean = arcpy.Parameter(
+            displayName=(
+                "Disable temporal outlier cleaner (NOT recommended — "
+                "this is the layer that defeats warm marine cloud over "
+                "Faial; turn off only for A/B comparison runs)"
+            ),
+            name="disable_temporal_clean",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        disable_temporal_clean.value = False
+
+        temporal_k = arcpy.Parameter(
+            displayName=(
+                "Temporal cleaner: robust z-score threshold (k, in "
+                "MAD-sigma units). Lower = more aggressive. Default 2.5 "
+                "matches the Tmask paper convention."
+            ),
+            name="temporal_k",
+            datatype="GPDouble",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        temporal_k.value = _TMASK_K
+
+        temporal_min_obs = arcpy.Parameter(
+            displayName=(
+                "Temporal cleaner: minimum valid observations per pixel "
+                "to attempt cleaning. Pixels with fewer observations "
+                "are left as-is (their cleaning would be unreliable) "
+                "and are reported in the obs_count sidecar."
+            ),
+            name="temporal_min_obs",
+            datatype="GPLong",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        temporal_min_obs.value = _TMASK_MIN_OBS
+
         return [
             gdb, mosaic_name, data_folder, thermal_folder,
             region, time_type, year, month, season,
             use_qa_planes, mask_feature, save_stats, preserve_scratch,
-            bt_threshold_k,
+            bt_threshold_k, use_ast08_thermal,
+            disable_temporal_clean, temporal_k, temporal_min_obs,
         ]
 
     def updateParameters(self, parameters):
@@ -5973,6 +6356,26 @@ class AsterMosaic(object):
                 if len(parameters) > 13 and parameters[13].value is not None
                 else _ASTER_CLOUD_BT_MAX_K
             )
+            use_ast08_thermal = (
+                bool(parameters[14].value)
+                if len(parameters) > 14 and parameters[14].value is not None
+                else False
+            )
+            disable_temporal_clean = (
+                bool(parameters[15].value)
+                if len(parameters) > 15 and parameters[15].value is not None
+                else False
+            )
+            temporal_k = (
+                float(parameters[16].value)
+                if len(parameters) > 16 and parameters[16].value is not None
+                else _TMASK_K
+            )
+            temporal_min_obs = (
+                int(parameters[17].value)
+                if len(parameters) > 17 and parameters[17].value is not None
+                else _TMASK_MIN_OBS
+            )
 
             # ----------------------------------------------------------------
             # AOI-first scoping. See LandsatMosaic.execute() for the full
@@ -6002,9 +6405,33 @@ class AsterMosaic(object):
             arcpy.AddMessage(
                 f"  Options:    QA mask = {use_qa}, "
                 f"per-scene cloud test = on "
-                f"(B02 > {_ASTER_CLOUD_B02_MIN}, B04 > {_ASTER_CLOUD_B04_MIN}, "
-                f"BT < {bt_threshold_k:.0f} K when AST_08 paired)"
+                f"(B02 > {_ASTER_CLOUD_B02_MIN}, "
+                f"B04 > {_ASTER_CLOUD_B04_MIN}"
+                + (f", BT < {bt_threshold_k:.0f} K when AST_08 paired"
+                   if use_ast08_thermal else "")
+                + ")"
             )
+            if use_ast08_thermal:
+                arcpy.AddMessage(
+                    "  AST_08:     thermal cloud test ENABLED — note "
+                    "AST_08 is clear-sky-only by construction and may "
+                    "give misleading results over cloud."
+                )
+            else:
+                arcpy.AddMessage(
+                    "  AST_08:     thermal cloud test disabled "
+                    "(default; AST_08 is clear-sky-only)."
+                )
+            if disable_temporal_clean:
+                arcpy.AddMessage(
+                    "  Temporal:   outlier cleaner DISABLED "
+                    "(A/B comparison mode)."
+                )
+            else:
+                arcpy.AddMessage(
+                    f"  Temporal:   outlier cleaner ON "
+                    f"(k={temporal_k}, min_obs={temporal_min_obs})"
+                )
 
             if mask_feature and arcpy.Exists(mask_feature):
                 arcpy.env.mask = mask_feature
@@ -6115,6 +6542,10 @@ class AsterMosaic(object):
                     scratch_dir, use_qa, mask_feature,
                     save_stats, _ASTER_MODE_FULL, "VNIR+SWIR (9-band)",
                     bt_threshold_k=bt_threshold_k,
+                    use_ast08_thermal=use_ast08_thermal,
+                    disable_temporal_clean=disable_temporal_clean,
+                    temporal_k=temporal_k,
+                    temporal_min_obs=temporal_min_obs,
                 )
                 if output_full:
                     outputs.append(output_full)
@@ -6131,6 +6562,10 @@ class AsterMosaic(object):
                 scratch_dir, use_qa, mask_feature,
                 save_stats, _ASTER_MODE_VNIR, "VNIR-only (3-band)",
                 bt_threshold_k=bt_threshold_k,
+                use_ast08_thermal=use_ast08_thermal,
+                disable_temporal_clean=disable_temporal_clean,
+                temporal_k=temporal_k,
+                temporal_min_obs=temporal_min_obs,
             )
             if output_vnir:
                 outputs.append(output_vnir)
@@ -6172,7 +6607,9 @@ class AsterMosaic(object):
     def _run_mosaic_pipeline(
         self, scenes, gdb_path, output_name, scratch_dir,
         use_qa, mask_feature, save_stats, mode, label,
-        bt_threshold_k=None,
+        bt_threshold_k=None, use_ast08_thermal=False,
+        disable_temporal_clean=False,
+        temporal_k=_TMASK_K, temporal_min_obs=_TMASK_MIN_OBS,
     ):
         """Run Phases 3-5 over a scene list in one of the supported modes.
 
@@ -6247,6 +6684,7 @@ class AsterMosaic(object):
                 stacked = self._process_scene(
                     scene, scratch_dir, use_qa, mode,
                     bt_threshold_k=bt_threshold_k,
+                    use_ast08_thermal=use_ast08_thermal,
                 )
             except Exception as e:
                 arcpy.AddWarning(f"  ✗ {scene['scene_id']}: {e}")
@@ -6277,23 +6715,111 @@ class AsterMosaic(object):
             f"({stack_phase_elapsed/max(1,len(stacked_paths)):.1f}s/scene)"
         )
 
-        # Phase 4 (multitemporal cloud refinement) was removed in favour
-        # of the per-scene multi-spectral cloud test inside
-        # ``_process_scene``. The temporal-percentile approach assumed a
-        # clear-dominant scene stack and could not handle the persistent
-        # marine cumulus over the Faial demonstrator (where p75 brightness
-        # was itself cloud).
+        # Output path is resolved BEFORE Phase 4 so the evidence-layer
+        # publish can be tied to the mosaic's GDB stem from the start.
+        # If Phase 5 (GeometricMedian) fails downstream, the sidecars
+        # published in Phase 4 still survive at their final location.
+        output_path = os.path.join(gdb_path, output_name)
+
+        # Phase 4 — Temporal outlier cleaner (Tmask reduction).
+        # Runs per-pixel robust z-score against each pixel's own clear-
+        # sky history; flags warm marine cloud that no per-scene
+        # spectral threshold can separate from warm land. Default ON;
+        # disabled only for A/B comparison runs. Emits two evidence-
+        # quality sidecar rasters tied to this mosaic's output name:
+        # ``{name}_obs_count`` (valid clear observations per pixel)
+        # and ``{name}_cloud_freq`` (flagged fraction per pixel).
+        # Treat both as inputs to downstream uncertainty propagation,
+        # not as QA to discard. Sidecars are CopyRaster-published from
+        # scratch to the GDB sidecar folder inside this phase so they
+        # survive both scratch cleanup AND a Phase 5 failure — the
+        # cleaner output is the diagnostic users need to triage a
+        # GeometricMedian crash.
+        composite_inputs = stacked_paths
+        obs_count_pub = None
+        cloud_freq_pub = None
+        if disable_temporal_clean:
+            arcpy.AddMessage(
+                f"\n▶ Phase 4 [{label}] — Temporal cleaner DISABLED"
+            )
+        else:
+            scratch_obs = os.path.join(
+                scratch_dir, f"{output_name}_obs_count.tif",
+            )
+            scratch_freq = os.path.join(
+                scratch_dir, f"{output_name}_cloud_freq.tif",
+            )
+            cleaner_ran = False
+            try:
+                with phase(
+                    f"Phase 4 [{label}] — Temporal outlier cleaner "
+                    f"(k={temporal_k}, min_obs={temporal_min_obs})",
+                    quiet_close=True,
+                ) as ph4:
+                    composite_inputs = _temporal_outlier_clean(
+                        stacked_paths,
+                        brightness_band_index=2,   # B02 (red) in both modes
+                        scratch_dir=scratch_dir,
+                        k=temporal_k,
+                        min_obs=temporal_min_obs,
+                        obs_count_path=scratch_obs,
+                        cloud_freq_path=scratch_freq,
+                    )
+                arcpy.AddMessage(
+                    f"  ✓ Temporal cleaner in {ph4.elapsed:.1f}s"
+                )
+                cleaner_ran = True
+            except ValueError as e:
+                arcpy.AddWarning(
+                    f"  ✗ Temporal cleaner skipped: {e}"
+                )
+                composite_inputs = stacked_paths
+            except Exception as e:
+                arcpy.AddWarning(
+                    f"  ✗ Temporal cleaner failed ({e}); proceeding "
+                    "with uncleaned stacks."
+                )
+                composite_inputs = stacked_paths
+
+            # Publish evidence layers from scratch to the GDB sidecar
+            # folder. Independent of Phase 5 outcome — runs as long as
+            # the cleaner produced files. Delete-then-CopyRaster is
+            # tolerant of catalog locks from a previous run that
+            # ``.save()`` overwrite would trip on.
+            if cleaner_ran:
+                for src, suffix in (
+                    (scratch_obs, "_obs_count.tif"),
+                    (scratch_freq, "_cloud_freq.tif"),
+                ):
+                    if not arcpy.Exists(src):
+                        continue
+                    dst = _sidecar_path_for_raster(output_path, suffix)
+                    try:
+                        if arcpy.Exists(dst):
+                            arcpy.management.Delete(dst)
+                        arcpy.management.CopyRaster(src, dst)
+                        arcpy.AddMessage(
+                            f"  ✓ Evidence layer → {os.path.basename(dst)}"
+                        )
+                        if suffix == "_obs_count.tif":
+                            obs_count_pub = dst
+                        else:
+                            cloud_freq_pub = dst
+                    except arcpy.ExecuteError as e:
+                        arcpy.AddWarning(
+                            f"  Could not publish "
+                            f"{os.path.basename(src)}: {e}"
+                        )
 
         # Phase 5 — GeometricMedian
-        output_path = os.path.join(gdb_path, output_name)
         arcpy.SetProgressor("default", f"Computing GeometricMedian [{label}]...")
         try:
             with phase(
-                f"Phase 5 [{label}] — GeometricMedian over {len(stacked_paths)} stacks",
+                f"Phase 5 [{label}] — GeometricMedian over {len(composite_inputs)} stacks",
                 quiet_close=True,
             ) as ph:
                 median = arcpy.ia.GeometricMedian(
-                    stacked_paths,
+                    composite_inputs,
                     epsilon=_GEOMETRIC_MEDIAN_EPSILON,
                     max_iteration=_GEOMETRIC_MEDIAN_MAX_ITER,
                     extent_type="UnionOf",
@@ -6344,6 +6870,36 @@ class AsterMosaic(object):
                 final_path,
                 "aster-vnir" if mode == _ASTER_MODE_VNIR else "aster",
             )
+
+            # Evidence layers were published to the GDB sidecar folder
+            # in Phase 4, using ``output_path``'s stem. If AOI mask was
+            # applied, ``final_path`` carries a ``_Masked`` suffix; the
+            # sidecars are renamed to match so downstream pairing on
+            # basename works unambiguously. When AOI was not applied
+            # (final_path == output_path), the rename is a no-op.
+            if final_path != output_path:
+                for src_pub, suffix in (
+                    (obs_count_pub, "_obs_count.tif"),
+                    (cloud_freq_pub, "_cloud_freq.tif"),
+                ):
+                    if not src_pub or not arcpy.Exists(src_pub):
+                        continue
+                    dst = _sidecar_path_for_raster(final_path, suffix)
+                    if dst == src_pub:
+                        continue
+                    try:
+                        if arcpy.Exists(dst):
+                            arcpy.management.Delete(dst)
+                        arcpy.management.Rename(src_pub, dst)
+                        arcpy.AddMessage(
+                            f"  ✓ Evidence layer renamed → "
+                            f"{os.path.basename(dst)}"
+                        )
+                    except arcpy.ExecuteError as e:
+                        arcpy.AddWarning(
+                            f"  Could not rename "
+                            f"{os.path.basename(src_pub)}: {e}"
+                        )
 
         return final_path
 
@@ -6555,7 +7111,7 @@ class AsterMosaic(object):
         return all(b in files for b in _ASTER_SWIR_BANDS)
 
     def _process_scene(self, scene, scratch_dir, use_qa, mode,
-                       bt_threshold_k=None):
+                       bt_threshold_k=None, use_ast08_thermal=False):
         """Apply scale + resample + QA mask + stack → single multi-band raster.
 
         Parameters
@@ -6668,18 +7224,22 @@ class AsterMosaic(object):
         else:
             cloud_vis_swir = cloud_vis
 
-        # Optional thermal channel. When the scene was paired with an
-        # AST_08 (Surface Kinetic Temperature) file in scene discovery,
-        # pixels below ``_ASTER_CLOUD_BT_MAX_K`` are flagged as cloud
-        # regardless of VIS/SWIR brightness — this catches thin cirrus
-        # (cold but not bright) and reduces false positives over warm
-        # bare ground. Combined with VIS/SWIR via OR: either signal is
-        # sufficient.
+        # Optional thermal channel. AST_08 (Surface Kinetic Temperature)
+        # is produced by the TES algorithm AFTER the operational L2
+        # cloud mask is already applied, so over cloud it is NoData or a
+        # corrupted retrieval — it fails on precisely the pixels a cloud
+        # test needs, and the warm-cloud / warm-land BT distributions
+        # overlap besides. The path is preserved for experimentation
+        # but is OFF by default; the temporal cleaner in Phase 4
+        # handles cloud removal instead.
         bt_threshold = (
             float(bt_threshold_k) if bt_threshold_k is not None
             else _ASTER_CLOUD_BT_MAX_K
         )
-        bt_kelvin = self._load_bt_kelvin(scene.get("thermal"), scratch_dir, scene_id)
+        bt_kelvin = (
+            self._load_bt_kelvin(scene.get("thermal"), scratch_dir, scene_id)
+            if use_ast08_thermal else None
+        )
         if bt_kelvin is not None:
             cloud_mask = cloud_vis_swir | (bt_kelvin < bt_threshold)
         else:
