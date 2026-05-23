@@ -6211,16 +6211,21 @@ class AsterMosaic(object):
 
         thermal_folder = arcpy.Parameter(
             displayName=(
-                "Optional ASTER Thermal Data Folder (AST_08 Surface "
-                "Kinetic Temperature) — paired with AST_07XT by scene ID. "
-                "When omitted, the main data folder is also searched for "
-                "AST_08 files."
+                "Optional ASTER Thermal Data Folder (AST_08, Surface "
+                "Kinetic Temperature). Used by the optional thermal "
+                "cloud test in Advanced Options (default OFF, so this "
+                "field is hidden by default). A separate LST temporal "
+                "statistics tool, planned but not yet shipped, will "
+                "have its own thermal-folder parameter."
             ),
             name="thermal_folder",
             datatype="DEFolder",
             parameterType="Optional",
             direction="Input",
         )
+        # Initially hidden; updateParameters reveals it when
+        # use_ast08_thermal is checked. Keeps the default dialog clean.
+        thermal_folder.enabled = False
 
         region = arcpy.Parameter(
             displayName="Region",
@@ -6284,7 +6289,7 @@ class AsterMosaic(object):
         )
 
         use_qa_planes = arcpy.Parameter(
-            displayName="Apply QA Data Plane Cloud Mask",
+            displayName="Apply QA Data Plane Quality Mask",
             name="use_qa_planes",
             datatype="GPBoolean",
             parameterType="Optional",
@@ -6320,32 +6325,24 @@ class AsterMosaic(object):
         )
         preserve_scratch.value = False
 
-        # Per-scene thermal cloud threshold. Only consulted when an
-        # AST_08 scene is paired with the AST_07XT input: pixels colder
-        # than this value are flagged as cloud regardless of VIS/SWIR
-        # brightness. 280 K catches warm maritime stratus that sits on
-        # Atlantic island summits (Faial caldera at 275-285 K); the
-        # earlier 270 K default leaked this cloud through the bright
-        # conjunction test. Raise to ~285-295 K for hot / arid AOIs
-        # (Cape Verde, Angola) where surface BT runs warmer; lower to
-        # ~255-265 K for very cold / high-altitude AOIs where ground
-        # can be cool enough to false-flag.
-        bt_threshold_k = arcpy.Parameter(
-            displayName=(
-                "Thermal Cloud Threshold (K). Pixels colder than this "
-                "are flagged as cloud when AST_08 is paired AND "
-                "'Use AST_08 thermal cloud test' is enabled below. "
-                "Default 280 K (Faial / mid-latitude maritime; catches "
-                "warm low cloud sitting on Atlantic island summits); "
-                "raise for hot AOIs, lower for high-altitude AOIs."
-            ),
-            name="bt_threshold_k",
-            datatype="GPDouble",
+        # Cloud-mask edge dilation. The per-scene reflectance + NDVI
+        # test misses a 1-3 pixel halo around marine cloud (subpixel
+        # mixing softens the edge). FocalStatistics MAXIMUM over a
+        # circular neighbourhood pulls those pixels into the mask.
+        # Mirrors the S2 tool's "Cloud Mask Buffer (pixels)" idiom.
+        # Sits with the per-scene cloud-test family at the top of the
+        # Advanced Options group; always active (no toggle gates it).
+        cloud_buffer_px = arcpy.Parameter(
+            displayName="Cloud Mask Buffer (pixels)",
+            name="cloud_buffer_px",
+            datatype="GPLong",
             parameterType="Optional",
             direction="Input",
             category="Advanced Options",
         )
-        bt_threshold_k.value = _ASTER_CLOUD_BT_MAX_K
+        cloud_buffer_px.value = _ASTER_CLOUD_BUFFER_PX
+        cloud_buffer_px.filter.type = "Range"
+        cloud_buffer_px.filter.list = [0, 10]
 
         # AST_08 (Surface Kinetic Temperature) is produced by the TES
         # algorithm AFTER the operational L2 cloud mask is already
@@ -6354,12 +6351,16 @@ class AsterMosaic(object):
         # warm-low-cloud / warm-land BT distributions also overlap, so
         # no scalar threshold separates them. The path is preserved
         # behind this opt-in switch (default OFF); prefer the temporal
-        # cleaner below for the actual cloud removal.
+        # cleaner below for the actual cloud removal. Sits BEFORE the
+        # threshold field it gates so the dialog reads top-down.
         use_ast08_thermal = arcpy.Parameter(
             displayName=(
-                "Use AST_08 thermal cloud test (OFF by default; AST_08 "
-                "is clear-sky-only and overlaps warm land, kept for "
-                "experimentation)"
+                "Use AST_08 thermal cloud test (NOT recommended). "
+                "AST_08 is produced by the TES algorithm AFTER the "
+                "operational cloud mask is applied, so over a cloud "
+                "it is NoData or a corrupted retrieval. The Phase 4 "
+                "temporal cleaner handles cloud removal. Enable ONLY "
+                "for A/B comparison runs."
             ),
             name="use_ast08_thermal",
             datatype="GPBoolean",
@@ -6369,19 +6370,47 @@ class AsterMosaic(object):
         )
         use_ast08_thermal.value = False
 
-        disable_temporal_clean = arcpy.Parameter(
+        # Per-scene thermal cloud threshold. Greyed out by default
+        # because ``use_ast08_thermal`` is OFF by default; updateParameters
+        # toggles the .enabled state when the master switch changes.
+        # 280 K catches warm maritime stratus on Atlantic island summits
+        # (Faial caldera at 275-285 K). Raise to ~285-295 K for hot /
+        # arid AOIs (Cape Verde, Angola) where surface BT runs warmer;
+        # lower to ~255-265 K for very cold / high-altitude AOIs where
+        # ground can be cool enough to false-flag.
+        bt_threshold_k = arcpy.Parameter(
             displayName=(
-                "Disable temporal outlier cleaner (NOT recommended; "
-                "this is the layer that defeats warm marine cloud over "
-                "Faial. Turn off only for A/B comparison runs)"
+                "Thermal Cloud Threshold (K). Default 280 K (Faial / "
+                "mid-latitude maritime). Raise for hot AOIs "
+                "(Cape Verde, Angola; ~285-295 K), lower for high-"
+                "altitude AOIs (~255-265 K)."
             ),
-            name="disable_temporal_clean",
+            name="bt_threshold_k",
+            datatype="GPDouble",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        bt_threshold_k.value = _ASTER_CLOUD_BT_MAX_K
+        bt_threshold_k.enabled = False
+
+        # Temporal outlier cleaner master toggle. Affirmative phrasing:
+        # default ON, the cleaner is the layer that defeats warm marine
+        # cloud over Faial. Renamed in May 2026 from the double-negative
+        # ``disable_temporal_clean`` so the dialog reads naturally.
+        enable_temporal_clean = arcpy.Parameter(
+            displayName=(
+                "Enable temporal outlier cleaner (default ON). This "
+                "is the Tmask-reduction layer that defeats warm marine "
+                "cloud over Faial. Disable only for A/B comparison runs."
+            ),
+            name="enable_temporal_clean",
             datatype="GPBoolean",
             parameterType="Optional",
             direction="Input",
             category="Advanced Options",
         )
-        disable_temporal_clean.value = False
+        enable_temporal_clean.value = True
 
         temporal_k = arcpy.Parameter(
             displayName=(
@@ -6412,34 +6441,24 @@ class AsterMosaic(object):
         )
         temporal_min_obs.value = _TMASK_MIN_OBS
 
-        # Cloud-mask edge dilation. The per-scene reflectance + NDVI
-        # test misses a 1-3 pixel halo around marine cloud (subpixel
-        # mixing softens the edge). FocalStatistics MAXIMUM over a
-        # circular neighbourhood pulls those pixels into the mask.
-        # Mirrors the S2 tool's "Cloud Mask Buffer (pixels)" idiom.
-        cloud_buffer_px = arcpy.Parameter(
-            displayName="Cloud Mask Buffer (pixels)",
-            name="cloud_buffer_px",
-            datatype="GPLong",
-            parameterType="Optional",
-            direction="Input",
-            category="Advanced Options",
-        )
-        cloud_buffer_px.value = _ASTER_CLOUD_BUFFER_PX
-        cloud_buffer_px.filter.type = "Range"
-        cloud_buffer_px.filter.list = [0, 10]
-
+        # Return order: master toggles BEFORE the values they gate so
+        # the dialog reads top-down. Per-scene cloud-mask family (always
+        # active) sits with the AST_08 thermal family (opt-in) above the
+        # temporal-cleaner family. Resume safety stays first under
+        # Advanced Options.
         return [
             gdb, mosaic_name, data_folder, thermal_folder,
             region, time_type, year, month, season,
             use_qa_planes, mask_feature, save_stats, preserve_scratch,
-            bt_threshold_k, use_ast08_thermal,
-            disable_temporal_clean, temporal_k, temporal_min_obs,
             cloud_buffer_px,
+            use_ast08_thermal, bt_threshold_k,
+            enable_temporal_clean, temporal_k, temporal_min_obs,
         ]
 
     def updateParameters(self, parameters):
         try:
+            # Existing time-filter logic: time_type at index 5 gates
+            # year (6), month (7), season (8).
             time_type = parameters[5]
             year = parameters[6]
             month = parameters[7]
@@ -6454,6 +6473,46 @@ class AsterMosaic(object):
                 year.enabled = True; month.enabled = False; season.enabled = True
             elif time_type.valueAsText == "season_all_years":
                 year.enabled = False; month.enabled = False; season.enabled = True
+
+            # AST_08 thermal family gate: use_ast08_thermal (idx 14)
+            # controls visibility of thermal_folder (idx 3) AND the BT
+            # threshold (idx 15). Default OFF keeps the dialog clean.
+            thermal_folder = parameters[3]
+            use_ast08_thermal = parameters[14]
+            bt_threshold_k = parameters[15]
+            thermal_on = bool(use_ast08_thermal.value)
+            thermal_folder.enabled = thermal_on
+            bt_threshold_k.enabled = thermal_on
+
+            # Temporal cleaner family gate: enable_temporal_clean
+            # (idx 16) controls temporal_k (17) and temporal_min_obs
+            # (18). Default ON keeps the cleaner active.
+            enable_temporal_clean = parameters[16]
+            temporal_k = parameters[17]
+            temporal_min_obs = parameters[18]
+            cleaner_on = bool(enable_temporal_clean.value)
+            temporal_k.enabled = cleaner_on
+            temporal_min_obs.enabled = cleaner_on
+        except Exception:
+            pass
+
+    def updateMessages(self, parameters):
+        """Surface a yellow warning whenever the AST_08 thermal cloud
+        test is enabled. The toggle defaults OFF and is documented as
+        NOT recommended; this nudge keeps the structural caveat
+        visible in the dialog any time the user opts in, so an
+        accidental check doesn't sail through to a multi-hour run."""
+        try:
+            use_ast08_thermal = parameters[14]
+            if use_ast08_thermal.value:
+                use_ast08_thermal.setWarningMessage(
+                    "AST_08 is clear-sky-only by construction. Over a "
+                    "cloud it is NoData or a corrupted retrieval, so "
+                    "it fails on the very pixels a cloud test needs. "
+                    "The Phase 4 temporal cleaner handles cloud "
+                    "removal. Leave this OFF unless you are running "
+                    "an explicit A/B comparison."
+                )
         except Exception:
             pass
 
@@ -6486,39 +6545,46 @@ class AsterMosaic(object):
             mask_feature = parameters[10].valueAsText
             save_stats = bool(parameters[11].value)
             preserve_scratch = bool(parameters[12].value)
-            # Thermal cloud threshold (Advanced Options). Falls back
-            # to the module default when the user leaves the field
-            # empty. Read as float, not int, since 295.5 K etc. are
-            # valid thresholds.
-            bt_threshold_k = (
-                float(parameters[13].value)
+            # Advanced Options reads. Indices match the new return
+            # order in getParameterInfo: cloud_buffer_px (13) is the
+            # always-active per-scene edge dilation; use_ast08_thermal
+            # (14) gates bt_threshold_k (15); enable_temporal_clean
+            # (16) gates temporal_k (17) and temporal_min_obs (18).
+            # bt_threshold_k stays float, not int, since 295.5 K etc.
+            # are valid thresholds.
+            cloud_buffer_px = (
+                int(parameters[13].value)
                 if len(parameters) > 13 and parameters[13].value is not None
-                else _ASTER_CLOUD_BT_MAX_K
+                else _ASTER_CLOUD_BUFFER_PX
             )
             use_ast08_thermal = (
                 bool(parameters[14].value)
                 if len(parameters) > 14 and parameters[14].value is not None
                 else False
             )
-            disable_temporal_clean = (
-                bool(parameters[15].value)
+            bt_threshold_k = (
+                float(parameters[15].value)
                 if len(parameters) > 15 and parameters[15].value is not None
-                else False
+                else _ASTER_CLOUD_BT_MAX_K
+            )
+            # Affirmative phrasing: enable_temporal_clean defaults True
+            # so the cleaner runs on default. Replaces the older
+            # disable_temporal_clean (double negative); the call sites
+            # below consume the affirmative value directly.
+            enable_temporal_clean = (
+                bool(parameters[16].value)
+                if len(parameters) > 16 and parameters[16].value is not None
+                else True
             )
             temporal_k = (
-                float(parameters[16].value)
-                if len(parameters) > 16 and parameters[16].value is not None
+                float(parameters[17].value)
+                if len(parameters) > 17 and parameters[17].value is not None
                 else _TMASK_K
             )
             temporal_min_obs = (
-                int(parameters[17].value)
-                if len(parameters) > 17 and parameters[17].value is not None
-                else _TMASK_MIN_OBS
-            )
-            cloud_buffer_px = (
                 int(parameters[18].value)
                 if len(parameters) > 18 and parameters[18].value is not None
-                else _ASTER_CLOUD_BUFFER_PX
+                else _TMASK_MIN_OBS
             )
 
             # ----------------------------------------------------------------
@@ -6571,15 +6637,15 @@ class AsterMosaic(object):
                     "  AST_08:     thermal cloud test disabled "
                     "(default; AST_08 is clear-sky-only)."
                 )
-            if disable_temporal_clean:
-                arcpy.AddMessage(
-                    "  Temporal:   outlier cleaner DISABLED "
-                    "(A/B comparison mode)."
-                )
-            else:
+            if enable_temporal_clean:
                 arcpy.AddMessage(
                     f"  Temporal:   outlier cleaner ON "
                     f"(k={temporal_k}, min_obs={temporal_min_obs})"
+                )
+            else:
+                arcpy.AddMessage(
+                    "  Temporal:   outlier cleaner DISABLED "
+                    "(A/B comparison mode)."
                 )
 
             if mask_feature and arcpy.Exists(mask_feature):
@@ -6692,7 +6758,7 @@ class AsterMosaic(object):
                     save_stats, _ASTER_MODE_FULL, "VNIR+SWIR (9-band)",
                     bt_threshold_k=bt_threshold_k,
                     use_ast08_thermal=use_ast08_thermal,
-                    disable_temporal_clean=disable_temporal_clean,
+                    enable_temporal_clean=enable_temporal_clean,
                     temporal_k=temporal_k,
                     temporal_min_obs=temporal_min_obs,
                     cloud_buffer_px=cloud_buffer_px,
@@ -6713,7 +6779,7 @@ class AsterMosaic(object):
                 save_stats, _ASTER_MODE_VNIR, "VNIR-only (3-band)",
                 bt_threshold_k=bt_threshold_k,
                 use_ast08_thermal=use_ast08_thermal,
-                disable_temporal_clean=disable_temporal_clean,
+                enable_temporal_clean=enable_temporal_clean,
                 temporal_k=temporal_k,
                 temporal_min_obs=temporal_min_obs,
                 cloud_buffer_px=cloud_buffer_px,
@@ -6759,7 +6825,7 @@ class AsterMosaic(object):
         self, scenes, gdb_path, output_name, scratch_dir,
         use_qa, mask_feature, save_stats, mode, label,
         bt_threshold_k=None, use_ast08_thermal=False,
-        disable_temporal_clean=False,
+        enable_temporal_clean=True,
         temporal_k=_TMASK_K, temporal_min_obs=_TMASK_MIN_OBS,
         cloud_buffer_px=_ASTER_CLOUD_BUFFER_PX,
     ):
@@ -6892,7 +6958,7 @@ class AsterMosaic(object):
         composite_inputs = stacked_paths
         obs_count_pub = None
         cloud_freq_pub = None
-        if disable_temporal_clean:
+        if not enable_temporal_clean:
             arcpy.AddMessage(
                 f"\n▶ Phase 4 [{label}]: Temporal cleaner DISABLED"
             )
@@ -7033,8 +7099,8 @@ class AsterMosaic(object):
                         else "n/a"
                     ),
                     "temporal_clean": (
-                        "off" if disable_temporal_clean
-                        else f"on(k={temporal_k:g},min_obs={temporal_min_obs})"
+                        f"on(k={temporal_k:g},min_obs={temporal_min_obs})"
+                        if enable_temporal_clean else "off"
                     ),
                     "toolbox_version": TOOLBOX_VERSION,
                 }
