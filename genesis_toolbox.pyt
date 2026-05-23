@@ -989,13 +989,17 @@ def _cleanup_per_scene_intermediates(scratch_dir, scene_id, keep_basenames):
     retry pass. Safe under ``preserve_scratch=True`` because resume only
     inspects the kept files.
 
-    Why it matters: without it, a long run accumulates O(n_scenes x
-    intermediates) files in one directory. NTFS directory operations
-    and the GDAL / arcpy raster-handle caches all degrade as the count
-    grows past ~1000. A 89-scene Sentinel-2 Faial run (2026-05-22)
-    climbed from 48s/scene at scene 8 to 950s/scene at scene 89, a
-    ~20x degradation; the same pipeline with this cleanup keeps
-    scratch flat at ~2 files per scene during the run.
+    Scope: scratch directory hygiene. The cleanup keeps the per-scene
+    file count flat at ~2 (stack + marker) instead of ~24, which
+    bounds disk usage on long runs and makes end-of-run cleanup
+    faster. It does NOT fix the per-scene timing degradation observed
+    on a 89-scene Sentinel-2 Faial run: a 2026-05-23 A/B against the
+    pre-cleanup baseline showed identical timing
+    (48 / 97 / 192 / 328 s/scene per 8-scene batch through scene 32).
+    The degradation is driven by something the cleanup does not touch;
+    suspected GDAL JP2 driver handle pool or Pro raster manager
+    growth, neither of which arcpy.management.ClearWorkspaceCache
+    reaches. Diagnosis pending.
     """
     if not scratch_dir or not scene_id or not os.path.isdir(scratch_dir):
         return
@@ -1016,11 +1020,14 @@ def _periodic_arcpy_cache_flush(idx, every_n=10):
     """Flush arcpy's workspace cache and Python references every N
     scenes during a long Phase 3 loop.
 
-    The arcpy workspace cache and the underlying GDAL handle pool grow
-    monotonically as rasters are opened; on a 90-scene S2 run that
-    growth was the dominant contributor to per-scene timing
-    degradation. Calling this every ``every_n`` scenes bounds the cache
-    without paying the cost on every iteration.
+    Scope: arcpy catalog cache + Python reference release. Cheap
+    insurance against arcpy holding stale workspace references on
+    long runs. Does NOT bound per-scene timing in the Sentinel-2 case
+    where the dominant degradation source sits below
+    arcpy.management.ClearWorkspaceCache (likely the GDAL JP2 driver
+    handle pool or Pro's raster manager; both opaque to arcpy).
+    Kept because the flush is near-zero cost and may help cases where
+    the cause IS arcpy cache; the S2 case is not one of them.
 
     Safe to call mid-loop because the geomedian's inputs are referenced
     by file path, not by raster object; nothing the cache holds is
