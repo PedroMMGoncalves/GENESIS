@@ -152,7 +152,7 @@ def _apply_aoi_mask_and_save(unmasked_path, mask_feature, gdb_path,
 # Method: collect a single brightness band across the co-registered scene
 # stack, compute the per-pixel temporal median and a MAD-derived robust
 # sigma, and flag any scene whose value deviates by more than ``k`` robust
-# sigmas (bright = cloud, dark = shadow). The flag is then applied to
+# sigmas (bright == cloud, dark == shadow). The flag is then applied to
 # every band of that scene-pixel via SetNull; the downstream
 # GeometricMedian composites only the survivors.
 #
@@ -282,7 +282,7 @@ def _temporal_outlier_clean(
     ``(nrows, ncols)`` flag array, saves the flag raster to scratch,
     and applies it via SetNull + CompositeBands. Peak memory is
     bounded by the larger of the pass-1 cube and the pass-2 per-scene
-    flag array — the previous single-pass design held an
+    flag array. The previous single-pass design held an
     ``(n, nrows, ncols)`` flag tensor which becomes multi-GB at
     continental AOIs.
     """
@@ -310,7 +310,7 @@ def _temporal_outlier_clean(
         ).save(bp)
         bright_paths.append(bp)
 
-    # 2) Pass 1 — walk the AOI in row stripes; accumulate per-pixel
+    # 2) Pass 1: walk the AOI in row stripes; accumulate per-pixel
     #    temporal median, robust sigma, and observation count into
     #    full-extent arrays. The cube allocation is bounded by
     #    ``block_rows``; obs_full is Int32 so it survives multi-decade
@@ -350,7 +350,7 @@ def _temporal_outlier_clean(
     # Free pass-1 cube allocations before pass 2 ramps up.
     del cube, valid, med, mad, sigma
 
-    # 3) Pass 2 — per scene, derive the drop mask stripe by stripe from
+    # 3) Pass 2: per scene, derive the drop mask stripe by stripe from
     #    the pass-1 statistics; accumulate into one ``(nrows, ncols)``
     #    flag array; save explicitly so SetNull receives a materialised
     #    raster (no lazy raster shadowing across loop iterations);
@@ -423,7 +423,7 @@ def _temporal_outlier_clean(
     else:
         say(
             "  temporal clean: no eligible scene-pixels "
-            "(coverage too sparse everywhere) — nothing flagged."
+            "(coverage too sparse everywhere); nothing flagged."
         )
 
     # 4) Evidence-quality layers. Both rasters use a NaN sentinel at
@@ -446,7 +446,7 @@ def _temporal_outlier_clean(
         freq = 1.0 - (obs_full.astype(np.float32) / float(n))
         freq[obs_full == 0] = np.nan
         arcpy.NumPyArrayToRaster(freq, ll, cw, ch).save(cloud_freq_path)
-        say(f"  temporal clean: cloud_freq written → "
+        say(f"  temporal clean: cloud_freq written -> "
             f"{os.path.basename(cloud_freq_path)}")
 
     return cleaned
@@ -1025,24 +1025,48 @@ _GEOMETRIC_MEDIAN_EPSILON = 0.001
 _GEOMETRIC_MEDIAN_MAX_ITER = 20
 
 # ASTER per-scene multi-spectral cloud test. The AST_07XT QA Data Plane
-# only flags SR retrieval status (not clouds), so we add a brightness
-# test inspired by Hulley & Hook (2008)'s ACCA-adapted ASTER cloud
-# detection. A pixel is flagged as cloud when BOTH the visible red
-# (B02) AND the SWIR (B04) reflectance exceed the thresholds below.
-# Requiring both bands separates bright cloud tops (high in VIS *and*
-# SWIR) from bright bare ground / sand / snow (high in VIS but lower
-# in SWIR). VNIR-only mosaics degrade to a B02-only test.
-# Thresholds match the conservative end of Hulley's "definitely cloud"
-# band — false-positive rate over bare basalt should be < 5%.
-_ASTER_CLOUD_B02_MIN = 0.45
-_ASTER_CLOUD_B04_MIN = 0.25
+# only flags SR retrieval status (not clouds), so the per-scene path
+# uses a hardened multi-spectral test that runs on VNIR alone (works
+# on the post-Apr-2008 majority of the archive where SWIR is dead)
+# with optional SWIR confirmation for the pre-failure subset.
+#
+# Primary VNIR test (all three thresholds must hit):
+#   (mean(B01,B02,B03N) > _BRIGHT_MIN)                  bright
+#   AND |B03N - B02| < _FLAT_TOL                        spectrally flat
+#   AND |B01 - B02|  < _FLAT_TOL                        across VNIR
+#   AND (B03N - B02)/(B03N + B02) < _NDVI_MAX           not vegetation
+#
+# Spectral flatness separates true cloud tops (flat across VNIR) from
+# bright bare basalt / sand (red-dominated) without needing SWIR. The
+# vegetation guard prevents canopy from tripping the brightness term
+# in healthy NIR. Coupled with the new Phase 4 temporal cleaner the
+# per-scene test is intentionally recall-oriented: catch gross cloud
+# cheaply, let the temporal layer handle the residue. Thresholds are
+# starting points calibrated against Faial; log to provenance and
+# revisit if the cleaner's flagged-pixel fraction trends abnormally
+# high or low on a new region.
+#
+# Optional SWIR confirmation (pre-Apr-2008 scenes only) ORs in
+# pixels bright in both red AND SWIR: a separate, narrower bright-
+# cloud signature that complements the VNIR flat-and-bright test.
+_ASTER_CLOUD_B02_MIN     = 0.30   # red brightener (SWIR-confirmed path only)
+_ASTER_CLOUD_B04_MIN     = 0.18   # SWIR brightener (SWIR-confirmed path only)
+_ASTER_CLOUD_BRIGHT_MIN  = 0.24   # mean VNIR brightness for primary test
+_ASTER_CLOUD_FLAT_TOL    = 0.06   # spectral flatness tolerance (reflectance)
+_ASTER_CLOUD_NDVI_MAX    = 0.20   # vegetation guard ceiling
+_ASTER_WATER_NDWI_MIN    = 0.00   # NDWI > 0 marks water (McFeeters 1996);
+                                  # excluded from cloud candidacy so coastal
+                                  # whitewater / surf is not flagged
+_ASTER_CLOUD_BUFFER_PX   = 3      # edge dilation radius (cells); catches the
+                                  # 1-3 px halo around marine cloud that the
+                                  # per-pixel test misses
 
 # Optional brightness-temperature cloud channel. When AST_08 (Surface
 # Kinetic Temperature, V004) scenes are paired with the AST_07XT input
 # by scene ID, pixels colder than this threshold are flagged as cloud
 # regardless of VIS/SWIR brightness. The May 2026 Faial diagnostic
-# showed that Hulley & Hook (2008)'s 295 K threshold — calibrated for
-# tropical scenes — over-masks mid-latitude Atlantic land, where
+# showed that Hulley & Hook (2008)'s 295 K threshold, calibrated for
+# tropical scenes, over-masks mid-latitude Atlantic land, where
 # daytime surface temperatures legitimately sit in the 275-296 K range
 # (cool forest canopy, north-facing slopes, early-morning passes).
 # The earlier 270 K floor proved too cold to catch warm maritime
@@ -1052,14 +1076,24 @@ _ASTER_CLOUD_B04_MIN = 0.25
 # Still well below typical daytime Faial land (vegetated slopes report
 # 285-296 K) and captures both clear cumulus tops (250-275 K) and warm
 # low-altitude marine cloud (275-280 K).
+#
+# ASTER product family caveat: AST_08 (Surface Kinetic Temperature),
+# AST_09 (VNIR/SWIR surface radiance), and AST_09T (TIR surface-
+# leaving radiance) are ALL produced AFTER the operational L2 cloud
+# mask is applied and are therefore clear-sky-only by construction.
+# None of them describe a cloud and none can be used as a cloud
+# detector. The only ASTER thermal quantity valid over cloud is at-
+# sensor TOA brightness temperature from L1B / L1T radiance; that
+# path is not implemented in GENESIS today but is the logical entry
+# point if a thermal channel is ever revisited.
 _ASTER_CLOUD_BT_MAX_K = 280.0
 
 # AST_08 V004 stores Surface Kinetic Temperature as Int16 with a scale
-# factor of 0.1 (DN × 0.1 = Kelvin). The earlier comment in this
-# module claimed COG TIFFs export already-scaled Kelvin — the
+# factor of 0.1 (DN x 0.1 = Kelvin). The earlier comment in this
+# module claimed COG TIFFs export already-scaled Kelvin; the
 # diagnostic on Faial scratch showed otherwise (raw values 2700-3000,
 # the literal DN). Applied inside ``_load_bt_kelvin`` immediately
-# after the 90 m → 15 m Resample.
+# after the 90 m to 15 m Resample.
 _ASTER_TIR_SCALE = 0.1
 
 # Lower validity bound for AST_08 Surface Kinetic Temperature, in
@@ -1082,10 +1116,10 @@ _NDVI_PERSISTENCE_THRESHOLD = 0.5
 _NDWI_WATER_THRESHOLD = 0.0
 _GDV_DRY_FLOOR = 0.3
 
-# Tool 07 stack discovery — auto-detect across the three per-scene
+# Tool 07 stack discovery: auto-detect across the three per-scene
 # scratch conventions emitted by tools 01/02/03. Each mosaic writes a
-# different filename suffix (S2 → ``*_stack.tif``, Landsat →
-# ``*_composite.tif``, ASTER → ``*_stack.tif`` or ``*_stack_vnir.tif``)
+# different filename suffix (S2 -> ``*_stack.tif``, Landsat ->
+# ``*_composite.tif``, ASTER -> ``*_stack.tif`` or ``*_stack_vnir.tif``)
 # and the user shouldn't have to know which one applies to the scratch
 # they just pointed at. When the GP parameter is left at the auto
 # label, the tool globs all three patterns and unions the results.
@@ -6200,10 +6234,10 @@ class AsterMosaic(object):
         preserve_scratch.value = False
 
         # Per-scene thermal cloud threshold. Only consulted when an
-        # AST_08 scene is paired with the AST_07XT input — pixels colder
+        # AST_08 scene is paired with the AST_07XT input: pixels colder
         # than this value are flagged as cloud regardless of VIS/SWIR
         # brightness. 280 K catches warm maritime stratus that sits on
-        # Atlantic island summits (Faial caldera at 275-285 K) — the
+        # Atlantic island summits (Faial caldera at 275-285 K); the
         # earlier 270 K default leaked this cloud through the bright
         # conjunction test. Raise to ~285-295 K for hot / arid AOIs
         # (Cape Verde, Angola) where surface BT runs warmer; lower to
@@ -6211,7 +6245,7 @@ class AsterMosaic(object):
         # can be cool enough to false-flag.
         bt_threshold_k = arcpy.Parameter(
             displayName=(
-                "Thermal Cloud Threshold (K) — pixels colder than this "
+                "Thermal Cloud Threshold (K). Pixels colder than this "
                 "are flagged as cloud when AST_08 is paired AND "
                 "'Use AST_08 thermal cloud test' is enabled below. "
                 "Default 280 K (Faial / mid-latitude maritime; catches "
@@ -6228,7 +6262,7 @@ class AsterMosaic(object):
 
         # AST_08 (Surface Kinetic Temperature) is produced by the TES
         # algorithm AFTER the operational L2 cloud mask is already
-        # applied — over a cloud it is NoData or a corrupted retrieval,
+        # applied; over a cloud it is NoData or a corrupted retrieval,
         # so it fails on precisely the pixels a cloud test needs. The
         # warm-low-cloud / warm-land BT distributions also overlap, so
         # no scalar threshold separates them. The path is preserved
@@ -6236,8 +6270,8 @@ class AsterMosaic(object):
         # cleaner below for the actual cloud removal.
         use_ast08_thermal = arcpy.Parameter(
             displayName=(
-                "Use AST_08 thermal cloud test (OFF by default — AST_08 "
-                "is clear-sky-only and overlaps warm land; kept for "
+                "Use AST_08 thermal cloud test (OFF by default; AST_08 "
+                "is clear-sky-only and overlaps warm land, kept for "
                 "experimentation)"
             ),
             name="use_ast08_thermal",
@@ -6250,9 +6284,9 @@ class AsterMosaic(object):
 
         disable_temporal_clean = arcpy.Parameter(
             displayName=(
-                "Disable temporal outlier cleaner (NOT recommended — "
+                "Disable temporal outlier cleaner (NOT recommended; "
                 "this is the layer that defeats warm marine cloud over "
-                "Faial; turn off only for A/B comparison runs)"
+                "Faial. Turn off only for A/B comparison runs)"
             ),
             name="disable_temporal_clean",
             datatype="GPBoolean",
@@ -6265,8 +6299,8 @@ class AsterMosaic(object):
         temporal_k = arcpy.Parameter(
             displayName=(
                 "Temporal cleaner: robust z-score threshold (k, in "
-                "MAD-sigma units). Lower = more aggressive. Default 2.5 "
-                "matches the Tmask paper convention."
+                "MAD-sigma units). Lower is more aggressive. Default "
+                "2.5 matches the Tmask paper convention."
             ),
             name="temporal_k",
             datatype="GPDouble",
@@ -6291,12 +6325,30 @@ class AsterMosaic(object):
         )
         temporal_min_obs.value = _TMASK_MIN_OBS
 
+        # Cloud-mask edge dilation. The per-scene reflectance + NDVI
+        # test misses a 1-3 pixel halo around marine cloud (subpixel
+        # mixing softens the edge). FocalStatistics MAXIMUM over a
+        # circular neighbourhood pulls those pixels into the mask.
+        # Mirrors the S2 tool's "Cloud Mask Buffer (pixels)" idiom.
+        cloud_buffer_px = arcpy.Parameter(
+            displayName="Cloud Mask Buffer (pixels)",
+            name="cloud_buffer_px",
+            datatype="GPLong",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        cloud_buffer_px.value = _ASTER_CLOUD_BUFFER_PX
+        cloud_buffer_px.filter.type = "Range"
+        cloud_buffer_px.filter.list = [0, 10]
+
         return [
             gdb, mosaic_name, data_folder, thermal_folder,
             region, time_type, year, month, season,
             use_qa_planes, mask_feature, save_stats, preserve_scratch,
             bt_threshold_k, use_ast08_thermal,
             disable_temporal_clean, temporal_k, temporal_min_obs,
+            cloud_buffer_px,
         ]
 
     def updateParameters(self, parameters):
@@ -6347,7 +6399,7 @@ class AsterMosaic(object):
             mask_feature = parameters[10].valueAsText
             save_stats = bool(parameters[11].value)
             preserve_scratch = bool(parameters[12].value)
-            # Thermal cloud threshold (Advanced Options) — falls back
+            # Thermal cloud threshold (Advanced Options). Falls back
             # to the module default when the user leaves the field
             # empty. Read as float, not int, since 295.5 K etc. are
             # valid thresholds.
@@ -6376,6 +6428,11 @@ class AsterMosaic(object):
                 if len(parameters) > 17 and parameters[17].value is not None
                 else _TMASK_MIN_OBS
             )
+            cloud_buffer_px = (
+                int(parameters[18].value)
+                if len(parameters) > 18 and parameters[18].value is not None
+                else _ASTER_CLOUD_BUFFER_PX
+            )
 
             # ----------------------------------------------------------------
             # AOI-first scoping. See LandsatMosaic.execute() for the full
@@ -6389,7 +6446,7 @@ class AsterMosaic(object):
             # ----------------------------------------------------------------
             # Header — one block of run context.
             arcpy.AddMessage("=" * 60)
-            arcpy.AddMessage(f"ASTER L2 MOSAIC — {region}")
+            arcpy.AddMessage(f"ASTER L2 MOSAIC ({region})")
             arcpy.AddMessage("=" * 60)
             arcpy.AddMessage(f"  Output:     {gdb_path}\\{mosaic_name}")
             arcpy.AddMessage(f"  Source:     {data_folder}")
@@ -6398,22 +6455,27 @@ class AsterMosaic(object):
                     arcpy.AddMessage(f"  Thermal:    {thermal_folder}")
                 else:
                     arcpy.AddWarning(
-                        f"  Thermal:    {thermal_folder!r} NOT FOUND — "
-                        "falling back to scanning the main data folder for AST_08"
+                        f"  Thermal:    {thermal_folder!r} NOT FOUND. "
+                        "Falling back to scanning the main data folder for AST_08."
                     )
                     thermal_folder = None
             arcpy.AddMessage(
                 f"  Options:    QA mask = {use_qa}, "
-                f"per-scene cloud test = on "
-                f"(B02 > {_ASTER_CLOUD_B02_MIN}, "
-                f"B04 > {_ASTER_CLOUD_B04_MIN}"
-                + (f", BT < {bt_threshold_k:.0f} K when AST_08 paired"
+                f"per-scene cloud test = hardened VNIR "
+                f"(brightness > {_ASTER_CLOUD_BRIGHT_MIN}, "
+                f"flat tol < {_ASTER_CLOUD_FLAT_TOL}, "
+                f"NDVI < {_ASTER_CLOUD_NDVI_MAX}; "
+                f"+ SWIR confirmation B02>{_ASTER_CLOUD_B02_MIN} & "
+                f"B04>{_ASTER_CLOUD_B04_MIN} on pre-failure scenes; "
+                f"+ NDWI water guard > {_ASTER_WATER_NDWI_MIN}; "
+                f"+ {cloud_buffer_px}px edge dilation"
+                + (f"; + BT < {bt_threshold_k:.0f} K when AST_08 paired"
                    if use_ast08_thermal else "")
                 + ")"
             )
             if use_ast08_thermal:
                 arcpy.AddMessage(
-                    "  AST_08:     thermal cloud test ENABLED — note "
+                    "  AST_08:     thermal cloud test ENABLED. Note: "
                     "AST_08 is clear-sky-only by construction and may "
                     "give misleading results over cloud."
                 )
@@ -6546,6 +6608,7 @@ class AsterMosaic(object):
                     disable_temporal_clean=disable_temporal_clean,
                     temporal_k=temporal_k,
                     temporal_min_obs=temporal_min_obs,
+                    cloud_buffer_px=cloud_buffer_px,
                 )
                 if output_full:
                     outputs.append(output_full)
@@ -6566,6 +6629,7 @@ class AsterMosaic(object):
                 disable_temporal_clean=disable_temporal_clean,
                 temporal_k=temporal_k,
                 temporal_min_obs=temporal_min_obs,
+                cloud_buffer_px=cloud_buffer_px,
             )
             if output_vnir:
                 outputs.append(output_vnir)
@@ -6610,6 +6674,7 @@ class AsterMosaic(object):
         bt_threshold_k=None, use_ast08_thermal=False,
         disable_temporal_clean=False,
         temporal_k=_TMASK_K, temporal_min_obs=_TMASK_MIN_OBS,
+        cloud_buffer_px=_ASTER_CLOUD_BUFFER_PX,
     ):
         """Run Phases 3-5 over a scene list in one of the supported modes.
 
@@ -6685,6 +6750,7 @@ class AsterMosaic(object):
                     scene, scratch_dir, use_qa, mode,
                     bt_threshold_k=bt_threshold_k,
                     use_ast08_thermal=use_ast08_thermal,
+                    cloud_buffer_px=cloud_buffer_px,
                 )
             except Exception as e:
                 arcpy.AddWarning(f"  ✗ {scene['scene_id']}: {e}")
@@ -6721,7 +6787,7 @@ class AsterMosaic(object):
         # published in Phase 4 still survive at their final location.
         output_path = os.path.join(gdb_path, output_name)
 
-        # Phase 4 — Temporal outlier cleaner (Tmask reduction).
+        # Phase 4: Temporal outlier cleaner (Tmask reduction).
         # Runs per-pixel robust z-score against each pixel's own clear-
         # sky history; flags warm marine cloud that no per-scene
         # spectral threshold can separate from warm land. Default ON;
@@ -6732,7 +6798,7 @@ class AsterMosaic(object):
         # Treat both as inputs to downstream uncertainty propagation,
         # not as QA to discard. Sidecars are CopyRaster-published from
         # scratch to the GDB sidecar folder inside this phase so they
-        # survive both scratch cleanup AND a Phase 5 failure — the
+        # survive both scratch cleanup AND a Phase 5 failure. The
         # cleaner output is the diagnostic users need to triage a
         # GeometricMedian crash.
         composite_inputs = stacked_paths
@@ -6740,7 +6806,7 @@ class AsterMosaic(object):
         cloud_freq_pub = None
         if disable_temporal_clean:
             arcpy.AddMessage(
-                f"\n▶ Phase 4 [{label}] — Temporal cleaner DISABLED"
+                f"\n▶ Phase 4 [{label}]: Temporal cleaner DISABLED"
             )
         else:
             scratch_obs = os.path.join(
@@ -6752,7 +6818,7 @@ class AsterMosaic(object):
             cleaner_ran = False
             try:
                 with phase(
-                    f"Phase 4 [{label}] — Temporal outlier cleaner "
+                    f"Phase 4 [{label}]: Temporal outlier cleaner "
                     f"(k={temporal_k}, min_obs={temporal_min_obs})",
                     quiet_close=True,
                 ) as ph4:
@@ -6782,7 +6848,7 @@ class AsterMosaic(object):
                 composite_inputs = stacked_paths
 
             # Publish evidence layers from scratch to the GDB sidecar
-            # folder. Independent of Phase 5 outcome — runs as long as
+            # folder. Independent of Phase 5 outcome; runs as long as
             # the cleaner produced files. Delete-then-CopyRaster is
             # tolerant of catalog locks from a previous run that
             # ``.save()`` overwrite would trip on.
@@ -6799,7 +6865,7 @@ class AsterMosaic(object):
                             arcpy.management.Delete(dst)
                         arcpy.management.CopyRaster(src, dst)
                         arcpy.AddMessage(
-                            f"  ✓ Evidence layer → {os.path.basename(dst)}"
+                            f"  ✓ Evidence layer -> {os.path.basename(dst)}"
                         )
                         if suffix == "_obs_count.tif":
                             obs_count_pub = dst
@@ -6865,7 +6931,28 @@ class AsterMosaic(object):
                     )
 
             if save_stats:
-                self._write_provenance_csv(final_path, scenes_used)
+                run_config = {
+                    "cloud_bright_min": _ASTER_CLOUD_BRIGHT_MIN,
+                    "cloud_flat_tol": _ASTER_CLOUD_FLAT_TOL,
+                    "cloud_ndvi_max": _ASTER_CLOUD_NDVI_MAX,
+                    "water_ndwi_min": _ASTER_WATER_NDWI_MIN,
+                    "swir_confirm_b02_min": _ASTER_CLOUD_B02_MIN,
+                    "swir_confirm_b04_min": _ASTER_CLOUD_B04_MIN,
+                    "cloud_buffer_px": cloud_buffer_px,
+                    "use_ast08_thermal": use_ast08_thermal,
+                    "bt_threshold_k": (
+                        f"{bt_threshold_k:g}" if use_ast08_thermal
+                        else "n/a"
+                    ),
+                    "temporal_clean": (
+                        "off" if disable_temporal_clean
+                        else f"on(k={temporal_k:g},min_obs={temporal_min_obs})"
+                    ),
+                    "toolbox_version": TOOLBOX_VERSION,
+                }
+                self._write_provenance_csv(
+                    final_path, scenes_used, run_config=run_config,
+                )
             _write_band_sidecar_csv(
                 final_path,
                 "aster-vnir" if mode == _ASTER_MODE_VNIR else "aster",
@@ -6892,7 +6979,7 @@ class AsterMosaic(object):
                             arcpy.management.Delete(dst)
                         arcpy.management.Rename(src_pub, dst)
                         arcpy.AddMessage(
-                            f"  ✓ Evidence layer renamed → "
+                            f"  ✓ Evidence layer renamed -> "
                             f"{os.path.basename(dst)}"
                         )
                     except arcpy.ExecuteError as e:
@@ -7111,7 +7198,8 @@ class AsterMosaic(object):
         return all(b in files for b in _ASTER_SWIR_BANDS)
 
     def _process_scene(self, scene, scratch_dir, use_qa, mode,
-                       bt_threshold_k=None, use_ast08_thermal=False):
+                       bt_threshold_k=None, use_ast08_thermal=False,
+                       cloud_buffer_px=_ASTER_CLOUD_BUFFER_PX):
         """Apply scale + resample + QA mask + stack → single multi-band raster.
 
         Parameters
@@ -7209,25 +7297,64 @@ class AsterMosaic(object):
                 band_raster = arcpy.sa.Raster(src)
             scaled[band] = Float(band_raster) * _ASTER_REFLECTANCE_SCALE
 
-        # Per-scene multi-spectral cloud test. Hulley & Hook (2008)'s
-        # ACCA-on-ASTER uses VIS + SWIR + TIR; we follow the same
-        # decomposition. The VIS/SWIR conjunction
-        #     (B02 > _B02_MIN) AND (B04 > _B04_MIN)
-        # separates true cloud tops (bright in BOTH red and SWIR) from
-        # bright bare basalt / sand (bright in VIS, dim in SWIR). VNIR-only
-        # scenes have no B04, so they fall back to a B02-only test, which
-        # over-flags bright bare ground; the optional thermal channel
-        # below partially compensates when paired with an AST_08 scene.
-        cloud_vis = scaled["B02"] > _ASTER_CLOUD_B02_MIN
+        # Per-scene multi-spectral cloud test (hardened, VNIR-driven).
+        # Primary test runs on VNIR alone so the post-Apr-2008 majority
+        # of the archive (no SWIR) gets a real test, not a single-
+        # threshold red brightener. Cloud over a vegetated basaltic
+        # island is bright, spectrally flat across VNIR, and low-NDVI;
+        # vegetation is high-NDVI; bare basalt is bright but red-
+        # dominated (not flat); water and shadow are dark. Optional
+        # SWIR confirmation tightens the test on pre-failure scenes.
+        # Coupled with the temporal cleaner in Phase 4, the per-scene
+        # path is deliberately recall-oriented: catch gross cloud
+        # cheaply, let the temporal layer handle the residue.
+        b1 = scaled["B01"]      # green
+        b2 = scaled["B02"]      # red
+        b3 = scaled["B03N"]     # NIR
+
+        brightness = (b1 + b2 + b3) / 3.0
+        ndvi = (b3 - b2) / (b3 + b2 + 1e-6)
+
+        # Spectral flatness proxy: |B03N - B02| AND |B01 - B02| both
+        # small. Two pairs of inequalities instead of arcpy.sa.Abs so
+        # we don't import a third name just for the absolute value.
+        nir_red = b3 - b2
+        grn_red = b1 - b2
+        flat = (
+            (nir_red < _ASTER_CLOUD_FLAT_TOL)
+            & (nir_red > -_ASTER_CLOUD_FLAT_TOL)
+            & (grn_red < _ASTER_CLOUD_FLAT_TOL)
+            & (grn_red > -_ASTER_CLOUD_FLAT_TOL)
+        )
+
+        cloud_vis_swir = (
+            (brightness > _ASTER_CLOUD_BRIGHT_MIN)
+            & flat
+            & (ndvi < _ASTER_CLOUD_NDVI_MAX)
+        )
+
+        # SWIR confirmation. ORs in pixels bright in BOTH red AND SWIR:
+        # a narrower bright-cloud signature complementary to the VNIR
+        # flat-and-bright test. Skipped on VNIR-only stacks.
         if "B04" in scaled:
-            cloud_vis_swir = cloud_vis & (scaled["B04"] > _ASTER_CLOUD_B04_MIN)
-        else:
-            cloud_vis_swir = cloud_vis
+            cloud_vis_swir = cloud_vis_swir | (
+                (b2 > _ASTER_CLOUD_B02_MIN)
+                & (scaled["B04"] > _ASTER_CLOUD_B04_MIN)
+            )
+
+        # NDWI water guard (McFeeters 1996). NDWI > 0 marks open water;
+        # coastal whitewater / surf can be bright and spectrally
+        # flat-ish, tripping the cloud test. Excluded from cloud
+        # candidacy so the temporal median composites the water
+        # without per-scene whitewater holes.
+        ndwi = (b1 - b3) / (b1 + b3 + 1e-6)
+        water = ndwi > _ASTER_WATER_NDWI_MIN
+        cloud_vis_swir = cloud_vis_swir & ~water
 
         # Optional thermal channel. AST_08 (Surface Kinetic Temperature)
         # is produced by the TES algorithm AFTER the operational L2
         # cloud mask is already applied, so over cloud it is NoData or a
-        # corrupted retrieval — it fails on precisely the pixels a cloud
+        # corrupted retrieval; it fails on precisely the pixels a cloud
         # test needs, and the warm-cloud / warm-land BT distributions
         # overlap besides. The path is preserved for experimentation
         # but is OFF by default; the temporal cleaner in Phase 4
@@ -7245,6 +7372,32 @@ class AsterMosaic(object):
         else:
             cloud_mask = cloud_vis_swir
 
+        # Edge dilation. Marine cloud has a soft 1-3 pixel halo from
+        # subpixel mixing that the per-pixel test misses; a circular
+        # FocalStatistics MAXIMUM pulls those pixels into the mask.
+        # Mirrors the S2 tool's cloud-buffer idiom. Materialised to
+        # scratch so the diagnostic below + downstream SetNull both
+        # consume a real raster (no lazy-expression re-evaluation).
+        if cloud_buffer_px and cloud_buffer_px > 0:
+            try:
+                buffered_path = os.path.join(
+                    scratch_dir, f"{scene_id}_cloudbuf.tif",
+                )
+                cloud_bin = arcpy.sa.Con(cloud_mask, 1, 0)
+                buffered = arcpy.sa.FocalStatistics(
+                    cloud_bin,
+                    arcpy.sa.NbrCircle(cloud_buffer_px, "CELL"),
+                    "MAXIMUM",
+                    "DATA",
+                )
+                buffered.save(buffered_path)
+                cloud_mask = arcpy.sa.Raster(buffered_path) > 0
+            except arcpy.ExecuteError as e:
+                arcpy.AddWarning(
+                    f"    cloud dilation failed ({e}); using "
+                    "undilated mask"
+                )
+
         # Per-scene cloud diagnostic. Materialises the lazy cloud mask
         # once and reads it via numpy to get the flagged-pixel fraction;
         # also surfaces the AST_08 BT min/median/max so threshold tuning
@@ -7259,6 +7412,11 @@ class AsterMosaic(object):
             cm_total = int(cm_arr.size)
             cm_flagged = int(cm_arr.sum())
             cm_pct = 100.0 * cm_flagged / cm_total if cm_total else 0.0
+            # Attach to the shared metadata dict so the provenance CSV
+            # row for this scene can surface it without re-deriving.
+            # ``dict(scene, ...)`` on line 7213 creates a new outer dict
+            # but the metadata reference is shared with the caller.
+            scene["metadata"]["cloud_pct"] = round(cm_pct, 2)
             bt_stats = ""
             if bt_kelvin is not None:
                 try:
@@ -7479,17 +7637,31 @@ class AsterMosaic(object):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _write_provenance_csv(output_raster_path, scenes_used):
+    def _write_provenance_csv(output_raster_path, scenes_used, run_config=None):
+        """Write the per-scene provenance CSV. Optional ``run_config``
+        is serialised as a leading ``# run config: k=v; ...`` comment
+        line so consumers with ``comment='#'`` skip it cleanly. The
+        per-scene rows include a ``cloud_pct`` column carrying the
+        flagged-pixel fraction from the per-scene cloud diagnostic
+        (populated when ``_process_scene`` ran the diagnostic block,
+        which is the default path).
+        """
         if not output_raster_path or not scenes_used:
             return
         try:
             csv_path = _sidecar_path_for_raster(output_raster_path, "_provenance.csv")
             now_iso = datetime.now().isoformat(timespec="seconds")
             with open(csv_path, "w", encoding="utf-8", newline="") as fh:
+                if run_config:
+                    config_str = "; ".join(
+                        f"{k}={v}" for k, v in run_config.items()
+                    )
+                    fh.write(f"# run config: {config_str}\n")
                 writer = csv.writer(fh, quoting=csv.QUOTE_MINIMAL)
                 writer.writerow([
                     "scene_id", "sensor", "acquisition_datetime",
                     "pass_number", "input_format", "input_path",
+                    "cloud_pct",
                     "processing_baseline", "toolbox_version",
                     "processing_datetime",
                 ])
@@ -7512,6 +7684,7 @@ class AsterMosaic(object):
                         meta.get("pass_number", ""),
                         scene.get("format", ""),
                         input_path,
+                        meta.get("cloud_pct", ""),
                         "AST_07XT V004",
                         TOOLBOX_VERSION,
                         now_iso,
@@ -10605,7 +10778,7 @@ class TemporalStatistics(object):
         stack_pattern = arcpy.Parameter(
             displayName=(
                 "Stack Filename Pattern (advanced; default auto-detects "
-                "across the three mosaic conventions — `*_stack.tif` "
+                "across the three mosaic conventions: `*_stack.tif` "
                 "(S2 / ASTER 9-band), `*_stack_vnir.tif` (ASTER VNIR), "
                 "and `*_composite.tif` (Landsat). Pick a single pattern "
                 "to restrict the scan."
@@ -10684,7 +10857,7 @@ class TemporalStatistics(object):
             if stack_pattern == _TOOL07_AUTO_LABEL:
                 discovery_patterns = list(_TOOL07_AUTO_PATTERNS)
                 pattern_display = (
-                    f"{_TOOL07_AUTO_LABEL} → "
+                    f"{_TOOL07_AUTO_LABEL} -> "
                     + ", ".join(_TOOL07_AUTO_PATTERNS)
                 )
             else:
