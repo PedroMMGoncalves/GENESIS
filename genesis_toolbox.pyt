@@ -978,6 +978,63 @@ def _cleanup_scratch_folder(scratch_dir):
         )
 
 
+def _cleanup_per_scene_intermediates(scratch_dir, scene_id, keep_basenames):
+    """Delete a scene's per-scene intermediate files after its final
+    stack has been written. Bounded by the ``{scene_id}*`` glob so it
+    cannot touch another scene's files; ``keep_basenames`` is the set
+    of basenames (final stack + resume marker) that must survive.
+
+    Best-effort: any file that can't be removed (catalog lock, transient
+    GDAL handle) stays for the end-of-run ``_cleanup_scratch_folder``
+    retry pass. Safe under ``preserve_scratch=True`` because resume only
+    inspects the kept files.
+
+    Why it matters: without it, a long run accumulates O(n_scenes x
+    intermediates) files in one directory. NTFS directory operations
+    and the GDAL / arcpy raster-handle caches all degrade as the count
+    grows past ~1000. A 89-scene Sentinel-2 Faial run (2026-05-22)
+    climbed from 48s/scene at scene 8 to 950s/scene at scene 89, a
+    ~20x degradation; the same pipeline with this cleanup keeps
+    scratch flat at ~2 files per scene during the run.
+    """
+    if not scratch_dir or not scene_id or not os.path.isdir(scratch_dir):
+        return
+    keep_paths = {os.path.join(scratch_dir, b) for b in keep_basenames}
+    for path in glob.glob(os.path.join(scratch_dir, scene_id + "*")):
+        if path in keep_paths:
+            continue
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def _periodic_arcpy_cache_flush(idx, every_n=10):
+    """Flush arcpy's workspace cache and Python references every N
+    scenes during a long Phase 3 loop.
+
+    The arcpy workspace cache and the underlying GDAL handle pool grow
+    monotonically as rasters are opened; on a 90-scene S2 run that
+    growth was the dominant contributor to per-scene timing
+    degradation. Calling this every ``every_n`` scenes bounds the cache
+    without paying the cost on every iteration.
+
+    Safe to call mid-loop because the geomedian's inputs are referenced
+    by file path, not by raster object; nothing the cache holds is
+    load-bearing between scenes.
+    """
+    if idx <= 0 or idx % every_n != 0:
+        return
+    try:
+        arcpy.management.ClearWorkspaceCache()
+    except Exception:
+        pass
+    gc.collect()
+
+
 # ---------------------------------------------------------------------------
 # Internal tunables. Hoisted from inline values so callers can read and
 # adjust knobs in one place. Underscore-prefixed because they're not a
@@ -3440,10 +3497,26 @@ class LandsatMosaic(object):
                     pass
                 multiband_rasters.append(temp_composite)
 
+                # Per-scene scratch cleanup: rmtree the {scene_id}/
+                # subfolder that held vmask.tif (and anything else
+                # arcpy / GDAL parked under the scene_id prefix). Keeps
+                # the final composite + resume marker. Bounds scratch
+                # growth so NTFS directory ops + GDAL handle caches
+                # stay cheap on long runs.
+                sid_safe = _sanitize_arcpy_name(scene_id)
+                _cleanup_per_scene_intermediates(
+                    scratch_dir, sid_safe,
+                    keep_basenames=(
+                        f"{sid_safe}_composite.tif",
+                        f"{sid_safe}_composite.tif.complete",
+                    ),
+                )
+
                 scene_times.append(
                     (datetime.now() - scene_start).total_seconds()
                 )
                 arcpy.SetProgressorPosition(composite_idx)
+                _periodic_arcpy_cache_flush(composite_idx)
 
                 # Periodic Messages-tab update — ~10 lines for the phase.
                 if composite_idx % log_every == 0 or composite_idx == len(to_process):
@@ -5271,6 +5344,7 @@ class Sentinel2Mosaic(object):
                         (datetime.now() - scene_start).total_seconds()
                     )
                 arcpy.SetProgressorPosition(idx)
+                _periodic_arcpy_cache_flush(idx)
                 # Periodic message ~10× during the phase
                 if idx % log_every == 0 or idx == len(to_process):
                     if scene_times:
@@ -5836,6 +5910,19 @@ class Sentinel2Mosaic(object):
                 fh.write(datetime.now().isoformat(timespec="seconds") + "\n")
         except OSError:
             pass  # Non-fatal — without the marker the scene rebuilds next run
+
+        # Per-scene scratch cleanup: drop the SCL extract, cloud buffer,
+        # the eight per-band 10m resamples, and the twelve per-band
+        # masked rasters. Keeps the final stack + resume marker. Bounds
+        # scratch growth so NTFS directory ops + GDAL handle caches
+        # stay cheap as the Phase 3 loop runs.
+        _cleanup_per_scene_intermediates(
+            scratch_dir, scene_id,
+            keep_basenames=(
+                f"{scene_id}_stack.tif",
+                f"{scene_id}_stack.tif.complete",
+            ),
+        )
 
         return stacked_path
 
@@ -6761,6 +6848,7 @@ class AsterMosaic(object):
                 scenes_used.append(scene)
                 scene_times.append((datetime.now() - scene_start).total_seconds())
             arcpy.SetProgressorPosition(idx)
+            _periodic_arcpy_cache_flush(idx)
             if idx % log_every == 0 or idx == len(to_process):
                 if scene_times:
                     avg = sum(scene_times) / len(scene_times)
@@ -7466,6 +7554,20 @@ class AsterMosaic(object):
                 fh.write(datetime.now().isoformat(timespec="seconds") + "\n")
         except OSError:
             pass
+
+        # Per-scene scratch cleanup: drop QA_15m, per-band 15m resamples,
+        # per-band masked rasters, cloudmask diagnostic save, cloudbuf
+        # dilation save, and any HDF subdataset extracts. Keeps the
+        # final stack + resume marker; the Phase 4 temporal cleaner's
+        # brightness extracts and cleaned stacks are created LATER (in
+        # ``_temporal_outlier_clean``) and therefore aren't touched.
+        _cleanup_per_scene_intermediates(
+            scratch_dir, scene_id,
+            keep_basenames=(
+                f"{scene_id}{stack_suffix}",
+                f"{scene_id}{stack_suffix}.complete",
+            ),
+        )
 
         return stacked
 
