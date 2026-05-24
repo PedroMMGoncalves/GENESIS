@@ -46,6 +46,7 @@ import gc
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 import arcpy.sa
@@ -11506,20 +11507,114 @@ class TemporalStatistics(object):
         )
         save_stats.value = True
 
+        stat_source = arcpy.Parameter(
+            displayName="Statistics Source",
+            name="stat_source",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input",
+        )
+        stat_source.filter.list = [
+            "NDVI/NDWI (multispectral stacks)",
+            "LST (AST_08 thermal)",
+            "LST (Landsat ST_B10 thermal)",
+        ]
+        stat_source.value = "NDVI/NDWI (multispectral stacks)"
+
+        ast08_folder = arcpy.Parameter(
+            displayName=(
+                "AST_08 Folder (LST AST_08 mode only; walked recursively "
+                "for AST_08 TIFFs and HDFs; TIFF preferred when both "
+                "formats coexist for the same scene_id)"
+            ),
+            name="ast08_folder",
+            datatype="DEFolder",
+            parameterType="Optional",
+            direction="Input",
+        )
+
+        lst_cool_delta_k = arcpy.Parameter(
+            displayName=(
+                "LST cool-persistence delta (K below per-scene spatial "
+                "mean; default 2.0)"
+            ),
+            name="lst_cool_delta_k",
+            datatype="GPDouble",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        lst_cool_delta_k.value = 2.0
+
+        lst_warm_delta_k = arcpy.Parameter(
+            displayName=(
+                "LST warm-persistence delta (K above per-scene spatial "
+                "mean; default 4.0)"
+            ),
+            name="lst_warm_delta_k",
+            datatype="GPDouble",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        lst_warm_delta_k.value = 4.0
+
         return [
             scratch, out_workspace, out_prefix, sensor_type, region,
             stratification, stack_pattern, mask_feature, save_stats,
+            stat_source, ast08_folder, lst_cool_delta_k, lst_warm_delta_k,
         ]
 
     def updateParameters(self, parameters):
-        """Enable Region only when stratification = Per season."""
+        """Mode-aware enable/disable.
+
+        Region is only consulted under Per-season stratification. The
+        Statistics Source choice drives which input set is live:
+        NDVI/NDWI needs Mosaic Scratch Folder + Stack Filename Pattern;
+        the LST modes need AST_08 Folder + LST persistence deltas.
+        """
         try:
             stratification = parameters[5]
             region = parameters[4]
-            if stratification.valueAsText == "Per season":
-                region.enabled = True
-            else:
-                region.enabled = False
+            region.enabled = (stratification.valueAsText == "Per season")
+
+            stat_source = (parameters[9].valueAsText or "")
+            scratch = parameters[0]
+            stack_pattern = parameters[6]
+            ast08_folder = parameters[10]
+            lst_cool = parameters[11]
+            lst_warm = parameters[12]
+            is_lst = stat_source.startswith("LST")
+            scratch.enabled = not is_lst
+            stack_pattern.enabled = not is_lst
+            ast08_folder.enabled = is_lst
+            lst_cool.enabled = is_lst
+            lst_warm.enabled = is_lst
+        except Exception:
+            pass
+
+    def updateMessages(self, parameters):
+        """Mode-aware required-input validation. ``scratch`` is declared
+        Required in getParameterInfo for NDVI/NDWI; for the LST modes we
+        forgive the missing scratch and instead require ast08_folder.
+        Landsat ST_B10 is parameter-flagged as not yet implemented."""
+        try:
+            stat_source = (parameters[9].valueAsText or "")
+            scratch = parameters[0]
+            ast08_folder = parameters[10]
+            if stat_source == "LST (AST_08 thermal)":
+                scratch.clearMessage()
+                if not ast08_folder.valueAsText:
+                    ast08_folder.setErrorMessage(
+                        "AST_08 Folder is required for the LST (AST_08 "
+                        "thermal) mode."
+                    )
+            elif stat_source == "LST (Landsat ST_B10 thermal)":
+                scratch.clearMessage()
+                parameters[9].setErrorMessage(
+                    "LST (Landsat ST_B10 thermal) mode is not yet "
+                    "implemented. Pick NDVI/NDWI or LST (AST_08 thermal)."
+                )
         except Exception:
             pass
 
@@ -11544,6 +11639,25 @@ class TemporalStatistics(object):
             stack_pattern = parameters[6].valueAsText or _TOOL07_AUTO_LABEL
             mask_feature = parameters[7].valueAsText
             save_stats = bool(parameters[8].value)
+            stat_source = (
+                parameters[9].valueAsText
+                if len(parameters) > 9 and parameters[9].valueAsText
+                else "NDVI/NDWI (multispectral stacks)"
+            )
+            ast08_folder = (
+                parameters[10].valueAsText
+                if len(parameters) > 10 else None
+            )
+            cool_delta_k = (
+                float(parameters[11].value)
+                if len(parameters) > 11 and parameters[11].value is not None
+                else 2.0
+            )
+            warm_delta_k = (
+                float(parameters[12].value)
+                if len(parameters) > 12 and parameters[12].value is not None
+                else 4.0
+            )
 
             if stack_pattern == _TOOL07_AUTO_LABEL:
                 discovery_patterns = list(_TOOL07_AUTO_PATTERNS)
@@ -11558,9 +11672,8 @@ class TemporalStatistics(object):
             arcpy.AddMessage("=" * 60)
             arcpy.AddMessage(f"TEMPORAL STATISTICS — prefix: {out_prefix}")
             arcpy.AddMessage("=" * 60)
-            arcpy.AddMessage(f"  Scratch:        {scratch_dir}")
+            arcpy.AddMessage(f"  Source mode:    {stat_source}")
             arcpy.AddMessage(f"  Output:         {out_workspace}")
-            arcpy.AddMessage(f"  Pattern:        {pattern_display}")
             arcpy.AddMessage(f"  Stratification: {stratification}")
 
             if mask_feature and arcpy.Exists(mask_feature):
@@ -11571,6 +11684,37 @@ class TemporalStatistics(object):
                 arcpy.AddWarning(
                     f"  AOI: {mask_feature!r} NOT FOUND — full extent"
                 )
+
+            # Mode dispatch. The LST modes share AOI handling and
+            # provenance shape with NDVI/NDWI but discover scenes from
+            # an AST_08 / Landsat folder rather than a mosaic scratch
+            # of multi-band stacks.
+            if stat_source == "LST (AST_08 thermal)":
+                self._execute_thermal_ast08(
+                    ast08_folder=ast08_folder,
+                    out_workspace=out_workspace,
+                    out_prefix=out_prefix,
+                    region=region,
+                    stratification=stratification,
+                    cool_delta_k=cool_delta_k,
+                    warm_delta_k=warm_delta_k,
+                    save_stats=save_stats,
+                )
+                arcpy.AddMessage("\n" + "=" * 60)
+                arcpy.AddMessage("DONE")
+                arcpy.AddMessage("=" * 60)
+                return None
+            if stat_source == "LST (Landsat ST_B10 thermal)":
+                arcpy.AddError(
+                    "LST (Landsat ST_B10 thermal) mode is not yet "
+                    "implemented. Pick NDVI/NDWI or LST (AST_08 thermal)."
+                )
+                return None
+
+            # NDVI/NDWI path. Restore the mode-specific header lines
+            # that don't apply to the LST modes.
+            arcpy.AddMessage(f"  Scratch:        {scratch_dir}")
+            arcpy.AddMessage(f"  Pattern:        {pattern_display}")
 
             # Discover stacks across all selected patterns and union.
             found = []
@@ -11937,6 +12081,339 @@ class TemporalStatistics(object):
             arcpy.AddMessage(f"  Provenance CSV: {csv_path}")
         except OSError as e:
             arcpy.AddWarning(f"  Could not write provenance CSV ({e})")
+
+    # ------------------------------------------------------------------
+    # LST (AST_08) thermal mode
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _discover_ast08(folder):
+        """Walk ``folder`` recursively for AST_08 files. Pair TIFF and
+        HDF on the 17-char scene_id (TIFF wins when both formats exist
+        for the same scene, matching the AsterMosaic discovery
+        convention). Returns ``(paths, metas)`` aligned by index; each
+        meta is ``{"scene_id", "acquisition_date", "format"}``.
+        """
+        by_sid = {}  # scene_id -> list[(fmt, path)]
+        for root, _, files in os.walk(folder):
+            for name in files:
+                scene_id = AsterMosaic._parse_ast08_filename(name)
+                if not scene_id:
+                    continue
+                ext = os.path.splitext(name)[1].lower()
+                fmt = "hdf" if ext == ".hdf" else "tiff"
+                by_sid.setdefault(scene_id, []).append(
+                    (fmt, os.path.join(root, name))
+                )
+
+        paths = []
+        metas = []
+        for sid, candidates in by_sid.items():
+            # Prefer TIFF when both formats coexist; fall back to HDF.
+            chosen = next(
+                ((f, p) for (f, p) in candidates if f == "tiff"),
+                candidates[0],
+            )
+            fmt, path = chosen
+            # scene_id layout (17 chars): PPP MM DD YYYY HHMMSS
+            try:
+                acq = datetime(
+                    int(sid[7:11]), int(sid[3:5]), int(sid[5:7]),
+                ).date()
+            except (ValueError, IndexError):
+                acq = None
+            paths.append(path)
+            metas.append({
+                "scene_id": sid,
+                "acquisition_date": acq,
+                "format": fmt,
+            })
+
+        # Sort by acquisition date for deterministic order; undated
+        # entries (corrupt filenames) go to the end.
+        paired = sorted(
+            zip(paths, metas),
+            key=lambda pm: pm[1]["acquisition_date"] or datetime.max.date(),
+        )
+        if paired:
+            paths, metas = map(list, zip(*paired))
+        return paths, metas
+
+    @staticmethod
+    def _materialise_kelvin_group(paths, meta_by_path, scratch, group_name):
+        """For each AST_08 path in the group, build the Kelvin raster
+        via ``_aster_bt_kelvin_from_path`` at native 90 m, materialise
+        to a scratch TIFF, and collect the saved path. AOI clipping
+        falls out of the active ``arcpy.env.mask`` / ``env.extent``,
+        which are set by the caller. Returns list of saved paths;
+        scenes that fail to load are skipped with a warning.
+        """
+        saved = []
+        for p in paths:
+            meta = meta_by_path.get(p, {})
+            sid = meta.get("scene_id") or "scene"
+            try:
+                bt = _aster_bt_kelvin_from_path(
+                    p, scratch, target_cellsize=None, scene_id=sid,
+                )
+                out_k = os.path.join(scratch, f"{group_name}_{sid}_K.tif")
+                bt.save(out_k)
+                saved.append(out_k)
+            except Exception as e:
+                arcpy.AddWarning(f"    ✗ {sid}: BT load failed ({e}); skipped")
+        return saved
+
+    def _compute_thermal_stats(self, group_name, kelvin_paths, out_workspace,
+                                prefix, stratified, cool_delta_k, warm_delta_k):
+        """CellStatistics min/max/mean/std + LST_obs_count +
+        LST_persistence_cool/warm over a group's materialised Kelvin
+        rasters. Returns ``{stat_tag: out_path}``.
+
+        Persistence is per-scene-relative: each input scene contributes
+        a binary raster (1 where the pixel is colder than the scene's
+        spatial mean minus cool_delta_k, or warmer than the mean plus
+        warm_delta_k), summed across the group. Per-scene means are
+        read from the saved TIFFs via GetRasterProperties, which honours
+        env.mask so the scalar is AOI-restricted.
+        """
+        suffix = f"_{group_name}" if stratified else ""
+        outputs = {}
+
+        bt_rasters = [arcpy.sa.Raster(p) for p in kelvin_paths]
+        valid_masks = [
+            arcpy.sa.Con(arcpy.sa.IsNull(r), 0, 1) for r in bt_rasters
+        ]
+
+        # Per-scene spatial mean for the persistence thresholds.
+        scene_means = []
+        for p in kelvin_paths:
+            try:
+                m = float(
+                    arcpy.management.GetRasterProperties(p, "MEAN").getOutput(0)
+                )
+            except Exception:
+                m = None
+            scene_means.append(m)
+
+        # Moments
+        for stat_tag, method in (
+            ("LST_min", "MINIMUM"),
+            ("LST_max", "MAXIMUM"),
+            ("LST_mean", "MEAN"),
+            ("LST_std", "STD"),
+        ):
+            out_path = _build_workspace_subfolder_path(
+                out_workspace, f"{prefix}_{stat_tag}{suffix}", "temporal",
+            )
+            try:
+                arcpy.sa.CellStatistics(
+                    kelvin_paths, statistics_type=method, ignore_nodata="DATA",
+                ).save(out_path)
+                outputs[stat_tag] = out_path
+                arcpy.AddMessage(f"    → {os.path.basename(out_path)}")
+            except arcpy.ExecuteError as e:
+                arcpy.AddWarning(f"    ✗ {stat_tag} failed: {e}")
+
+        # obs_count
+        try:
+            obs = arcpy.sa.CellStatistics(
+                valid_masks, statistics_type="SUM", ignore_nodata="DATA",
+            )
+            obs_path = _build_workspace_subfolder_path(
+                out_workspace, f"{prefix}_LST_obs_count{suffix}", "temporal",
+            )
+            obs.save(obs_path)
+            outputs["LST_obs_count"] = obs_path
+            arcpy.AddMessage(f"    → {os.path.basename(obs_path)}")
+        except arcpy.ExecuteError as e:
+            arcpy.AddWarning(f"    ✗ LST_obs_count failed: {e}")
+
+        # Persistence (cool, warm)
+        cool_list = []
+        warm_list = []
+        skipped = 0
+        for bt, m in zip(bt_rasters, scene_means):
+            if m is None:
+                skipped += 1
+                continue
+            cool_list.append(arcpy.sa.Con(bt < (m - cool_delta_k), 1, 0))
+            warm_list.append(arcpy.sa.Con(bt > (m + warm_delta_k), 1, 0))
+        if skipped:
+            arcpy.AddWarning(
+                f"    {skipped} scene(s) had no readable spatial mean; "
+                "excluded from persistence."
+            )
+        for stat_tag, plist in (
+            ("LST_persistence_cool", cool_list),
+            ("LST_persistence_warm", warm_list),
+        ):
+            if not plist:
+                arcpy.AddWarning(
+                    f"    ✗ {stat_tag}: no scenes with valid spatial mean"
+                )
+                continue
+            try:
+                persistence = arcpy.sa.CellStatistics(
+                    plist, statistics_type="SUM", ignore_nodata="DATA",
+                )
+                out_path = _build_workspace_subfolder_path(
+                    out_workspace, f"{prefix}_{stat_tag}{suffix}", "temporal",
+                )
+                persistence.save(out_path)
+                outputs[stat_tag] = out_path
+                arcpy.AddMessage(f"    → {os.path.basename(out_path)}")
+            except arcpy.ExecuteError as e:
+                arcpy.AddWarning(f"    ✗ {stat_tag} failed: {e}")
+
+        return outputs
+
+    @staticmethod
+    def _write_thermal_provenance_csv(out_workspace, prefix, mode_tag,
+                                       stratification, region, groups,
+                                       meta_by_path, cool_delta_k,
+                                       warm_delta_k):
+        """Provenance CSV for the thermal modes. Header is a leading
+        ``# run config: k=v; ...`` comment so consumers with
+        ``comment='#'`` skip it cleanly; per-scene rows carry scene_id,
+        acquisition_date_iso, source_format, source_path.
+        """
+        anchor = _build_workspace_subfolder_path(
+            out_workspace, prefix, "temporal",
+        )
+        csv_path = _sidecar_path_for_raster(anchor, "_temporal_provenance.csv")
+        config = {
+            "stat_source": mode_tag,
+            "stratification": stratification,
+            "region": region or "",
+            "bt_scale_factor": _ASTER_TIR_SCALE,
+            "valid_floor_K": _ASTER_TIR_VALID_K_FLOOR,
+            "cool_delta_K": cool_delta_k,
+            "warm_delta_K": warm_delta_k,
+            "native_resolution_m": 90,
+            "toolbox_version": TOOLBOX_VERSION,
+            "generated": datetime.now().isoformat(timespec="seconds"),
+        }
+        try:
+            with open(csv_path, "w", encoding="utf-8", newline="") as fh:
+                fh.write(
+                    "# run config: "
+                    + "; ".join(f"{k}={v}" for k, v in config.items())
+                    + "\n"
+                )
+                writer = csv.writer(fh, quoting=csv.QUOTE_MINIMAL)
+                writer.writerow([
+                    "group", "scene_id", "acquisition_date_iso",
+                    "source_format", "source_path",
+                ])
+                for group_name, paths in groups.items():
+                    for p in paths:
+                        m = meta_by_path.get(p, {})
+                        d = m.get("acquisition_date")
+                        writer.writerow([
+                            group_name,
+                            m.get("scene_id", ""),
+                            d.isoformat() if d else "",
+                            m.get("format", ""),
+                            p,
+                        ])
+            arcpy.AddMessage(f"  Provenance CSV: {csv_path}")
+        except OSError as e:
+            arcpy.AddWarning(f"  Could not write provenance CSV ({e})")
+
+    def _execute_thermal_ast08(self, ast08_folder, out_workspace, out_prefix,
+                                region, stratification, cool_delta_k,
+                                warm_delta_k, save_stats):
+        """LST (AST_08 thermal) mode entry point. Discovers AST_08
+        files under ``ast08_folder``, groups by season (or "all"),
+        materialises per-scene Kelvin rasters to a temp scratch,
+        computes the seven stat layers per group, and writes provenance.
+        AOI clipping flows from the active ``arcpy.env.mask``."""
+        if not (ast08_folder and os.path.isdir(ast08_folder)):
+            arcpy.AddError(
+                f"AST_08 Folder {ast08_folder!r} does not exist or is "
+                "not a directory."
+            )
+            return
+
+        arcpy.AddMessage(f"  AST_08 folder:  {ast08_folder}")
+        arcpy.AddMessage(f"  Cool delta:     {cool_delta_k} K")
+        arcpy.AddMessage(f"  Warm delta:     {warm_delta_k} K")
+
+        paths, metas = self._discover_ast08(ast08_folder)
+        if not paths:
+            arcpy.AddError(
+                f"No AST_08 files matched under {ast08_folder} "
+                "(expecting AST_08_*.tif or *.hdf)."
+            )
+            return
+        arcpy.AddMessage(f"  AST_08 scenes:  {len(paths)}")
+
+        # Per-season grouping reuses the helpers used by the NDVI path.
+        seasonal_pattern = self._seasonal_pattern_for_region(region or "")
+        dated = [(p, m["acquisition_date"]) for p, m in zip(paths, metas)]
+        n_dated = sum(1 for _, d in dated if d is not None)
+        if n_dated < len(dated):
+            arcpy.AddWarning(
+                f"  Dated:          {n_dated}/{len(dated)} parseable "
+                "filenames; rest excluded from per-season grouping."
+            )
+        groups = self._group_scenes(dated, stratification, seasonal_pattern)
+        for g, ps in groups.items():
+            arcpy.AddMessage(f"  Group {g!r}: {len(ps)} scene(s)")
+            if len(ps) < 2:
+                arcpy.AddWarning(
+                    f"  Group {g!r} has only {len(ps)} scene(s); stats "
+                    "need >= 2 — group will be skipped."
+                )
+
+        meta_by_path = {p: m for p, m in zip(paths, metas)}
+
+        scratch = tempfile.mkdtemp(prefix="genesis_lst_ast08_")
+        arcpy.AddMessage(f"  Scratch:        {scratch}")
+        try:
+            arcpy.AddMessage("\n▶ Computing thermal statistics per group...")
+            for group_name, group_paths in groups.items():
+                if len(group_paths) < 2:
+                    continue
+                group_start = datetime.now()
+                arcpy.SetProgressor(
+                    "default",
+                    f"Materialising Kelvin rasters [{group_name}]...",
+                )
+                kelvin_saved = self._materialise_kelvin_group(
+                    group_paths, meta_by_path, scratch, group_name,
+                )
+                if len(kelvin_saved) < 2:
+                    arcpy.AddWarning(
+                        f"  Group {group_name!r}: only {len(kelvin_saved)} "
+                        "valid Kelvin raster(s); group skipped."
+                    )
+                    arcpy.ResetProgressor()
+                    continue
+                arcpy.SetProgressorLabel(
+                    f"Computing thermal statistics [{group_name}]..."
+                )
+                self._compute_thermal_stats(
+                    group_name, kelvin_saved, out_workspace, out_prefix,
+                    stratified=(stratification == "Per season"),
+                    cool_delta_k=cool_delta_k, warm_delta_k=warm_delta_k,
+                )
+                arcpy.ResetProgressor()
+                arcpy.AddMessage(
+                    f"  ✓ Group {group_name!r}: stats written in "
+                    f"{(datetime.now() - group_start).total_seconds():.1f}s"
+                )
+
+            if save_stats:
+                self._write_thermal_provenance_csv(
+                    out_workspace, out_prefix, "LST_AST08", stratification,
+                    region, groups, meta_by_path, cool_delta_k, warm_delta_k,
+                )
+        finally:
+            try:
+                shutil.rmtree(scratch, ignore_errors=True)
+            except Exception:
+                pass
 
 
 # ===========================================================================
