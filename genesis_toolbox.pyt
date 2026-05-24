@@ -1121,6 +1121,29 @@ def _periodic_arcpy_cache_flush(idx, every_n=10):
 # is ~90s of overhead in exchange for keeping per-scene timing flat at
 # ~48s (vs the ~24h degraded curve).
 
+def _resolve_to_catalog_path(layer_or_path):
+    """Resolve a Pro layer reference to its on-disk catalog path.
+
+    When the user picks an AOI from Pro's layer dropdown, the GP
+    parameter's valueAsText is the layer NAME ("Limite_Municipio"),
+    not a path. That name resolves in Pro's map TOC but means nothing
+    to a fresh python.exe subprocess worker (which has no map open),
+    so the worker's ``arcpy.Exists`` returns False, env.mask stays
+    unset, and every operation falls back to the full scene extent.
+    Resolving here, in the parent, lets the worker re-bind the dataset
+    by path.
+
+    Returns the input unchanged on failure so the worker's existing
+    Exists check still produces a sensible "no mask" fallback.
+    """
+    if not layer_or_path:
+        return None
+    try:
+        return arcpy.Describe(layer_or_path).catalogPath
+    except Exception:
+        return layer_or_path
+
+
 def _resolve_worker_python():
     """Return a real python.exe to spawn subprocess workers with.
 
@@ -5653,7 +5676,7 @@ class Sentinel2Mosaic(object):
                 # See module-level _run_scene_batches docstring.
                 spec_extra = {
                     "mask_feature": (
-                        mask_feature
+                        _resolve_to_catalog_path(mask_feature)
                         if mask_feature and arcpy.Exists(mask_feature)
                         else None
                     ),
@@ -7352,7 +7375,7 @@ class AsterMosaic(object):
             snap_anchor = os.path.join(scratch_dir, "_snap_anchor.tif")
             spec_extra = {
                 "mask_feature": (
-                    mask_feature
+                    _resolve_to_catalog_path(mask_feature)
                     if mask_feature and arcpy.Exists(mask_feature)
                     else None
                 ),
