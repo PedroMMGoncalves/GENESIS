@@ -1341,49 +1341,6 @@ def _worker_aster_batch(spec, mode):
     print(f"BATCH_SUMMARY ok={n_ok} fail={n_fail}", flush=True)
 
 
-def _worker_landsat_batch(spec):
-    """Subprocess entry point for a Landsat scene batch. Re-checks
-    out Spatial + ImageAnalyst, re-establishes env.mask + env.extent
-    from the spec, instantiates LandsatMosaic, runs _process_scene on
-    each scene. Prints START / DONE / FAIL / BATCH_SUMMARY lines."""
-    arcpy.SetLogHistory(False)
-    arcpy.SetLogMetadata(False)
-    arcpy.env.overwriteOutput = True
-    arcpy.env.autoCancelling = False
-    mask_feature = spec.get("mask_feature")
-    if mask_feature and arcpy.Exists(mask_feature):
-        arcpy.env.mask = mask_feature
-        arcpy.env.extent = mask_feature
-    for ext in ("Spatial", "ImageAnalyst"):
-        if arcpy.CheckExtension(ext) != "Available":
-            print(f"FAIL: {ext} Analyst extension not Available", flush=True)
-            sys.exit(2)
-        arcpy.CheckOutExtension(ext)
-    tool = LandsatMosaic()
-    scratch_dir = spec["scratch_dir"]
-    n_ok = n_fail = 0
-    for scene in spec["scenes"]:
-        sid = scene.get("scene_id") or os.path.basename(
-            (scene.get("path") or "").rstrip(os.sep)
-        ) or "?"
-        t = time.time()
-        print(f"START {sid}", flush=True)
-        try:
-            tool._process_scene(scene, scratch_dir)
-            elapsed = time.time() - t
-            print(f"DONE  {sid} {elapsed:.1f}s", flush=True)
-            n_ok += 1
-        except Exception as e:
-            elapsed = time.time() - t
-            print(
-                f"FAIL  {sid} {elapsed:.1f}s "
-                f"{type(e).__name__}: {e}",
-                flush=True,
-            )
-            n_fail += 1
-    print(f"BATCH_SUMMARY ok={n_ok} fail={n_fail}", flush=True)
-
-
 # ---------------------------------------------------------------------------
 # Internal tunables. Hoisted from inline values so callers can read and
 # adjust knobs in one place. Underscore-prefixed because they're not a
@@ -3439,29 +3396,8 @@ class LandsatMosaic(object):
         )
         preserve_scratch.value = False
 
-        subprocess_batch_size = arcpy.Parameter(
-            displayName=(
-                "Subprocess Batch Size (advanced; controls the per-"
-                "scene-loop memory cycling. Each batch of N scenes "
-                "runs in a fresh python.exe subprocess to reclaim "
-                "accumulated arcpy / GDAL state. Default 10 trades "
-                "~10s arcpy reimport per batch for flat per-scene "
-                "timing. Set 0 to disable subprocess batching (legacy "
-                "single-process loop, for A/B comparison or debugging)."
-            ),
-            name="subprocess_batch_size",
-            datatype="GPLong",
-            parameterType="Optional",
-            direction="Input",
-            category="Advanced Options",
-        )
-        subprocess_batch_size.value = 10
-        subprocess_batch_size.filter.type = "Range"
-        subprocess_batch_size.filter.list = [0, 100]
-
         params = [gdb, mosaic_name, data_folder, region, time_type,
-                 year, month, season, mask, save_stats, preserve_scratch,
-                 subprocess_batch_size]
+                 year, month, season, mask, save_stats, preserve_scratch]
         return params
     
     def updateParameters(self, parameters):
@@ -3787,7 +3723,6 @@ class LandsatMosaic(object):
 
     def _create_geometric_median_mosaic(self, clean_scenes, gdb_path, mosaic_name,
                                          preserve_scratch=False,
-                                         subprocess_batch_size=10,
                                          mask_feature=None):
         """Create geometric median mosaic preserving multi-band structure.
 
@@ -3858,50 +3793,13 @@ class LandsatMosaic(object):
                     f"composite(s) reused from previous run"
                 )
 
-            if to_process and subprocess_batch_size > 0:
-                # Subprocess path: each batch in a fresh python.exe to
-                # reclaim accumulated arcpy / GDAL state.
-                spec_extra = {
-                    "mask_feature": (
-                        mask_feature
-                        if mask_feature and arcpy.Exists(mask_feature)
-                        else None
-                    ),
-                }
-                ok = _run_scene_batches(
-                    worker_kind="landsat",
-                    scenes=to_process,
-                    batch_size=subprocess_batch_size,
-                    scratch_dir=scratch_dir,
-                    spec_extra=spec_extra,
-                    log_prefix="  ",
-                )
-                if not ok:
-                    return None
-                # Rescan scratch for newly-completed composites.
-                new_done = 0
-                new_failed = 0
-                for scene in to_process:
-                    comp_path = self._composite_path_for(scene, scratch_dir)
-                    if (os.path.exists(comp_path)
-                            and os.path.exists(comp_path + ".complete")):
-                        multiband_rasters.append(comp_path)
-                        new_done += 1
-                    else:
-                        new_failed += 1
-                arcpy.AddMessage(
-                    f"  ✓ Subprocess batches completed: {new_done} "
-                    f"newly built, {new_failed} failed"
-                )
-            elif to_process:
-                # Legacy single-process loop, kept for A/B comparison
-                # and as a fallback when subprocess_batch_size = 0.
+            scene_times = []
+            if to_process:
                 arcpy.SetProgressor(
                     "step", "Building per-scene composites",
                     0, max(1, len(to_process)), 1,
                 )
                 log_every = max(1, len(to_process) // 10)
-                scene_times = []
                 composite_idx = 0
                 for scene in to_process:
                     if arcpy.env.isCancelled:
@@ -4033,11 +3931,6 @@ class LandsatMosaic(object):
             mask_feature = parameters[8].valueAsText
             save_stats = parameters[9].value
             preserve_scratch = bool(parameters[10].value)
-            subprocess_batch_size = (
-                int(parameters[11].value)
-                if len(parameters) > 11 and parameters[11].value is not None
-                else 10
-            )
 
             # ----------------------------------------------------------------
             # AOI-first scoping. Set arcpy.env.mask + arcpy.env.extent BEFORE
@@ -4134,7 +4027,6 @@ class LandsatMosaic(object):
                         gdb_path,
                         f"{mosaic_name}_UTM{utm_zone}{region_info['hemisphere']}",
                         preserve_scratch=preserve_scratch,
-                        subprocess_batch_size=subprocess_batch_size,
                         mask_feature=mask_feature,
                     )
 
@@ -12031,8 +11923,6 @@ if __name__ == "__main__":
             _worker_aster_batch(_spec, mode="vnir_swir")
         elif _worker_kind == "aster_vnir":
             _worker_aster_batch(_spec, mode="vnir")
-        elif _worker_kind == "landsat":
-            _worker_landsat_batch(_spec)
         else:
             raise SystemExit(f"Unknown worker kind: {_worker_kind!r}")
         sys.exit(0)
