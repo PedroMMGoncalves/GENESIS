@@ -64,7 +64,7 @@ import scipy.stats
 # logcosh) defined as _fast_ica_numpy below — no external ML stack
 # required, so the toolbox loads on a stock ArcGIS Pro Python
 # environment without any conda customisation.
-from arcpy.ia import ExtractBand
+from arcpy.ia import ExtractBand, TransposeBits
 from arcpy.sa import Float, Divide, Times, Con, SetNull, Plus, Minus
 from arcpy.management import CompositeBands
 
@@ -3809,9 +3809,6 @@ class LandsatMosaic(object):
         output_path = None
         scratch_dir = None
         try:
-            from arcpy.ia import TransposeBits
-            from arcpy.sa import Con
-
             start_time = datetime.now()
             total = sum(
                 1 for s in clean_scenes
