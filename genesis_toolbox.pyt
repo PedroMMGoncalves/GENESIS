@@ -1121,6 +1121,28 @@ def _periodic_arcpy_cache_flush(idx, every_n=10):
 # is ~90s of overhead in exchange for keeping per-scene timing flat at
 # ~48s (vs the ~24h degraded curve).
 
+def _resolve_worker_python():
+    """Return a real python.exe to spawn subprocess workers with.
+
+    Inside ArcGIS Pro, sys.executable is ArcGISPro.exe (Pro hosts
+    CPython in-process; the OS-level executable is the GUI shell).
+    Spawning that with worker argv launches a new Pro GUI and never
+    runs the worker, so the orchestrator pipe blocks forever.
+    sys.exec_prefix points at the active Python env (Pro's bundled
+    arcgispro-py3, a cloned env, or a standalone install) in every
+    host, so python.exe under it is the canonical worker interpreter.
+    """
+    candidate = os.path.join(sys.exec_prefix, "python.exe")
+    if os.path.exists(candidate):
+        return candidate
+    raise RuntimeError(
+        f"Could not locate python.exe under sys.exec_prefix "
+        f"({sys.exec_prefix!r}); refusing to fall back to "
+        f"sys.executable={sys.executable!r} (under Pro that is "
+        f"ArcGISPro.exe and would hang the orchestrator)."
+    )
+
+
 def _run_scene_batches(
     worker_kind, scenes, batch_size, scratch_dir,
     spec_extra=None, log_prefix="  ",
@@ -1139,6 +1161,7 @@ def _run_scene_batches(
     """
     spec_extra = spec_extra or {}
     n_batches = (len(scenes) + batch_size - 1) // batch_size
+    worker_python = _resolve_worker_python()
     arcpy.AddMessage(
         f"{log_prefix}Subprocess batching: {len(scenes)} scene"
         f"{'s' if len(scenes) != 1 else ''} in {n_batches} batch"
@@ -1146,6 +1169,7 @@ def _run_scene_batches(
         f"batch runs in a fresh python.exe to flush accumulated "
         f"arcpy / GDAL state."
     )
+    arcpy.AddMessage(f"{log_prefix}  worker interpreter: {worker_python}")
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"   # immediate worker stdout, line by line
     for batch_idx in range(n_batches):
@@ -1160,7 +1184,7 @@ def _run_scene_batches(
         spec = {"scenes": batch, "scratch_dir": scratch_dir, **spec_extra}
         with open(spec_path, "w", encoding="utf-8") as fh:
             json.dump(spec, fh, default=str)
-        cmd = [sys.executable, __file__, "--worker", worker_kind, spec_path]
+        cmd = [worker_python, __file__, "--worker", worker_kind, spec_path]
         arcpy.AddMessage(
             f"{log_prefix}[batch {batch_idx + 1}/{n_batches}] spawning "
             f"worker for {len(batch)} scene{'s' if len(batch) != 1 else ''}"
