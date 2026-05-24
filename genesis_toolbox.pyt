@@ -188,30 +188,57 @@ def _tmask_reference_grid(raster_path):
     )
 
 
-def _tmask_assert_common_grid(stack_paths, tol=1e-6):
-    """Raise if the stacks are not on an identical grid.
+def _tmask_assert_common_grid(stack_paths):
+    """Raise if the stacks are not on a common grid (within sub-cell
+    drift for the lower-left and 0.01 percent relative drift for the
+    cell size). ncols / nrows must match exactly.
 
-    Triggers when an AOI is not active (env.extent + env.snapRaster +
-    cellSize is what aligns every per-scene CompositeBands output).
+    A snap-aware tolerance accepts up to +/- 0.5 cell of drift in the
+    lower-left X / Y. env.snapRaster aligns cells to integer multiples
+    of the cell size, but a sub-cell origin drift across many scenes
+    from different overpasses is expected even with AOI + snap active;
+    the strict 1e-6 m tolerance the earlier implementation used was
+    micrometer-scale and fired on routine floating-point noise from
+    chained Resample + CompositeBands operations.
+
+    On mismatch the error message identifies which dimension drifted
+    and by how much, so the caller can decide between real
+    misalignment (re-resample the offender) and floating-point noise
+    to be tolerated. Mosaic tool runs with AOI + snap active still
+    occasionally hit a stale-stack case where the scratch carries a
+    stack from a previous pre-AOI run; the per-dimension diff
+    surfaces that immediately.
     """
-    ref = _tmask_reference_grid(stack_paths[0])
+    ncols0, nrows0, ll0, cw0, ch0 = _tmask_reference_grid(stack_paths[0])
+    xy_tol = 0.5 * min(cw0, ch0)
+    cs_rel_tol = 1e-4
     for sp in stack_paths[1:]:
-        g = _tmask_reference_grid(sp)
-        same = (
-            g[0] == ref[0] and g[1] == ref[1]
-            and abs(g[2].X - ref[2].X) < tol
-            and abs(g[2].Y - ref[2].Y) < tol
-            and abs(g[3] - ref[3]) < tol
-            and abs(g[4] - ref[4]) < tol
-        )
-        if not same:
+        ncols, nrows, ll, cw, ch = _tmask_reference_grid(sp)
+        diffs = []
+        if ncols != ncols0:
+            diffs.append(f"ncols {ncols} vs {ncols0}")
+        if nrows != nrows0:
+            diffs.append(f"nrows {nrows} vs {nrows0}")
+        dx = abs(ll.X - ll0.X)
+        if dx > xy_tol:
+            diffs.append(f"lower-left X drift {dx:.4g} > tol {xy_tol:.4g}")
+        dy = abs(ll.Y - ll0.Y)
+        if dy > xy_tol:
+            diffs.append(f"lower-left Y drift {dy:.4g} > tol {xy_tol:.4g}")
+        if abs(cw - cw0) > cs_rel_tol * cw0:
+            diffs.append(f"cell width {cw:.6g} vs {cw0:.6g}")
+        if abs(ch - ch0) > cs_rel_tol * ch0:
+            diffs.append(f"cell height {ch:.6g} vs {ch0:.6g}")
+        if diffs:
             raise ValueError(
-                "Temporal cleaning requires all per-scene stacks on one "
-                "grid. Run the mosaic tool with an AOI so env.extent + "
-                "env.snapRaster align every stack. Mismatch: "
-                f"{stack_paths[0]} vs {sp}"
+                "Temporal cleaning requires all per-scene stacks on a "
+                "common grid (within sub-cell drift). Most likely "
+                "cause: a stale stack from a previous run without "
+                "AOI / snap is still in scratch. Mismatch: "
+                f"{os.path.basename(stack_paths[0])} vs "
+                f"{os.path.basename(sp)}: " + "; ".join(diffs)
             )
-    return ref
+    return ncols0, nrows0, ll0, cw0, ch0
 
 
 def _tmask_setnull_multiband(stack_path, flag_raster, out_path):
