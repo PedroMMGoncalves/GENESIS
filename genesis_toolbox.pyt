@@ -40,9 +40,12 @@
 # ASTER scale factor 0.001 is applied during ingestion.
 
 import arcpy
+import json
 import os
 import gc
 import shutil
+import subprocess
+import sys
 import time
 from datetime import datetime
 import arcpy.sa
@@ -1082,6 +1085,177 @@ def _periodic_arcpy_cache_flush(idx, every_n=10):
     except Exception:
         pass
     gc.collect()
+
+
+# ---------------------------------------------------------------------------
+# Subprocess-per-batch perf workaround
+# ---------------------------------------------------------------------------
+#
+# The 2026-05-22 / 23 / 24 per-scene timing diagnostics on Sentinel-2
+# (89 scenes, 48s -> 950s/scene over the run) and ASTER (74 scenes,
+# 30s -> 823s/scene) showed a doubling-per-batch curve that did not
+# respond to scratch-file cleanup, arcpy.management.ClearWorkspaceCache,
+# or arcpy.SetLogHistory(False). The remaining candidates (GDAL JP2
+# driver handle pool, Pro raster manager internal state, native library
+# buffer accumulations) are all opaque to arcpy.
+#
+# Process exit is the only mechanism that reclaims them all
+# unconditionally: when a process exits the kernel reclaims memory,
+# closes file handles, drops library state. The next process starts
+# from zero. This pattern is endorsed by Esri's DevSummit 2017 paper
+# (Clinton Dow, Parallel Python: Multiprocessing With ArcPy) and is
+# the community-standard escape hatch for arcpy long-loop accumulation.
+#
+# Mechanism: ``_run_scene_batches`` divides a scene list into batches
+# of N and for each batch spawns ``python.exe genesis_toolbox.pyt
+# --worker <kind> <spec.json>``. The .pyt file is valid Python and its
+# tail dispatch block (at the very end) routes to the appropriate
+# ``_worker_<kind>_batch`` function. ArcGIS Pro imports the .pyt as a
+# module to discover tool classes; the ``__main__`` block does not run
+# from Pro. Each worker re-imports arcpy (~5-10s overhead per batch),
+# re-establishes env state from the spec, processes the scenes, and
+# exits. Per-scene state cannot accumulate across batches because each
+# subprocess starts fresh.
+#
+# Cost: ~10s arcpy reimport per batch. For 89 scenes at batch=10 that
+# is ~90s of overhead in exchange for keeping per-scene timing flat at
+# ~48s (vs the ~24h degraded curve).
+
+def _run_scene_batches(
+    worker_kind, scenes, batch_size, scratch_dir,
+    spec_extra=None, log_prefix="  ",
+):
+    """Run ``scenes`` through the matching worker in batches of
+    ``batch_size``, one fresh python.exe per batch. Returns True on
+    full success, False on cancellation or any batch failure.
+
+    Worker stdout is streamed live into arcpy.AddMessage so the user
+    sees per-scene progress in Pro's messages tab. The
+    ``arcpy.env.isCancelled`` flag is polled between lines; on cancel
+    the current subprocess is terminated and the loop exits.
+
+    Spec format (JSON file on disk, path passed as argv[3]):
+      {"scenes": [scene_dict, ...], "scratch_dir": str, ...extras}
+    """
+    spec_extra = spec_extra or {}
+    n_batches = (len(scenes) + batch_size - 1) // batch_size
+    arcpy.AddMessage(
+        f"{log_prefix}Subprocess batching: {len(scenes)} scene"
+        f"{'s' if len(scenes) != 1 else ''} in {n_batches} batch"
+        f"{'es' if n_batches != 1 else ''} of {batch_size}. Each "
+        f"batch runs in a fresh python.exe to flush accumulated "
+        f"arcpy / GDAL state."
+    )
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"   # immediate worker stdout, line by line
+    for batch_idx in range(n_batches):
+        if arcpy.env.isCancelled:
+            arcpy.AddWarning(f"{log_prefix}Cancelled by user.")
+            return False
+        batch = scenes[batch_idx * batch_size:(batch_idx + 1) * batch_size]
+        spec_path = os.path.join(
+            scratch_dir,
+            f"_batch_{batch_idx:03d}_{worker_kind}.json",
+        )
+        spec = {"scenes": batch, "scratch_dir": scratch_dir, **spec_extra}
+        with open(spec_path, "w", encoding="utf-8") as fh:
+            json.dump(spec, fh, default=str)
+        cmd = [sys.executable, __file__, "--worker", worker_kind, spec_path]
+        arcpy.AddMessage(
+            f"{log_prefix}[batch {batch_idx + 1}/{n_batches}] spawning "
+            f"worker for {len(batch)} scene{'s' if len(batch) != 1 else ''}"
+        )
+        t_batch = time.time()
+        rc = 1
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, env=env,
+            )
+            for line in proc.stdout:
+                arcpy.AddMessage(f"{log_prefix}  {line.rstrip()}")
+                if arcpy.env.isCancelled:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    arcpy.AddWarning(
+                        f"{log_prefix}Worker terminated mid-batch."
+                    )
+                    return False
+            rc = proc.wait()
+        except Exception as e:
+            arcpy.AddError(
+                f"{log_prefix}Worker spawn failed: "
+                f"{type(e).__name__}: {e}"
+            )
+            return False
+        finally:
+            try:
+                os.remove(spec_path)
+            except OSError:
+                pass
+        elapsed = time.time() - t_batch
+        if rc != 0:
+            arcpy.AddError(
+                f"{log_prefix}Batch {batch_idx + 1} returned non-zero "
+                f"exit code {rc} after {elapsed:.1f}s"
+            )
+            return False
+        arcpy.AddMessage(
+            f"{log_prefix}[batch {batch_idx + 1}/{n_batches}] done: "
+            f"{len(batch)} scene{'s' if len(batch) != 1 else ''} in "
+            f"{elapsed:.1f}s ({elapsed / max(1, len(batch)):.1f}s/scene)"
+        )
+    return True
+
+
+def _worker_s2_batch(spec):
+    """Subprocess entry point for a Sentinel-2 scene batch. Re-checks
+    out Spatial + ImageAnalyst, re-establishes env.mask + env.extent
+    from the spec, instantiates Sentinel2Mosaic, runs _process_scene
+    on each scene, prints per-scene status (START / DONE / FAIL with
+    elapsed seconds) to stdout for the orchestrator to capture. Exits
+    cleanly even on per-scene failures; the BATCH_SUMMARY tail line
+    carries the ok/fail counts."""
+    arcpy.SetLogHistory(False)
+    arcpy.SetLogMetadata(False)
+    arcpy.env.overwriteOutput = True
+    mask_feature = spec.get("mask_feature")
+    if mask_feature and arcpy.Exists(mask_feature):
+        arcpy.env.mask = mask_feature
+        arcpy.env.extent = mask_feature
+    for ext in ("Spatial", "ImageAnalyst"):
+        if arcpy.CheckExtension(ext) != "Available":
+            print(f"FAIL: {ext} Analyst extension not Available", flush=True)
+            sys.exit(2)
+        arcpy.CheckOutExtension(ext)
+    tool = Sentinel2Mosaic()
+    scratch_dir = spec["scratch_dir"]
+    scl_classes = tuple(spec["scl_classes"])
+    cloud_buffer_pixels = spec["cloud_buffer_pixels"]
+    n_ok = n_fail = 0
+    for scene in spec["scenes"]:
+        sid = (scene.get("metadata") or {}).get("product_uri", "?")
+        t = time.time()
+        print(f"START {sid}", flush=True)
+        try:
+            tool._process_scene(
+                scene, scratch_dir, scl_classes, cloud_buffer_pixels,
+            )
+            elapsed = time.time() - t
+            print(f"DONE  {sid} {elapsed:.1f}s", flush=True)
+            n_ok += 1
+        except Exception as e:
+            elapsed = time.time() - t
+            print(
+                f"FAIL  {sid} {elapsed:.1f}s "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
+            n_fail += 1
+    print(f"BATCH_SUMMARY ok={n_ok} fail={n_fail}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -5120,11 +5294,38 @@ class Sentinel2Mosaic(object):
         )
         preserve_scratch.value = False
 
+        # Subprocess-per-batch perf workaround. The 2026-05 in-process
+        # per-scene loop showed doubling-per-batch timing degradation
+        # (48s to 950s per scene over 89 scenes) that no in-process
+        # cleanup could bound. Splitting the run into batches and
+        # spawning a fresh python.exe per batch reclaims accumulated
+        # arcpy / GDAL state by OS guarantee.
+        subprocess_batch_size = arcpy.Parameter(
+            displayName=(
+                "Subprocess Batch Size (advanced; controls the per-"
+                "scene-loop memory cycling. Each batch of N scenes "
+                "runs in a fresh python.exe subprocess to reclaim "
+                "accumulated arcpy / GDAL state. Default 10 trades "
+                "~10s arcpy reimport per batch for flat per-scene "
+                "timing. Set 0 to disable subprocess batching (legacy "
+                "single-process loop, for A/B comparison or debugging)."
+            ),
+            name="subprocess_batch_size",
+            datatype="GPLong",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        subprocess_batch_size.value = 10
+        subprocess_batch_size.filter.type = "Range"
+        subprocess_batch_size.filter.list = [0, 100]
+
         return [
             gdb, mosaic_name, data_folder, region, time_type,
             year, month, season,
             cloud_aggressiveness, cloud_buffer,
             mask_feature, save_stats, preserve_scratch,
+            subprocess_batch_size,
         ]
 
     def updateParameters(self, parameters):
@@ -5189,6 +5390,15 @@ class Sentinel2Mosaic(object):
             mask_feature = parameters[10].valueAsText
             save_stats = bool(parameters[11].value)
             preserve_scratch = bool(parameters[12].value)
+            # Subprocess batch size for the per-scene-loop perf
+            # workaround (Advanced Options). Default 10. Set to 0 to
+            # use the legacy single-process loop (A/B comparison or
+            # debugging only).
+            subprocess_batch_size = (
+                int(parameters[13].value)
+                if len(parameters) > 13 and parameters[13].value is not None
+                else 10
+            )
 
             # Resolve aggressiveness preset → SCL class tuple. The dropdown
             # constrains the value to the preset keys; fall back defensively
@@ -5351,60 +5561,113 @@ class Sentinel2Mosaic(object):
                         "Phase 4"
                     )
 
-            arcpy.SetProgressor(
-                "step", "Cloud-masking + stacking scenes",
-                0, max(1, len(to_process)), 1,
-            )
-            log_every = max(1, len(to_process) // 10) if to_process else 1
-            scene_times = []
-
-            for idx, scene in enumerate(to_process, 1):
-                if arcpy.env.isCancelled:
-                    arcpy.ResetProgressor()
-                    arcpy.AddWarning(
-                        f"  ✗ Cancelled after {idx-1}/{len(to_process)} scenes."
-                    )
-                    return None
-                meta = scene["metadata"]
-                tile = meta.get("tile_id")
-                if not tile:
-                    arcpy.AddWarning(
-                        f"  ✗ {os.path.basename(scene['path'])}: no tile ID"
-                    )
-                    continue
-                src_tag = "zip" if scene.get("source_kind") == "zip" else "safe"
-                arcpy.SetProgressorLabel(
-                    f"[{idx}/{len(to_process)}] [{tile}/{src_tag}] "
-                    f"{os.path.basename(scene['path'])}"
+            if to_process and subprocess_batch_size > 0:
+                # Subprocess-per-batch path. Each batch runs in a fresh
+                # python.exe to flush accumulated arcpy / GDAL state.
+                # See module-level _run_scene_batches docstring.
+                spec_extra = {
+                    "mask_feature": (
+                        mask_feature
+                        if mask_feature and arcpy.Exists(mask_feature)
+                        else None
+                    ),
+                    "scl_classes": list(scl_classes),
+                    "cloud_buffer_pixels": cloud_buffer_pixels,
+                }
+                ok = _run_scene_batches(
+                    worker_kind="s2",
+                    scenes=to_process,
+                    batch_size=subprocess_batch_size,
+                    scratch_dir=scratch_dir,
+                    spec_extra=spec_extra,
+                    log_prefix="  ",
                 )
-                scene_start = datetime.now()
-                try:
-                    stacked_path = self._process_scene(
-                        scene, scratch_dir, scl_classes, cloud_buffer_pixels,
+                if not ok:
+                    return None
+                # Rescan scratch for newly-completed scenes; append to
+                # the accumulators that the resume scan already
+                # primed with previously-completed work.
+                new_done = 0
+                new_failed = 0
+                for scene in to_process:
+                    meta = scene["metadata"]
+                    tile = meta.get("tile_id")
+                    product_uri = meta.get("product_uri")
+                    if not (tile and product_uri):
+                        new_failed += 1
+                        continue
+                    stack = os.path.join(
+                        scratch_dir, f"{product_uri}_stack.tif",
                     )
-                except Exception as e:
-                    arcpy.AddWarning(f"  ✗ {os.path.basename(scene['path'])}: {e}")
-                    continue
-                if stacked_path:
-                    scenes_by_tile.setdefault(tile, []).append(stacked_path)
-                    composite_temp_paths.append(stacked_path)
-                    all_scenes_used.append(scene)
-                    scene_times.append(
-                        (datetime.now() - scene_start).total_seconds()
-                    )
-                arcpy.SetProgressorPosition(idx)
-                _periodic_arcpy_cache_flush(idx)
-                # Periodic message ~10× during the phase
-                if idx % log_every == 0 or idx == len(to_process):
-                    if scene_times:
-                        avg = sum(scene_times) / len(scene_times)
-                        pct = 100.0 * idx / len(to_process)
-                        arcpy.AddMessage(
-                            f"  [{idx}/{len(to_process)}] {pct:.0f}% — "
-                            f"avg {avg:.1f}s/scene"
-                        )
+                    marker = stack + ".complete"
+                    if os.path.exists(stack) and os.path.exists(marker):
+                        scenes_by_tile.setdefault(tile, []).append(stack)
+                        composite_temp_paths.append(stack)
+                        all_scenes_used.append(scene)
+                        new_done += 1
+                    else:
+                        new_failed += 1
+                arcpy.AddMessage(
+                    f"  ✓ Subprocess batches completed: {new_done} "
+                    f"newly built, {new_failed} failed"
+                )
+            elif to_process:
+                # Legacy single-process loop, kept for A/B comparison
+                # and as a fallback when subprocess_batch_size = 0.
+                arcpy.SetProgressor(
+                    "step", "Cloud-masking + stacking scenes",
+                    0, max(1, len(to_process)), 1,
+                )
+                log_every = max(1, len(to_process) // 10) if to_process else 1
+                scene_times = []
 
-            arcpy.ResetProgressor()
+                for idx, scene in enumerate(to_process, 1):
+                    if arcpy.env.isCancelled:
+                        arcpy.ResetProgressor()
+                        arcpy.AddWarning(
+                            f"  ✗ Cancelled after {idx-1}/{len(to_process)} scenes."
+                        )
+                        return None
+                    meta = scene["metadata"]
+                    tile = meta.get("tile_id")
+                    if not tile:
+                        arcpy.AddWarning(
+                            f"  ✗ {os.path.basename(scene['path'])}: no tile ID"
+                        )
+                        continue
+                    src_tag = "zip" if scene.get("source_kind") == "zip" else "safe"
+                    arcpy.SetProgressorLabel(
+                        f"[{idx}/{len(to_process)}] [{tile}/{src_tag}] "
+                        f"{os.path.basename(scene['path'])}"
+                    )
+                    scene_start = datetime.now()
+                    try:
+                        stacked_path = self._process_scene(
+                            scene, scratch_dir, scl_classes, cloud_buffer_pixels,
+                        )
+                    except Exception as e:
+                        arcpy.AddWarning(f"  ✗ {os.path.basename(scene['path'])}: {e}")
+                        continue
+                    if stacked_path:
+                        scenes_by_tile.setdefault(tile, []).append(stacked_path)
+                        composite_temp_paths.append(stacked_path)
+                        all_scenes_used.append(scene)
+                        scene_times.append(
+                            (datetime.now() - scene_start).total_seconds()
+                        )
+                    arcpy.SetProgressorPosition(idx)
+                    _periodic_arcpy_cache_flush(idx)
+                    # Periodic message ~10× during the phase
+                    if idx % log_every == 0 or idx == len(to_process):
+                        if scene_times:
+                            avg = sum(scene_times) / len(scene_times)
+                            pct = 100.0 * idx / len(to_process)
+                            arcpy.AddMessage(
+                                f"  [{idx}/{len(to_process)}] {pct:.0f}% — "
+                                f"avg {avg:.1f}s/scene"
+                            )
+
+                arcpy.ResetProgressor()
             if not scenes_by_tile:
                 arcpy.AddError("  ✗ No scenes survived cloud masking + stacking.")
                 return None
@@ -11463,3 +11726,32 @@ class TemporalStatistics(object):
             arcpy.AddMessage(f"  Provenance CSV: {csv_path}")
         except OSError as e:
             arcpy.AddWarning(f"  Could not write provenance CSV ({e})")
+
+
+# ===========================================================================
+# Subprocess worker entry point.
+# ===========================================================================
+#
+# ArcGIS Pro imports this .pyt as a module to discover tool classes; the
+# block below does not execute under Pro. It only fires when a mosaic
+# tool's execute() spawns this same file as a standalone Python script
+# via subprocess.Popen with `--worker <kind> <spec.json>` argv. See
+# _run_scene_batches for the orchestration that drives this.
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 4 and sys.argv[1] == "--worker":
+        _worker_kind = sys.argv[2]
+        with open(sys.argv[3], encoding="utf-8") as _fh:
+            _spec = json.load(_fh)
+        if _worker_kind == "s2":
+            _worker_s2_batch(_spec)
+        else:
+            raise SystemExit(f"Unknown worker kind: {_worker_kind!r}")
+        sys.exit(0)
+    else:
+        raise SystemExit(
+            "genesis_toolbox.pyt is an ArcGIS Pro toolbox; load it via "
+            "Pro's Catalog (right-click Toolboxes > Add Toolbox). Direct "
+            "invocation is only supported in --worker mode by the "
+            "subprocess-batching orchestration; see _run_scene_batches."
+        )
