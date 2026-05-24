@@ -65,6 +65,21 @@ from arcpy.ia import ExtractBand
 from arcpy.sa import Float, Divide, Times, Con, SetNull, Plus, Minus
 from arcpy.management import CompositeBands
 
+# Disable arcpy history + metadata logging at module import. Every
+# arcpy tool call otherwise appends to an XML history file under
+# %AppData%\Esri\ArcGISPro\ArcToolbox\History and writes per-dataset
+# metadata XML into the workspace; both files grow linearly per call
+# and parsing the growing XML produces super-linear loop time. This
+# is the dominant documented cause of progressive slowdown in long
+# arcpy loops (Esri Community: 90 s/iter at iter 50 dropped to under
+# 0.5 s/iter with logging off). Matches the GENESIS pattern (89-scene
+# S2 Faial: 48 to 950 s/scene; 74-scene ASTER: 30 to 823 s/scene).
+# ClearWorkspaceCache (called periodically in the per-scene loop) is
+# a schema-lock release, not a metadata-XML release, which is why the
+# earlier scratch-cleanup commit showed no perf improvement.
+arcpy.SetLogHistory(False)
+arcpy.SetLogMetadata(False)
+
 TOOLBOX_VERSION = "1.0.0-phase3"
 
 
