@@ -1258,6 +1258,108 @@ def _worker_s2_batch(spec):
     print(f"BATCH_SUMMARY ok={n_ok} fail={n_fail}", flush=True)
 
 
+def _worker_aster_batch(spec, mode):
+    """Subprocess entry point for an ASTER scene batch. Re-checks out
+    Spatial + ImageAnalyst, re-establishes env.mask + env.extent +
+    env.snapRaster (15 m anchor) from the spec, instantiates
+    AsterMosaic, runs _process_scene on each scene in the given mode
+    (``"vnir_swir"`` for the 9-band path or ``"vnir"`` for the
+    3-band path). Prints START / DONE / FAIL / BATCH_SUMMARY lines."""
+    arcpy.SetLogHistory(False)
+    arcpy.SetLogMetadata(False)
+    arcpy.env.overwriteOutput = True
+    arcpy.env.autoCancelling = False
+    mask_feature = spec.get("mask_feature")
+    if mask_feature and arcpy.Exists(mask_feature):
+        arcpy.env.mask = mask_feature
+        arcpy.env.extent = mask_feature
+    snap_anchor = spec.get("snap_anchor")
+    if snap_anchor and os.path.exists(snap_anchor):
+        arcpy.env.snapRaster = snap_anchor
+        arcpy.env.cellSize = 15
+    for ext in ("Spatial", "ImageAnalyst"):
+        if arcpy.CheckExtension(ext) != "Available":
+            print(f"FAIL: {ext} Analyst extension not Available", flush=True)
+            sys.exit(2)
+        arcpy.CheckOutExtension(ext)
+    tool = AsterMosaic()
+    scratch_dir = spec["scratch_dir"]
+    use_qa = bool(spec.get("use_qa", True))
+    bt_threshold_k = spec.get("bt_threshold_k")
+    use_ast08_thermal = bool(spec.get("use_ast08_thermal", False))
+    cloud_buffer_px = int(spec.get("cloud_buffer_px", _ASTER_CLOUD_BUFFER_PX))
+    aster_mode = (
+        _ASTER_MODE_VNIR if mode == "vnir" else _ASTER_MODE_FULL
+    )
+    n_ok = n_fail = 0
+    for scene in spec["scenes"]:
+        sid = scene.get("scene_id") or "?"
+        t = time.time()
+        print(f"START {sid}", flush=True)
+        try:
+            tool._process_scene(
+                scene, scratch_dir, use_qa, aster_mode,
+                bt_threshold_k=bt_threshold_k,
+                use_ast08_thermal=use_ast08_thermal,
+                cloud_buffer_px=cloud_buffer_px,
+            )
+            elapsed = time.time() - t
+            print(f"DONE  {sid} {elapsed:.1f}s", flush=True)
+            n_ok += 1
+        except Exception as e:
+            elapsed = time.time() - t
+            print(
+                f"FAIL  {sid} {elapsed:.1f}s "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
+            n_fail += 1
+    print(f"BATCH_SUMMARY ok={n_ok} fail={n_fail}", flush=True)
+
+
+def _worker_landsat_batch(spec):
+    """Subprocess entry point for a Landsat scene batch. Re-checks
+    out Spatial + ImageAnalyst, re-establishes env.mask + env.extent
+    from the spec, instantiates LandsatMosaic, runs _process_scene on
+    each scene. Prints START / DONE / FAIL / BATCH_SUMMARY lines."""
+    arcpy.SetLogHistory(False)
+    arcpy.SetLogMetadata(False)
+    arcpy.env.overwriteOutput = True
+    arcpy.env.autoCancelling = False
+    mask_feature = spec.get("mask_feature")
+    if mask_feature and arcpy.Exists(mask_feature):
+        arcpy.env.mask = mask_feature
+        arcpy.env.extent = mask_feature
+    for ext in ("Spatial", "ImageAnalyst"):
+        if arcpy.CheckExtension(ext) != "Available":
+            print(f"FAIL: {ext} Analyst extension not Available", flush=True)
+            sys.exit(2)
+        arcpy.CheckOutExtension(ext)
+    tool = LandsatMosaic()
+    scratch_dir = spec["scratch_dir"]
+    n_ok = n_fail = 0
+    for scene in spec["scenes"]:
+        sid = scene.get("scene_id") or os.path.basename(
+            (scene.get("path") or "").rstrip(os.sep)
+        ) or "?"
+        t = time.time()
+        print(f"START {sid}", flush=True)
+        try:
+            tool._process_scene(scene, scratch_dir)
+            elapsed = time.time() - t
+            print(f"DONE  {sid} {elapsed:.1f}s", flush=True)
+            n_ok += 1
+        except Exception as e:
+            elapsed = time.time() - t
+            print(
+                f"FAIL  {sid} {elapsed:.1f}s "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
+            n_fail += 1
+    print(f"BATCH_SUMMARY ok={n_ok} fail={n_fail}", flush=True)
+
+
 # ---------------------------------------------------------------------------
 # Internal tunables. Hoisted from inline values so callers can read and
 # adjust knobs in one place. Underscore-prefixed because they're not a
@@ -3313,8 +3415,29 @@ class LandsatMosaic(object):
         )
         preserve_scratch.value = False
 
+        subprocess_batch_size = arcpy.Parameter(
+            displayName=(
+                "Subprocess Batch Size (advanced; controls the per-"
+                "scene-loop memory cycling. Each batch of N scenes "
+                "runs in a fresh python.exe subprocess to reclaim "
+                "accumulated arcpy / GDAL state. Default 10 trades "
+                "~10s arcpy reimport per batch for flat per-scene "
+                "timing. Set 0 to disable subprocess batching (legacy "
+                "single-process loop, for A/B comparison or debugging)."
+            ),
+            name="subprocess_batch_size",
+            datatype="GPLong",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        subprocess_batch_size.value = 10
+        subprocess_batch_size.filter.type = "Range"
+        subprocess_batch_size.filter.list = [0, 100]
+
         params = [gdb, mosaic_name, data_folder, region, time_type,
-                 year, month, season, mask, save_stats, preserve_scratch]
+                 year, month, season, mask, save_stats, preserve_scratch,
+                 subprocess_batch_size]
         return params
     
     def updateParameters(self, parameters):
@@ -3554,8 +3677,94 @@ class LandsatMosaic(object):
             arcpy.AddError(f"Scene validation failed: {str(e)}")
             return None
 
+    @staticmethod
+    def _composite_path_for(scene, scratch_dir):
+        """Resolve the per-scene composite stack path in scratch.
+        Static so the subprocess worker can use it without needing the
+        full Phase 3 context."""
+        sid = scene.get('scene_id') or os.path.basename(
+            (scene.get('path') or '').rstrip(os.sep)
+        ) or "scene"
+        return os.path.join(
+            scratch_dir,
+            f"{_sanitize_arcpy_name(sid)}_composite.tif",
+        )
+
+    def _process_scene(self, scene, scratch_dir):
+        """Build one per-scene composite from a Landsat C2L2 scene.
+
+        Extracted from the inline body of _create_geometric_median_mosaic
+        (2026-05-24) so the subprocess-per-batch worker can call this
+        directly on a fresh python.exe per batch. The legacy single-
+        process loop in _create_geometric_median_mosaic also calls
+        this method; behaviour is unchanged.
+
+        Returns the composite path on success. Raises on failure (the
+        caller decides whether to AddWarning + skip or propagate).
+        """
+        band_paths = scene['band_paths']
+        scene_id = scene.get('scene_id') or os.path.basename(
+            (scene.get('path') or '').rstrip(os.sep)
+        ) or "scene"
+
+        # Per-scene subfolder so vmask.tif + Bn.tif don't collide
+        # between scenes. _cleanup_scratch_folder() handles the lot.
+        scene_scratch = os.path.join(
+            scratch_dir, _sanitize_arcpy_name(scene_id),
+        )
+        os.makedirs(scene_scratch, exist_ok=True)
+
+        # 1. value_mask materialised ONCE per scene -> kills the
+        #    7x QA decode redundancy of the previous lazy chain.
+        #    Honours env.mask + env.extent when AOI is active.
+        qa_raster = arcpy.Raster(band_paths["QA_PIXEL"])
+        cloud_mask = TransposeBits(
+            qa_raster, [0, 1, 2, 3, 4], [0, 1, 2, 3, 4], 0, None
+        )
+        value_mask = ~cloud_mask
+        value_mask_path = os.path.join(scene_scratch, "vmask.tif")
+        value_mask.save(value_mask_path)
+        value_mask_raster = arcpy.Raster(value_mask_path)
+
+        # Lazy Con chain. The per-band .save() materialisation tried
+        # in commit 4f4728b was reverted because it produced visible
+        # dark blobs over high-cloud areas (NoData semantics on
+        # cloudy pixels were lost when .save() ran with env.mask
+        # active; cloudy ended up as zero, not NoData, and
+        # GeometricMedian pulled the median toward zero).
+        composite_inputs = [
+            Con(value_mask_raster, arcpy.Raster(band_paths[f"B{n}"]))
+            for n in range(1, 8)
+        ]
+
+        temp_composite = self._composite_path_for(scene, scratch_dir)
+        arcpy.management.CompositeBands(composite_inputs, temp_composite)
+
+        # Resume sentinel: only written after CompositeBands returns,
+        # so its presence guarantees the composite is complete.
+        try:
+            with open(temp_composite + ".complete", "w", encoding="utf-8") as fh:
+                fh.write(datetime.now().isoformat(timespec="seconds") + "\n")
+        except OSError:
+            pass
+
+        # Per-scene scratch cleanup: rmtree the {scene_id}/ subfolder
+        # that held vmask.tif. Bounds scratch growth so NTFS directory
+        # ops + GDAL handle caches stay cheap on long runs.
+        sid_safe = _sanitize_arcpy_name(scene_id)
+        _cleanup_per_scene_intermediates(
+            scratch_dir, sid_safe,
+            keep_basenames=(
+                f"{sid_safe}_composite.tif",
+                f"{sid_safe}_composite.tif.complete",
+            ),
+        )
+        return temp_composite
+
     def _create_geometric_median_mosaic(self, clean_scenes, gdb_path, mosaic_name,
-                                         preserve_scratch=False):
+                                         preserve_scratch=False,
+                                         subprocess_batch_size=10,
+                                         mask_feature=None):
         """Create geometric median mosaic preserving multi-band structure.
 
         Cleanup fix: previously the temp composites (one per scene) were
@@ -3603,15 +3812,6 @@ class LandsatMosaic(object):
             # both survive in scratch is reused as-is. A composite file
             # without a marker is partial (Phase 3 died mid-CompositeBands)
             # and gets rebuilt below.
-            def _composite_path_for(scene):
-                sid = scene.get('scene_id') or os.path.basename(
-                    (scene.get('path') or '').rstrip(os.sep)
-                ) or "scene"
-                return os.path.join(
-                    scratch_dir,
-                    f"{_sanitize_arcpy_name(sid)}_composite.tif",
-                )
-
             eligible_scenes = [
                 s for s in clean_scenes
                 if (s.get('band_paths') and
@@ -3621,7 +3821,7 @@ class LandsatMosaic(object):
             resumed_count = 0
             to_process = []
             for scene in eligible_scenes:
-                comp_path = _composite_path_for(scene)
+                comp_path = self._composite_path_for(scene, scratch_dir)
                 if os.path.exists(comp_path) and os.path.exists(comp_path + ".complete"):
                     multiband_rasters.append(comp_path)
                     resumed_count += 1
@@ -3637,120 +3837,86 @@ class LandsatMosaic(object):
                     f"composite(s) reused from previous run"
                 )
 
-            arcpy.SetProgressor(
-                "step", "Building per-scene composites",
-                0, max(1, len(to_process)), 1,
-            )
-            # Periodic Messages-tab update: ~10 lines for the whole phase,
-            # whatever the scene count. Per-scene progress is on the GP
-            # dialog progress bar (SetProgressorLabel/Position).
-            log_every = max(1, len(to_process) // 10) if to_process else 1
-            scene_times = []
-            composite_idx = 0
-
-            for scene in to_process:
-                # Cancel check every iteration — each composite is ~30s+.
-                if arcpy.env.isCancelled:
-                    arcpy.ResetProgressor()
-                    arcpy.AddWarning(
-                        f"  ✗ Cancelled by user after {composite_idx}/{len(to_process)} composites."
-                    )
-                    return None
-
-                band_paths = scene['band_paths']
-                composite_idx += 1
-                scene_id = scene.get('scene_id') or os.path.basename(
-                    (scene.get('path') or '').rstrip(os.sep)
-                ) or f"scene_{composite_idx}"
-                arcpy.SetProgressorLabel(
-                    f"[{composite_idx}/{len(to_process)}] {scene_id}"
-                )
-                scene_start = datetime.now()
-
-                # Per-scene subfolder so vmask.tif + Bn.tif don't collide
-                # between scenes. _cleanup_scratch_folder() handles the lot.
-                scene_scratch = os.path.join(
-                    scratch_dir, _sanitize_arcpy_name(scene_id),
-                )
-                os.makedirs(scene_scratch, exist_ok=True)
-
-                # 1. value_mask materialised ONCE per scene → kills the
-                #    7× QA decode redundancy of the previous lazy chain.
-                #    Honours env.mask + env.extent when AOI is active.
-                qa_raster = arcpy.Raster(band_paths["QA_PIXEL"])
-                cloud_mask = TransposeBits(
-                    qa_raster, [0, 1, 2, 3, 4], [0, 1, 2, 3, 4], 0, None
-                )
-                value_mask = ~cloud_mask
-                value_mask_path = os.path.join(scene_scratch, "vmask.tif")
-                value_mask.save(value_mask_path)
-                value_mask_raster = arcpy.Raster(value_mask_path)
-
-                # Lazy Con chain — same logic that produced the clean
-                # `Landsat_Masked` output in earlier runs. The per-band
-                # `.save()` materialisation introduced in commit 4f4728b
-                # was reverted (2026-05-21) because it produced visible
-                # dark blobs over high-cloud areas like Caldeira do
-                # Cabeço Gordo: when `.save()` ran with env.mask active,
-                # NoData semantics on cloudy pixels were lost (cloudy
-                # ended up as zero, not NoData), and GeometricMedian
-                # pulled the median down to zero-ish values.
-                #
-                # Cost of going lazy: CompositeBands ignores env.extent,
-                # so the per-scene composite is full-scene-extent (~33k
-                # km² for Landsat at Faial), not AOI-extent. The win we
-                # kept: value_mask is still materialised once per scene
-                # above, so QA decode is 1× not 7×. GeometricMedian
-                # still honours env.extent for its OUTPUT, so the heavy
-                # median phase remains fast (~60s vs the pre-AOI 18 min).
-                composite_inputs = [
-                    Con(value_mask_raster, arcpy.Raster(band_paths[f"B{n}"]))
-                    for n in range(1, 8)
-                ]
-
-                temp_composite = _composite_path_for(scene)
-                arcpy.management.CompositeBands(composite_inputs, temp_composite)
-                # Resume sentinel — only written after CompositeBands
-                # returns successfully; a half-written composite stays
-                # marker-less and is rebuilt next run.
-                try:
-                    with open(temp_composite + ".complete", "w", encoding="utf-8") as fh:
-                        fh.write(datetime.now().isoformat(timespec="seconds") + "\n")
-                except OSError:
-                    pass
-                multiband_rasters.append(temp_composite)
-
-                # Per-scene scratch cleanup: rmtree the {scene_id}/
-                # subfolder that held vmask.tif (and anything else
-                # arcpy / GDAL parked under the scene_id prefix). Keeps
-                # the final composite + resume marker. Bounds scratch
-                # growth so NTFS directory ops + GDAL handle caches
-                # stay cheap on long runs.
-                sid_safe = _sanitize_arcpy_name(scene_id)
-                _cleanup_per_scene_intermediates(
-                    scratch_dir, sid_safe,
-                    keep_basenames=(
-                        f"{sid_safe}_composite.tif",
-                        f"{sid_safe}_composite.tif.complete",
+            if to_process and subprocess_batch_size > 0:
+                # Subprocess path: each batch in a fresh python.exe to
+                # reclaim accumulated arcpy / GDAL state.
+                spec_extra = {
+                    "mask_feature": (
+                        mask_feature
+                        if mask_feature and arcpy.Exists(mask_feature)
+                        else None
                     ),
+                }
+                ok = _run_scene_batches(
+                    worker_kind="landsat",
+                    scenes=to_process,
+                    batch_size=subprocess_batch_size,
+                    scratch_dir=scratch_dir,
+                    spec_extra=spec_extra,
+                    log_prefix="  ",
                 )
-
-                scene_times.append(
-                    (datetime.now() - scene_start).total_seconds()
+                if not ok:
+                    return None
+                # Rescan scratch for newly-completed composites.
+                new_done = 0
+                new_failed = 0
+                for scene in to_process:
+                    comp_path = self._composite_path_for(scene, scratch_dir)
+                    if (os.path.exists(comp_path)
+                            and os.path.exists(comp_path + ".complete")):
+                        multiband_rasters.append(comp_path)
+                        new_done += 1
+                    else:
+                        new_failed += 1
+                arcpy.AddMessage(
+                    f"  ✓ Subprocess batches completed: {new_done} "
+                    f"newly built, {new_failed} failed"
                 )
-                arcpy.SetProgressorPosition(composite_idx)
-                _periodic_arcpy_cache_flush(composite_idx)
-
-                # Periodic Messages-tab update — ~10 lines for the phase.
-                if composite_idx % log_every == 0 or composite_idx == len(to_process):
-                    avg = sum(scene_times) / len(scene_times)
-                    pct = 100.0 * composite_idx / len(to_process)
-                    arcpy.AddMessage(
-                        f"  [{composite_idx}/{len(to_process)}] {pct:.0f}% — "
-                        f"avg {avg:.1f}s/scene"
+            elif to_process:
+                # Legacy single-process loop, kept for A/B comparison
+                # and as a fallback when subprocess_batch_size = 0.
+                arcpy.SetProgressor(
+                    "step", "Building per-scene composites",
+                    0, max(1, len(to_process)), 1,
+                )
+                log_every = max(1, len(to_process) // 10)
+                scene_times = []
+                composite_idx = 0
+                for scene in to_process:
+                    if arcpy.env.isCancelled:
+                        arcpy.ResetProgressor()
+                        arcpy.AddWarning(
+                            f"  ✗ Cancelled by user after {composite_idx}/{len(to_process)} composites."
+                        )
+                        return None
+                    composite_idx += 1
+                    scene_id = scene.get('scene_id') or os.path.basename(
+                        (scene.get('path') or '').rstrip(os.sep)
+                    ) or f"scene_{composite_idx}"
+                    arcpy.SetProgressorLabel(
+                        f"[{composite_idx}/{len(to_process)}] {scene_id}"
                     )
-
-            arcpy.ResetProgressor()
+                    scene_start = datetime.now()
+                    try:
+                        temp_composite = self._process_scene(scene, scratch_dir)
+                    except Exception as e:
+                        arcpy.AddWarning(f"  ✗ {scene_id}: {e}")
+                        arcpy.SetProgressorPosition(composite_idx)
+                        continue
+                    multiband_rasters.append(temp_composite)
+                    scene_times.append(
+                        (datetime.now() - scene_start).total_seconds()
+                    )
+                    arcpy.SetProgressorPosition(composite_idx)
+                    _periodic_arcpy_cache_flush(composite_idx)
+                    if composite_idx % log_every == 0 or composite_idx == len(to_process):
+                        avg = sum(scene_times) / len(scene_times)
+                        pct = 100.0 * composite_idx / len(to_process)
+                        arcpy.AddMessage(
+                            f"  [{composite_idx}/{len(to_process)}] {pct:.0f}% — "
+                            f"avg {avg:.1f}s/scene"
+                        )
+                arcpy.ResetProgressor()
 
             # Phase 3 summary with min/max/avg for outlier debuggability.
             if scene_times:
@@ -3846,6 +4012,11 @@ class LandsatMosaic(object):
             mask_feature = parameters[8].valueAsText
             save_stats = parameters[9].value
             preserve_scratch = bool(parameters[10].value)
+            subprocess_batch_size = (
+                int(parameters[11].value)
+                if len(parameters) > 11 and parameters[11].value is not None
+                else 10
+            )
 
             # ----------------------------------------------------------------
             # AOI-first scoping. Set arcpy.env.mask + arcpy.env.extent BEFORE
@@ -3942,6 +4113,8 @@ class LandsatMosaic(object):
                         gdb_path,
                         f"{mosaic_name}_UTM{utm_zone}{region_info['hemisphere']}",
                         preserve_scratch=preserve_scratch,
+                        subprocess_batch_size=subprocess_batch_size,
+                        mask_feature=mask_feature,
                     )
 
                     if zone_mosaic:
@@ -6753,6 +6926,30 @@ class AsterMosaic(object):
         )
         temporal_min_obs.value = _TMASK_MIN_OBS
 
+        # Subprocess-per-batch perf workaround, same shape as the one
+        # on Sentinel2Mosaic. Each batch of N scenes runs in a fresh
+        # python.exe so accumulated arcpy / GDAL state is reclaimed
+        # by OS guarantee at process exit.
+        subprocess_batch_size = arcpy.Parameter(
+            displayName=(
+                "Subprocess Batch Size (advanced; controls the per-"
+                "scene-loop memory cycling. Each batch of N scenes "
+                "runs in a fresh python.exe subprocess to reclaim "
+                "accumulated arcpy / GDAL state. Default 10 trades "
+                "~10s arcpy reimport per batch for flat per-scene "
+                "timing. Set 0 to disable subprocess batching (legacy "
+                "single-process loop, for A/B comparison or debugging)."
+            ),
+            name="subprocess_batch_size",
+            datatype="GPLong",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        subprocess_batch_size.value = 10
+        subprocess_batch_size.filter.type = "Range"
+        subprocess_batch_size.filter.list = [0, 100]
+
         # Return order: master toggles BEFORE the values they gate so
         # the dialog reads top-down. Per-scene cloud-mask family (always
         # active) sits with the AST_08 thermal family (opt-in) above the
@@ -6765,6 +6962,7 @@ class AsterMosaic(object):
             cloud_buffer_px,
             use_ast08_thermal, bt_threshold_k,
             enable_temporal_clean, temporal_k, temporal_min_obs,
+            subprocess_batch_size,
         ]
 
     def updateParameters(self, parameters):
@@ -6897,6 +7095,11 @@ class AsterMosaic(object):
                 int(parameters[18].value)
                 if len(parameters) > 18 and parameters[18].value is not None
                 else _TMASK_MIN_OBS
+            )
+            subprocess_batch_size = (
+                int(parameters[19].value)
+                if len(parameters) > 19 and parameters[19].value is not None
+                else 10
             )
 
             # ----------------------------------------------------------------
@@ -7074,6 +7277,7 @@ class AsterMosaic(object):
                     temporal_k=temporal_k,
                     temporal_min_obs=temporal_min_obs,
                     cloud_buffer_px=cloud_buffer_px,
+                    subprocess_batch_size=subprocess_batch_size,
                 )
                 if output_full:
                     outputs.append(output_full)
@@ -7095,6 +7299,7 @@ class AsterMosaic(object):
                 temporal_k=temporal_k,
                 temporal_min_obs=temporal_min_obs,
                 cloud_buffer_px=cloud_buffer_px,
+                subprocess_batch_size=subprocess_batch_size,
             )
             if output_vnir:
                 outputs.append(output_vnir)
@@ -7140,6 +7345,7 @@ class AsterMosaic(object):
         enable_temporal_clean=True,
         temporal_k=_TMASK_K, temporal_min_obs=_TMASK_MIN_OBS,
         cloud_buffer_px=_ASTER_CLOUD_BUFFER_PX,
+        subprocess_batch_size=10,
     ):
         """Run Phases 3-5 over a scene list in one of the supported modes.
 
@@ -7192,50 +7398,105 @@ class AsterMosaic(object):
                 f"from previous run"
             )
 
-        log_every = max(1, len(to_process) // 10) if to_process else 1
-        arcpy.SetProgressor(
-            "step", f"ASTER per-scene [{label}]",
-            0, max(1, len(to_process)), 1,
-        )
-
-        for idx, scene in enumerate(to_process, 1):
-            if arcpy.env.isCancelled:
-                arcpy.ResetProgressor()
-                arcpy.AddWarning(
-                    f"  ✗ Cancelled after {idx-1}/{len(to_process)} scenes."
-                )
-                return None
-            arcpy.SetProgressorLabel(
-                f"[{idx}/{len(to_process)}] [{scene.get('format','?')}] "
-                f"{scene['scene_id']}"
+        if to_process and subprocess_batch_size > 0:
+            # Subprocess path. Each batch runs in a fresh python.exe
+            # to flush accumulated arcpy / GDAL state. See module-level
+            # _run_scene_batches docstring.
+            snap_anchor = os.path.join(scratch_dir, "_snap_anchor.tif")
+            spec_extra = {
+                "mask_feature": (
+                    mask_feature
+                    if mask_feature and arcpy.Exists(mask_feature)
+                    else None
+                ),
+                "snap_anchor": (
+                    snap_anchor if os.path.exists(snap_anchor) else None
+                ),
+                "use_qa": use_qa,
+                "bt_threshold_k": bt_threshold_k,
+                "use_ast08_thermal": use_ast08_thermal,
+                "cloud_buffer_px": cloud_buffer_px,
+            }
+            worker_kind = (
+                "aster_vnir" if mode == _ASTER_MODE_VNIR
+                else "aster_vnir_swir"
             )
-            scene_start = datetime.now()
-            try:
-                stacked = self._process_scene(
-                    scene, scratch_dir, use_qa, mode,
-                    bt_threshold_k=bt_threshold_k,
-                    use_ast08_thermal=use_ast08_thermal,
-                    cloud_buffer_px=cloud_buffer_px,
-                )
-            except Exception as e:
-                arcpy.AddWarning(f"  ✗ {scene['scene_id']}: {e}")
-                arcpy.SetProgressorPosition(idx)
-                continue
-            if stacked:
-                stacked_paths.append(stacked)
-                scenes_used.append(scene)
-                scene_times.append((datetime.now() - scene_start).total_seconds())
-            arcpy.SetProgressorPosition(idx)
-            _periodic_arcpy_cache_flush(idx)
-            if idx % log_every == 0 or idx == len(to_process):
-                if scene_times:
-                    avg = sum(scene_times) / len(scene_times)
-                    pct = 100.0 * idx / len(to_process)
-                    arcpy.AddMessage(
-                        f"  [{idx}/{len(to_process)}] {pct:.0f}% — avg {avg:.1f}s/scene"
+            ok = _run_scene_batches(
+                worker_kind=worker_kind,
+                scenes=to_process,
+                batch_size=subprocess_batch_size,
+                scratch_dir=scratch_dir,
+                spec_extra=spec_extra,
+                log_prefix="  ",
+            )
+            if not ok:
+                return None
+            # Rescan scratch for newly-completed stacks via the same
+            # marker convention the resume scan uses at the top of
+            # this method. Anything still missing means the worker
+            # logged a FAIL line; we proceed without it.
+            new_done = 0
+            new_failed = 0
+            for scene in to_process:
+                sid = scene.get("scene_id", "")
+                expected = os.path.join(scratch_dir, f"{sid}{stack_suffix}")
+                if (sid and os.path.exists(expected)
+                        and os.path.exists(expected + ".complete")):
+                    stacked_paths.append(expected)
+                    scenes_used.append(scene)
+                    new_done += 1
+                else:
+                    new_failed += 1
+            arcpy.AddMessage(
+                f"  ✓ Subprocess batches completed: {new_done} "
+                f"newly built, {new_failed} failed"
+            )
+        elif to_process:
+            # Legacy single-process loop, kept for A/B comparison and
+            # as a fallback when subprocess_batch_size = 0.
+            log_every = max(1, len(to_process) // 10)
+            arcpy.SetProgressor(
+                "step", f"ASTER per-scene [{label}]",
+                0, max(1, len(to_process)), 1,
+            )
+            for idx, scene in enumerate(to_process, 1):
+                if arcpy.env.isCancelled:
+                    arcpy.ResetProgressor()
+                    arcpy.AddWarning(
+                        f"  ✗ Cancelled after {idx-1}/{len(to_process)} scenes."
                     )
+                    return None
+                arcpy.SetProgressorLabel(
+                    f"[{idx}/{len(to_process)}] [{scene.get('format','?')}] "
+                    f"{scene['scene_id']}"
+                )
+                scene_start = datetime.now()
+                try:
+                    stacked = self._process_scene(
+                        scene, scratch_dir, use_qa, mode,
+                        bt_threshold_k=bt_threshold_k,
+                        use_ast08_thermal=use_ast08_thermal,
+                        cloud_buffer_px=cloud_buffer_px,
+                    )
+                except Exception as e:
+                    arcpy.AddWarning(f"  ✗ {scene['scene_id']}: {e}")
+                    arcpy.SetProgressorPosition(idx)
+                    continue
+                if stacked:
+                    stacked_paths.append(stacked)
+                    scenes_used.append(scene)
+                    scene_times.append((datetime.now() - scene_start).total_seconds())
+                arcpy.SetProgressorPosition(idx)
+                _periodic_arcpy_cache_flush(idx)
+                if idx % log_every == 0 or idx == len(to_process):
+                    if scene_times:
+                        avg = sum(scene_times) / len(scene_times)
+                        pct = 100.0 * idx / len(to_process)
+                        arcpy.AddMessage(
+                            f"  [{idx}/{len(to_process)}] {pct:.0f}% — avg {avg:.1f}s/scene"
+                        )
 
-        arcpy.ResetProgressor()
+            arcpy.ResetProgressor()
         if not stacked_paths:
             arcpy.AddWarning(
                 f"  ✗ [{label}] No scenes survived per-scene processing."
@@ -11745,6 +12006,12 @@ if __name__ == "__main__":
             _spec = json.load(_fh)
         if _worker_kind == "s2":
             _worker_s2_batch(_spec)
+        elif _worker_kind == "aster_vnir_swir":
+            _worker_aster_batch(_spec, mode="vnir_swir")
+        elif _worker_kind == "aster_vnir":
+            _worker_aster_batch(_spec, mode="vnir")
+        elif _worker_kind == "landsat":
+            _worker_landsat_batch(_spec)
         else:
             raise SystemExit(f"Unknown worker kind: {_worker_kind!r}")
         sys.exit(0)
