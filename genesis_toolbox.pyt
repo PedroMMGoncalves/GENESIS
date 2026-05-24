@@ -6519,6 +6519,40 @@ _AST08_HDF_RE = re.compile(
 _AST08_BT_SDS_NAMES = ("SurfaceKineticTemperature", "KineticTemperature")
 
 
+def _aster_bt_kelvin_from_path(path, scratch_dir, target_cellsize=None, scene_id=""):
+    """Load AST_08 Surface Kinetic Temperature as a lazy Kelvin Raster.
+
+    Accepts a path to either an AST_08 GeoTIFF or HDF (the BT subdataset
+    is extracted to scratch via ``AsterMosaic._extract_ast08_bt_tiff``
+    when the path ends in ``.hdf``). Optionally resamples to
+    ``target_cellsize`` metres via BILINEAR; default ``None`` keeps the
+    native 90 m grid (the right choice for thermal statistics; the
+    AsterMosaic cloud test passes 15 to match the SR grid). Applies
+    ``_ASTER_TIR_SCALE`` (DN x 0.1 -> Kelvin) and screens NoData via
+    ``SetNull`` below ``_ASTER_TIR_VALID_K_FLOOR``.
+
+    Returns a lazy ``arcpy.sa.Raster`` in Kelvin. Raises on failure;
+    callers attach scene-level context to their warnings.
+    """
+    if path.lower().endswith(".hdf"):
+        bt_src = AsterMosaic._extract_ast08_bt_tiff(path, scratch_dir)
+        if bt_src is None:
+            raise RuntimeError("AST_08 HDF extraction failed")
+    else:
+        bt_src = path
+    if target_cellsize is not None:
+        resampled = os.path.join(
+            scratch_dir,
+            f"{scene_id or 'ast08'}_BT_{int(target_cellsize)}m.tif",
+        )
+        arcpy.management.Resample(bt_src, resampled, target_cellsize, "BILINEAR")
+        bt_dn = Float(arcpy.sa.Raster(resampled))
+    else:
+        bt_dn = Float(arcpy.sa.Raster(bt_src))
+    bt_kelvin = bt_dn * _ASTER_TIR_SCALE
+    return arcpy.sa.SetNull(bt_kelvin < _ASTER_TIR_VALID_K_FLOOR, bt_kelvin)
+
+
 class AsterMosaic(object):
     """Tool 03 — ASTER AST_07XT V004 mineral-mapping mosaic.
 
@@ -8241,19 +8275,13 @@ class AsterMosaic(object):
             return None
 
     def _load_bt_kelvin(self, thermal_meta, scratch_dir, scene_id):
-        """Load the paired AST_08 surface kinetic temperature, resample
-        to 15 m, and return a lazy Kelvin raster suitable for the cloud
-        test. Returns ``None`` when no thermal pairing exists or the
-        load fails (the caller falls back to VIS/SWIR-only cloud detection).
-
-        AST_08 V004 stores Surface Kinetic Temperature as Int16 with a
-        scale factor of 0.1 (DN × 0.1 = Kelvin) — the LP DAAC product
-        spec confirmed by the May 2026 Faial diagnostic that found raw
-        BT values of 2700-3000 instead of the 270-300 K range expected.
-        We multiply by ``_ASTER_TIR_SCALE`` after the Resample and then
-        screen NoData (stored as 0 DN and the float32 sentinel
-        Resample can introduce near scene edges) with a single
-        ``SetNull`` against ``_ASTER_TIR_VALID_K_FLOOR``.
+        """Load the paired AST_08 surface kinetic temperature at the 15 m
+        grid used by the per-scene cloud test. Returns ``None`` when no
+        thermal pairing exists or the load fails (the caller falls back
+        to VIS/SWIR-only cloud detection). The actual load logic lives
+        in module-level ``_aster_bt_kelvin_from_path``; this method
+        preserves the per-scene warning convention of the cloud-test
+        path.
         """
         if not thermal_meta:
             return None
@@ -8261,24 +8289,10 @@ class AsterMosaic(object):
         path = thermal_meta.get("path")
         if not (fmt and path):
             return None
-
-        if fmt == "hdf":
-            bt_src = self._extract_ast08_bt_tiff(path, scratch_dir)
-            if bt_src is None:
-                arcpy.AddWarning(
-                    f"  ✗ {scene_id}: AST_08 HDF extraction failed; "
-                    "continuing without thermal cloud channel"
-                )
-                return None
-        else:
-            bt_src = path
-
         try:
-            resampled = os.path.join(scratch_dir, f"{scene_id}_BT_15m.tif")
-            arcpy.management.Resample(bt_src, resampled, 15, "BILINEAR")
-            bt_dn = Float(arcpy.sa.Raster(resampled))
-            bt_kelvin = bt_dn * _ASTER_TIR_SCALE
-            return arcpy.sa.SetNull(bt_kelvin < _ASTER_TIR_VALID_K_FLOOR, bt_kelvin)
+            return _aster_bt_kelvin_from_path(
+                path, scratch_dir, target_cellsize=15, scene_id=scene_id,
+            )
         except Exception as e:
             arcpy.AddWarning(
                 f"  ✗ {scene_id}: AST_08 BT load failed ({e}); "
