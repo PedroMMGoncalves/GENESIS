@@ -1145,6 +1145,57 @@ def _resolve_to_catalog_path(layer_or_path):
         return layer_or_path
 
 
+def _format_scene_log_line(idx, total, scene_id, elapsed_s, extras=None, fail=None):
+    """One per-scene Phase 3 log line, uniformly shaped across mosaic tools.
+
+    Layouts:
+      ``  [  1/89] <scene_id>  36.9s   cloud 12.3%``      (success + extras)
+      ``  [  1/89] <scene_id>  36.9s``                    (success, no extras)
+      ``  ✗ [ 23/89] <scene_id>  31.2s   FAIL: <reason>`` (failure)
+
+    ``extras`` is an optional dict of label -> value strings, joined as
+    ``label value`` pairs separated by two spaces and prefixed with
+    three spaces from the timing column; ignored when ``fail`` is set.
+
+    ``scene_id`` is right-clipped to 48 characters with a trailing
+    ``...`` so Pro's message panel doesn't wrap. The counter is right-
+    padded to the digit-width of ``total`` so columns line up.
+    """
+    width = len(str(total))
+    counter = f"[{idx:>{width}}/{total}]"
+    sid_clip = scene_id if len(scene_id) <= 48 else scene_id[:45] + "..."
+    if fail:
+        return f"  ✗ {counter} {sid_clip}  {elapsed_s:5.1f}s   FAIL: {fail}"
+    extras_str = ""
+    if extras:
+        extras_str = "   " + "  ".join(f"{k} {v}" for k, v in extras.items())
+    return f"  {counter} {sid_clip}  {elapsed_s:5.1f}s{extras_str}"
+
+
+def _emit_phase3_summary(ok, failed, total_elapsed_s, failures=None):
+    """Emit the Phase 3 tail summary + optional Failures: block via
+    ``arcpy.AddMessage`` calls.
+
+    Average is computed over successful scenes only; failures might be
+    near-instant (worker-death synthesised) or near-pathological, and
+    mixing them with successes would skew the metric. ``failures`` is
+    an optional iterable of ``(idx, scene_id, fail_msg)`` tuples that
+    get re-listed under a ``Failures:`` header so a long run's errors
+    don't scroll out of view in Pro.
+    """
+    avg = total_elapsed_s / max(1, ok)
+    sym = "✓" if not failed else "✗"
+    arcpy.AddMessage(
+        f"  {sym} {ok} ok, {failed} failed in {total_elapsed_s:.0f}s "
+        f"({avg:.1f}s/scene)"
+    )
+    if failures:
+        arcpy.AddMessage("  Failures:")
+        for idx, sid, msg in failures:
+            sid_clip = sid if len(sid) <= 48 else sid[:45] + "..."
+            arcpy.AddMessage(f"    [{idx}] {sid_clip} {msg}")
+
+
 def _resolve_worker_python():
     """Return a real python.exe to spawn subprocess workers with.
 
@@ -1172,101 +1223,171 @@ def _run_scene_batches(
     spec_extra=None, log_prefix="  ",
 ):
     """Run ``scenes`` through the matching worker in batches of
-    ``batch_size``, one fresh python.exe per batch. Returns True on
-    full success, False on cancellation or any batch failure.
+    ``batch_size``, one fresh python.exe per batch.
 
-    Worker stdout is streamed live into arcpy.AddMessage so the user
-    sees per-scene progress in Pro's messages tab. The
-    ``arcpy.env.isCancelled`` flag is polled between lines; on cancel
-    the current subprocess is terminated and the loop exits.
+    Workers emit one JSON event per scene over stdout::
+
+      {"kind": "scene", "sid": "<id>", "elapsed_s": 36.9, "extras": {...}}
+      {"kind": "scene", "sid": "<id>", "elapsed_s": 31.2, "fail": "..."}
+
+    The orchestrator parses each event, formats a unified per-scene log
+    line via ``_format_scene_log_line``, drives ``arcpy.SetProgressor``,
+    and tracks failures for the tail summary emitted via
+    ``_emit_phase3_summary``. Batch boundaries are intentionally hidden
+    from the visible log; the underlying processing is still one
+    subprocess per batch.
+
+    Non-JSON lines on worker stdout pass through verbatim (leading
+    whitespace stripped) so stray ``arcpy.AddMessage`` / ``AddWarning``
+    from inside ``_process_scene`` still surfaces without double-
+    indenting under the formatted counter.
+
+    Worker-death detection: any scene_id that the batch's spec expected
+    but never produced a JSON event for is synthesised as a failure
+    with reason ``worker exit <rc> before scene reported``.
+
+    Returns True after all batches complete (per-scene failures do NOT
+    stop the run; caller proceeds with whatever scenes succeeded).
+    Returns False only on user cancellation or worker-spawn exception.
 
     Spec format (JSON file on disk, path passed as argv[3]):
       {"scenes": [scene_dict, ...], "scratch_dir": str, ...extras}
     """
     spec_extra = spec_extra or {}
-    n_batches = (len(scenes) + batch_size - 1) // batch_size
+    total = len(scenes)
+    n_batches = (total + batch_size - 1) // batch_size
     worker_python = _resolve_worker_python()
     arcpy.AddMessage(
-        f"{log_prefix}Subprocess batching: {len(scenes)} scene"
-        f"{'s' if len(scenes) != 1 else ''} in {n_batches} batch"
-        f"{'es' if n_batches != 1 else ''} of {batch_size}. Each "
-        f"batch runs in a fresh python.exe to flush accumulated "
-        f"arcpy / GDAL state."
+        f"{log_prefix}Subprocess batching: {total} scene"
+        f"{'s' if total != 1 else ''} via subprocess, {batch_size}/batch"
     )
-    arcpy.AddMessage(f"{log_prefix}  worker interpreter: {worker_python}")
+    arcpy.AddMessage(f"{log_prefix}  worker: {worker_python}")
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"   # immediate worker stdout, line by line
-    for batch_idx in range(n_batches):
-        if arcpy.env.isCancelled:
-            arcpy.AddWarning(f"{log_prefix}Cancelled by user.")
-            return False
-        batch = scenes[batch_idx * batch_size:(batch_idx + 1) * batch_size]
-        spec_path = os.path.join(
-            scratch_dir,
-            f"_batch_{batch_idx:03d}_{worker_kind}.json",
-        )
-        spec = {"scenes": batch, "scratch_dir": scratch_dir, **spec_extra}
-        with open(spec_path, "w", encoding="utf-8") as fh:
-            json.dump(spec, fh, default=str)
-        cmd = [worker_python, __file__, "--worker", worker_kind, spec_path]
-        arcpy.AddMessage(
-            f"{log_prefix}[batch {batch_idx + 1}/{n_batches}] spawning "
-            f"worker for {len(batch)} scene{'s' if len(batch) != 1 else ''}"
-        )
-        t_batch = time.time()
-        rc = 1
-        try:
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, env=env,
+
+    def _scene_id_of(scene):
+        # Kept in sync with the worker's sid extraction (see
+        # _worker_s2_batch / _worker_aster_batch).
+        if worker_kind == "s2":
+            return (scene.get("metadata") or {}).get("product_uri", "?")
+        return scene.get("scene_id") or "?"
+
+    arcpy.SetProgressor("step", "Per-scene processing", 0, max(1, total), 1)
+    global_idx = 0
+    failures = []
+    t0_phase = time.time()
+    try:
+        for batch_idx in range(n_batches):
+            if arcpy.env.isCancelled:
+                arcpy.AddWarning(f"{log_prefix}Cancelled by user.")
+                return False
+            batch = scenes[batch_idx * batch_size:(batch_idx + 1) * batch_size]
+            spec_path = os.path.join(
+                scratch_dir,
+                f"_batch_{batch_idx:03d}_{worker_kind}.json",
             )
-            for line in proc.stdout:
-                arcpy.AddMessage(f"{log_prefix}  {line.rstrip()}")
-                if arcpy.env.isCancelled:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                    arcpy.AddWarning(
-                        f"{log_prefix}Worker terminated mid-batch."
-                    )
-                    return False
-            rc = proc.wait()
-        except Exception as e:
-            arcpy.AddError(
-                f"{log_prefix}Worker spawn failed: "
-                f"{type(e).__name__}: {e}"
-            )
-            return False
-        finally:
+            spec = {"scenes": batch, "scratch_dir": scratch_dir, **spec_extra}
+            with open(spec_path, "w", encoding="utf-8") as fh:
+                json.dump(spec, fh, default=str)
+            cmd = [
+                worker_python, __file__, "--worker", worker_kind, spec_path,
+            ]
+            expected_sids = {_scene_id_of(s) for s in batch}
+            reported_sids = set()
+            rc = 1
             try:
-                os.remove(spec_path)
-            except OSError:
-                pass
-        elapsed = time.time() - t_batch
-        if rc != 0:
-            arcpy.AddError(
-                f"{log_prefix}Batch {batch_idx + 1} returned non-zero "
-                f"exit code {rc} after {elapsed:.1f}s"
-            )
-            return False
-        arcpy.AddMessage(
-            f"{log_prefix}[batch {batch_idx + 1}/{n_batches}] done: "
-            f"{len(batch)} scene{'s' if len(batch) != 1 else ''} in "
-            f"{elapsed:.1f}s ({elapsed / max(1, len(batch)):.1f}s/scene)"
-        )
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1, env=env,
+                )
+                for line in proc.stdout:
+                    stripped = line.rstrip()
+                    if not stripped:
+                        continue
+                    try:
+                        evt = json.loads(stripped)
+                    except (ValueError, TypeError):
+                        evt = None
+                    if (isinstance(evt, dict)
+                            and evt.get("kind") == "scene"):
+                        global_idx += 1
+                        sid = evt.get("sid", "?")
+                        reported_sids.add(sid)
+                        elapsed = float(evt.get("elapsed_s", 0.0))
+                        extras = evt.get("extras") or None
+                        fail = evt.get("fail")
+                        arcpy.AddMessage(_format_scene_log_line(
+                            global_idx, total, sid, elapsed,
+                            extras=extras, fail=fail,
+                        ))
+                        arcpy.SetProgressorPosition(global_idx)
+                        if fail:
+                            failures.append((global_idx, sid, fail))
+                    else:
+                        # Non-JSON or unknown event - pass through with
+                        # leading whitespace stripped so it doesn't
+                        # double-indent under the orchestrator's prefix.
+                        arcpy.AddMessage(
+                            f"{log_prefix}  {stripped.lstrip()}"
+                        )
+                    if arcpy.env.isCancelled:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                        arcpy.AddWarning(
+                            f"{log_prefix}Worker terminated mid-batch."
+                        )
+                        return False
+                rc = proc.wait()
+            except Exception as e:
+                arcpy.AddError(
+                    f"{log_prefix}Worker spawn failed: "
+                    f"{type(e).__name__}: {e}"
+                )
+                return False
+            finally:
+                try:
+                    os.remove(spec_path)
+                except OSError:
+                    pass
+
+            # Worker-death detection: synthesise failures for sids the
+            # batch spec expected but the worker never reported.
+            missing = expected_sids - reported_sids
+            for sid in missing:
+                global_idx += 1
+                fail_msg = f"worker exit {rc} before scene reported"
+                arcpy.AddMessage(_format_scene_log_line(
+                    global_idx, total, sid, 0.0, fail=fail_msg,
+                ))
+                failures.append((global_idx, sid, fail_msg))
+                arcpy.SetProgressorPosition(global_idx)
+    finally:
+        arcpy.ResetProgressor()
+
+    ok = total - len(failures)
+    _emit_phase3_summary(
+        ok, len(failures), time.time() - t0_phase, failures,
+    )
     return True
 
 
 def _worker_s2_batch(spec):
-    """Subprocess entry point for a Sentinel-2 scene batch. Re-checks
-    out Spatial + ImageAnalyst, re-establishes env.mask + env.extent
-    from the spec, instantiates Sentinel2Mosaic, runs _process_scene
-    on each scene, prints per-scene status (START / DONE / FAIL with
-    elapsed seconds) to stdout for the orchestrator to capture. Exits
-    cleanly even on per-scene failures; the BATCH_SUMMARY tail line
-    carries the ok/fail counts."""
+    """Subprocess entry point for a Sentinel-2 scene batch.
+
+    Emits one JSON event per scene over stdout::
+
+      {"kind": "scene", "sid": "<id>", "elapsed_s": 36.9, "extras": {}}
+      {"kind": "scene", "sid": "<id>", "elapsed_s": 31.2, "fail": "..."}
+
+    Fatal pre-loop errors (missing license, etc.) write a plain
+    ``FATAL: ...`` line and exit non-zero; the orchestrator's worker-
+    death detection then synthesises failures for every expected sid.
+    Per-scene failures emit a ``fail`` event but the worker continues
+    so the rest of the batch still runs.
+    """
     arcpy.SetLogHistory(False)
     arcpy.SetLogMetadata(False)
     arcpy.env.overwriteOutput = True
@@ -1276,43 +1397,51 @@ def _worker_s2_batch(spec):
         arcpy.env.extent = mask_feature
     for ext in ("Spatial", "ImageAnalyst"):
         if arcpy.CheckExtension(ext) != "Available":
-            print(f"FAIL: {ext} Analyst extension not Available", flush=True)
+            print(
+                f"FATAL: {ext} Analyst extension not Available",
+                flush=True,
+            )
             sys.exit(2)
         arcpy.CheckOutExtension(ext)
     tool = Sentinel2Mosaic()
     scratch_dir = spec["scratch_dir"]
     scl_classes = tuple(spec["scl_classes"])
     cloud_buffer_pixels = spec["cloud_buffer_pixels"]
-    n_ok = n_fail = 0
     for scene in spec["scenes"]:
         sid = (scene.get("metadata") or {}).get("product_uri", "?")
         t = time.time()
-        print(f"START {sid}", flush=True)
         try:
             tool._process_scene(
                 scene, scratch_dir, scl_classes, cloud_buffer_pixels,
             )
             elapsed = time.time() - t
-            print(f"DONE  {sid} {elapsed:.1f}s", flush=True)
-            n_ok += 1
+            # S2 has no per-scene cloud diagnostic at present; extras
+            # stays empty. Future: count SCL cloud classes vs total
+            # pixels after mask and surface as cloud %.
+            print(json.dumps({
+                "kind": "scene", "sid": sid,
+                "elapsed_s": round(elapsed, 1),
+                "extras": {},
+            }), flush=True)
         except Exception as e:
             elapsed = time.time() - t
-            print(
-                f"FAIL  {sid} {elapsed:.1f}s "
-                f"{type(e).__name__}: {e}",
-                flush=True,
-            )
-            n_fail += 1
-    print(f"BATCH_SUMMARY ok={n_ok} fail={n_fail}", flush=True)
+            print(json.dumps({
+                "kind": "scene", "sid": sid,
+                "elapsed_s": round(elapsed, 1),
+                "fail": f"{type(e).__name__}: {e}",
+            }), flush=True)
 
 
 def _worker_aster_batch(spec, mode):
-    """Subprocess entry point for an ASTER scene batch. Re-checks out
-    Spatial + ImageAnalyst, re-establishes env.mask + env.extent +
-    env.snapRaster (15 m anchor) from the spec, instantiates
-    AsterMosaic, runs _process_scene on each scene in the given mode
-    (``"vnir_swir"`` for the 9-band path or ``"vnir"`` for the
-    3-band path). Prints START / DONE / FAIL / BATCH_SUMMARY lines."""
+    """Subprocess entry point for an ASTER scene batch.
+
+    Emits one JSON event per scene over stdout; see ``_worker_s2_batch``
+    for the protocol. The ``extras`` dict carries any per-scene
+    diagnostics that ``AsterMosaic._process_scene`` stashed on
+    ``scene["metadata"]``: ``cloud_pct`` (always when the cloud test
+    ran) and ``bt_stats`` (when the optional AST_08 thermal channel
+    was enabled).
+    """
     arcpy.SetLogHistory(False)
     arcpy.SetLogMetadata(False)
     arcpy.env.overwriteOutput = True
@@ -1327,7 +1456,10 @@ def _worker_aster_batch(spec, mode):
         arcpy.env.cellSize = 15
     for ext in ("Spatial", "ImageAnalyst"):
         if arcpy.CheckExtension(ext) != "Available":
-            print(f"FAIL: {ext} Analyst extension not Available", flush=True)
+            print(
+                f"FATAL: {ext} Analyst extension not Available",
+                flush=True,
+            )
             sys.exit(2)
         arcpy.CheckOutExtension(ext)
     tool = AsterMosaic()
@@ -1339,11 +1471,9 @@ def _worker_aster_batch(spec, mode):
     aster_mode = (
         _ASTER_MODE_VNIR if mode == "vnir" else _ASTER_MODE_FULL
     )
-    n_ok = n_fail = 0
     for scene in spec["scenes"]:
         sid = scene.get("scene_id") or "?"
         t = time.time()
-        print(f"START {sid}", flush=True)
         try:
             tool._process_scene(
                 scene, scratch_dir, use_qa, aster_mode,
@@ -1352,17 +1482,26 @@ def _worker_aster_batch(spec, mode):
                 cloud_buffer_px=cloud_buffer_px,
             )
             elapsed = time.time() - t
-            print(f"DONE  {sid} {elapsed:.1f}s", flush=True)
-            n_ok += 1
+            meta = scene.get("metadata") or {}
+            extras = {}
+            cloud_pct = meta.get("cloud_pct")
+            if cloud_pct is not None:
+                extras["cloud"] = f"{cloud_pct:.1f}%"
+            bt_stats = meta.get("bt_stats")
+            if bt_stats:
+                extras["BT[K]"] = bt_stats
+            print(json.dumps({
+                "kind": "scene", "sid": sid,
+                "elapsed_s": round(elapsed, 1),
+                "extras": extras,
+            }), flush=True)
         except Exception as e:
             elapsed = time.time() - t
-            print(
-                f"FAIL  {sid} {elapsed:.1f}s "
-                f"{type(e).__name__}: {e}",
-                flush=True,
-            )
-            n_fail += 1
-    print(f"BATCH_SUMMARY ok={n_ok} fail={n_fail}", flush=True)
+            print(json.dumps({
+                "kind": "scene", "sid": sid,
+                "elapsed_s": round(elapsed, 1),
+                "fail": f"{type(e).__name__}: {e}",
+            }), flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -8133,23 +8272,24 @@ class AsterMosaic(object):
             # ``dict(scene, ...)`` on line 7213 creates a new outer dict
             # but the metadata reference is shared with the caller.
             scene["metadata"]["cloud_pct"] = round(cm_pct, 2)
-            bt_stats = ""
+            # Stash BT stats on metadata too (when AST_08 thermal is on)
+            # so the subprocess worker can surface them via the per-scene
+            # log line's extras dict. The orchestrator's unified Phase 3
+            # log replaces the inline arcpy.AddMessage diagnostic that
+            # previously lived here.
             if bt_kelvin is not None:
                 try:
                     bt_arr = arcpy.RasterToNumPyArray(bt_kelvin)
                     bt_valid = bt_arr[bt_arr > _ASTER_TIR_VALID_K_FLOOR]
                     if bt_valid.size:
-                        bt_stats = (
-                            f", BT[K] min={float(np.min(bt_valid)):.1f}"
+                        scene["metadata"]["bt_stats"] = (
+                            f"min={float(np.min(bt_valid)):.1f}"
                             f"/med={float(np.median(bt_valid)):.1f}"
                             f"/max={float(np.max(bt_valid)):.1f}"
                             f" (cut {bt_threshold:.0f})"
                         )
                 except Exception:
                     pass
-            arcpy.AddMessage(
-                f"    cloud mask: {cm_pct:.1f}% of pixels flagged{bt_stats}"
-            )
         except Exception as e:
             arcpy.AddWarning(
                 f"    cloud diagnostic failed ({e}); proceeding"
