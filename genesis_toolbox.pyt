@@ -3956,13 +3956,14 @@ class LandsatMosaic(object):
                     f"composite(s) reused from previous run"
                 )
 
-            scene_times = []
             if to_process:
                 arcpy.SetProgressor(
-                    "step", "Building per-scene composites",
+                    "step", "Per-scene processing",
                     0, max(1, len(to_process)), 1,
                 )
-                log_every = max(1, len(to_process) // 10)
+                t0_phase = time.time()
+                scene_times = []
+                failures = []
                 composite_idx = 0
                 for scene in to_process:
                     if arcpy.env.isCancelled:
@@ -3978,34 +3979,30 @@ class LandsatMosaic(object):
                     arcpy.SetProgressorLabel(
                         f"[{composite_idx}/{len(to_process)}] {scene_id}"
                     )
-                    scene_start = datetime.now()
+                    scene_start = time.time()
                     try:
                         temp_composite = self._process_scene(scene, scratch_dir)
+                        elapsed = time.time() - scene_start
+                        arcpy.AddMessage(_format_scene_log_line(
+                            composite_idx, len(to_process),
+                            scene_id, elapsed,
+                        ))
+                        multiband_rasters.append(temp_composite)
+                        scene_times.append(elapsed)
                     except Exception as e:
-                        arcpy.AddWarning(f"  ✗ {scene_id}: {e}")
-                        arcpy.SetProgressorPosition(composite_idx)
-                        continue
-                    multiband_rasters.append(temp_composite)
-                    scene_times.append(
-                        (datetime.now() - scene_start).total_seconds()
-                    )
+                        elapsed = time.time() - scene_start
+                        fail_msg = f"{type(e).__name__}: {e}"
+                        arcpy.AddMessage(_format_scene_log_line(
+                            composite_idx, len(to_process),
+                            scene_id, elapsed, fail=fail_msg,
+                        ))
+                        failures.append((composite_idx, scene_id, fail_msg))
                     arcpy.SetProgressorPosition(composite_idx)
                     _periodic_arcpy_cache_flush(composite_idx)
-                    if composite_idx % log_every == 0 or composite_idx == len(to_process):
-                        avg = sum(scene_times) / len(scene_times)
-                        pct = 100.0 * composite_idx / len(to_process)
-                        arcpy.AddMessage(
-                            f"  [{composite_idx}/{len(to_process)}] {pct:.0f}% — "
-                            f"avg {avg:.1f}s/scene"
-                        )
                 arcpy.ResetProgressor()
-
-            # Phase 3 summary with min/max/avg for outlier debuggability.
-            if scene_times:
-                arcpy.AddMessage(
-                    f"  ✓ {len(scene_times)} composites in {sum(scene_times):.1f}s "
-                    f"(avg {sum(scene_times)/len(scene_times):.1f}s, "
-                    f"min {min(scene_times):.1f}s, max {max(scene_times):.1f}s)"
+                _emit_phase3_summary(
+                    len(scene_times), len(failures),
+                    time.time() - t0_phase, failures,
                 )
 
             # Phase 4 — GeometricMedian
@@ -5834,16 +5831,15 @@ class Sentinel2Mosaic(object):
                 if not ok:
                     return None
                 # Rescan scratch for newly-completed scenes; append to
-                # the accumulators that the resume scan already
-                # primed with previously-completed work.
-                new_done = 0
-                new_failed = 0
+                # the accumulators that the resume scan already primed
+                # with previously-completed work. The user-facing tally
+                # is already emitted by _run_scene_batches' tail
+                # summary; this rescan only populates internal state.
                 for scene in to_process:
                     meta = scene["metadata"]
                     tile = meta.get("tile_id")
                     product_uri = meta.get("product_uri")
                     if not (tile and product_uri):
-                        new_failed += 1
                         continue
                     stack = os.path.join(
                         scratch_dir, f"{product_uri}_stack.tif",
@@ -5853,23 +5849,16 @@ class Sentinel2Mosaic(object):
                         scenes_by_tile.setdefault(tile, []).append(stack)
                         composite_temp_paths.append(stack)
                         all_scenes_used.append(scene)
-                        new_done += 1
-                    else:
-                        new_failed += 1
-                arcpy.AddMessage(
-                    f"  ✓ Subprocess batches completed: {new_done} "
-                    f"newly built, {new_failed} failed"
-                )
             elif to_process:
                 # Legacy single-process loop, kept for A/B comparison
                 # and as a fallback when subprocess_batch_size = 0.
                 arcpy.SetProgressor(
-                    "step", "Cloud-masking + stacking scenes",
+                    "step", "Per-scene processing",
                     0, max(1, len(to_process)), 1,
                 )
-                log_every = max(1, len(to_process) // 10) if to_process else 1
+                t0_phase = time.time()
                 scene_times = []
-
+                failures = []
                 for idx, scene in enumerate(to_process, 1):
                     if arcpy.env.isCancelled:
                         arcpy.ResetProgressor()
@@ -5879,52 +5868,54 @@ class Sentinel2Mosaic(object):
                         return None
                     meta = scene["metadata"]
                     tile = meta.get("tile_id")
+                    sid = meta.get("product_uri") or os.path.basename(scene["path"])
                     if not tile:
-                        arcpy.AddWarning(
-                            f"  ✗ {os.path.basename(scene['path'])}: no tile ID"
-                        )
+                        fail_msg = "no tile ID"
+                        arcpy.AddMessage(_format_scene_log_line(
+                            idx, len(to_process), sid, 0.0, fail=fail_msg,
+                        ))
+                        failures.append((idx, sid, fail_msg))
+                        arcpy.SetProgressorPosition(idx)
                         continue
                     src_tag = "zip" if scene.get("source_kind") == "zip" else "safe"
                     arcpy.SetProgressorLabel(
-                        f"[{idx}/{len(to_process)}] [{tile}/{src_tag}] "
-                        f"{os.path.basename(scene['path'])}"
+                        f"[{idx}/{len(to_process)}] [{tile}/{src_tag}] {sid}"
                     )
-                    scene_start = datetime.now()
+                    scene_start = time.time()
                     try:
                         stacked_path = self._process_scene(
                             scene, scratch_dir, scl_classes, cloud_buffer_pixels,
                         )
+                        elapsed = time.time() - scene_start
                     except Exception as e:
-                        arcpy.AddWarning(f"  ✗ {os.path.basename(scene['path'])}: {e}")
+                        elapsed = time.time() - scene_start
+                        fail_msg = f"{type(e).__name__}: {e}"
+                        arcpy.AddMessage(_format_scene_log_line(
+                            idx, len(to_process), sid, elapsed, fail=fail_msg,
+                        ))
+                        failures.append((idx, sid, fail_msg))
+                        arcpy.SetProgressorPosition(idx)
                         continue
                     if stacked_path:
                         scenes_by_tile.setdefault(tile, []).append(stacked_path)
                         composite_temp_paths.append(stacked_path)
                         all_scenes_used.append(scene)
-                        scene_times.append(
-                            (datetime.now() - scene_start).total_seconds()
-                        )
+                        scene_times.append(elapsed)
+                        arcpy.AddMessage(_format_scene_log_line(
+                            idx, len(to_process), sid, elapsed,
+                        ))
                     arcpy.SetProgressorPosition(idx)
                     _periodic_arcpy_cache_flush(idx)
-                    # Periodic message ~10× during the phase
-                    if idx % log_every == 0 or idx == len(to_process):
-                        if scene_times:
-                            avg = sum(scene_times) / len(scene_times)
-                            pct = 100.0 * idx / len(to_process)
-                            arcpy.AddMessage(
-                                f"  [{idx}/{len(to_process)}] {pct:.0f}% — "
-                                f"avg {avg:.1f}s/scene"
-                            )
-
                 arcpy.ResetProgressor()
+                _emit_phase3_summary(
+                    len(scene_times), len(failures),
+                    time.time() - t0_phase, failures,
+                )
             if not scenes_by_tile:
                 arcpy.AddError("  ✗ No scenes survived cloud masking + stacking.")
                 return None
-            stack_elapsed = (datetime.now() - stack_start).total_seconds()
             arcpy.AddMessage(
-                f"  ✓ {len(all_scenes_used)} scenes in {stack_elapsed:.1f}s "
-                f"({stack_elapsed/max(1,len(all_scenes_used)):.1f}s/scene) — "
-                f"tiles: {sorted(scenes_by_tile.keys())}"
+                f"  Tiles: {sorted(scenes_by_tile.keys())}"
             )
 
             # Step 4: per-tile geometric median.
@@ -7469,7 +7460,6 @@ class AsterMosaic(object):
         )
         stacked_paths = []
         scenes_used = []
-        stack_phase_start = datetime.now()
         scene_times = []
 
         # Resume scan — reuse any per-scene stack that survives in scratch
@@ -7543,10 +7533,9 @@ class AsterMosaic(object):
                 return None
             # Rescan scratch for newly-completed stacks via the same
             # marker convention the resume scan uses at the top of
-            # this method. Anything still missing means the worker
-            # logged a FAIL line; we proceed without it.
-            new_done = 0
-            new_failed = 0
+            # this method. The user-facing tally is already emitted by
+            # _run_scene_batches' tail summary; this rescan only
+            # populates internal state.
             for scene in to_process:
                 sid = scene.get("scene_id", "")
                 expected = os.path.join(scratch_dir, f"{sid}{stack_suffix}")
@@ -7554,21 +7543,15 @@ class AsterMosaic(object):
                         and os.path.exists(expected + ".complete")):
                     stacked_paths.append(expected)
                     scenes_used.append(scene)
-                    new_done += 1
-                else:
-                    new_failed += 1
-            arcpy.AddMessage(
-                f"  ✓ Subprocess batches completed: {new_done} "
-                f"newly built, {new_failed} failed"
-            )
         elif to_process:
             # Legacy single-process loop, kept for A/B comparison and
             # as a fallback when subprocess_batch_size = 0.
-            log_every = max(1, len(to_process) // 10)
             arcpy.SetProgressor(
-                "step", f"ASTER per-scene [{label}]",
+                "step", f"Per-scene processing [{label}]",
                 0, max(1, len(to_process)), 1,
             )
+            t0_phase = time.time()
+            failures = []
             for idx, scene in enumerate(to_process, 1):
                 if arcpy.env.isCancelled:
                     arcpy.ResetProgressor()
@@ -7576,11 +7559,11 @@ class AsterMosaic(object):
                         f"  ✗ Cancelled after {idx-1}/{len(to_process)} scenes."
                     )
                     return None
+                sid = scene.get("scene_id") or "?"
                 arcpy.SetProgressorLabel(
-                    f"[{idx}/{len(to_process)}] [{scene.get('format','?')}] "
-                    f"{scene['scene_id']}"
+                    f"[{idx}/{len(to_process)}] [{scene.get('format','?')}] {sid}"
                 )
-                scene_start = datetime.now()
+                scene_start = time.time()
                 try:
                     stacked = self._process_scene(
                         scene, scratch_dir, use_qa, mode,
@@ -7588,35 +7571,44 @@ class AsterMosaic(object):
                         use_ast08_thermal=use_ast08_thermal,
                         cloud_buffer_px=cloud_buffer_px,
                     )
+                    elapsed = time.time() - scene_start
                 except Exception as e:
-                    arcpy.AddWarning(f"  ✗ {scene['scene_id']}: {e}")
+                    elapsed = time.time() - scene_start
+                    fail_msg = f"{type(e).__name__}: {e}"
+                    arcpy.AddMessage(_format_scene_log_line(
+                        idx, len(to_process), sid, elapsed, fail=fail_msg,
+                    ))
+                    failures.append((idx, sid, fail_msg))
                     arcpy.SetProgressorPosition(idx)
                     continue
                 if stacked:
                     stacked_paths.append(stacked)
                     scenes_used.append(scene)
-                    scene_times.append((datetime.now() - scene_start).total_seconds())
+                    scene_times.append(elapsed)
+                    meta = scene.get("metadata") or {}
+                    extras = {}
+                    cloud_pct = meta.get("cloud_pct")
+                    if cloud_pct is not None:
+                        extras["cloud"] = f"{cloud_pct:.1f}%"
+                    bt_stats = meta.get("bt_stats")
+                    if bt_stats:
+                        extras["BT[K]"] = bt_stats
+                    arcpy.AddMessage(_format_scene_log_line(
+                        idx, len(to_process), sid, elapsed,
+                        extras=extras or None,
+                    ))
                 arcpy.SetProgressorPosition(idx)
                 _periodic_arcpy_cache_flush(idx)
-                if idx % log_every == 0 or idx == len(to_process):
-                    if scene_times:
-                        avg = sum(scene_times) / len(scene_times)
-                        pct = 100.0 * idx / len(to_process)
-                        arcpy.AddMessage(
-                            f"  [{idx}/{len(to_process)}] {pct:.0f}% — avg {avg:.1f}s/scene"
-                        )
-
             arcpy.ResetProgressor()
+            _emit_phase3_summary(
+                len(scene_times), len(failures),
+                time.time() - t0_phase, failures,
+            )
         if not stacked_paths:
             arcpy.AddWarning(
                 f"  ✗ [{label}] No scenes survived per-scene processing."
             )
             return None
-        stack_phase_elapsed = (datetime.now() - stack_phase_start).total_seconds()
-        arcpy.AddMessage(
-            f"  ✓ {len(stacked_paths)} scenes in {stack_phase_elapsed:.1f}s "
-            f"({stack_phase_elapsed/max(1,len(stacked_paths)):.1f}s/scene)"
-        )
 
         # Output path is resolved BEFORE Phase 4 so the evidence-layer
         # publish can be tied to the mosaic's GDB stem from the start.
