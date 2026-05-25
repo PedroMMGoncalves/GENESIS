@@ -7977,23 +7977,41 @@ class AsterMosaic(object):
 
         # First pass: build scaled-reflectance rasters for every required
         # band. SWIR bands are resampled from 30m to 15m first. The
-        # ``SetNull(< 0)`` after Resample translates float32 NoData
-        # sentinels (~-3.4e+38) that BILINEAR can introduce near scene
-        # edges into proper NoData — without it the sentinel flows through
-        # ``Float() * scale`` and contaminates downstream statistics.
+        # ``SetNull(<= 0)`` after read/resample is applied SYMMETRICALLY
+        # to VNIR and SWIR. Two failure modes it catches:
+        #   - Zero: AST_07XT L2 source TIFFs use 0 as the conventional
+        #     no-data marker for out-of-footprint pixels and
+        #     unrecoverable retrievals. Without this guard, those zeros
+        #     leak through ``Float() * scale = 0`` into the per-scene
+        #     composite. Across many scenes the GeometricMedian then
+        #     pulls toward zero in proportion to how many scenes do not
+        #     cover the pixel; the bias is visible as scene-footprint-
+        #     shaped dark patches in the final composite (the 2026-05-25
+        #     VNIR regression on Faial; AOI mask = 1373x964, NIR mean
+        #     0.10 instead of expected 0.3-0.5).
+        #   - Negative: the float32 NoData sentinel (~-3.4e+38) that
+        #     BILINEAR resample can introduce near scene edges; if it
+        #     survives into Float() * scale it propagates as huge-
+        #     magnitude values that destroy band statistics (the
+        #     symmetric SWIR symptom: bands 4-9 mean ~-2.6e+17 in the
+        #     same V6 run).
+        # Previously the guard was only on the SWIR path; the VNIR
+        # native-15m read bypassed it because no Resample step was
+        # involved. The 2026-05-25 AOI catalog-path fix made env.mask
+        # actually reach the worker, which surfaced both failure modes
+        # because the saved per-scene rasters now span the AOI rather
+        # than the scene's natural footprint.
         scaled = {}
         for band in required_bands:
             src = files[band]
             if band not in _ASTER_NATIVE_15M:
                 resampled = os.path.join(scratch_dir, f"{scene_id}_{band}_15m.tif")
                 arcpy.management.Resample(src, resampled, 15, "BILINEAR")
-                resampled_raster = arcpy.sa.Raster(resampled)
-                band_raster = arcpy.sa.SetNull(
-                    resampled_raster < 0, resampled_raster,
-                )
+                src_raster = arcpy.sa.Raster(resampled)
             else:
-                band_raster = arcpy.sa.Raster(src)
-            scaled[band] = Float(band_raster) * _ASTER_REFLECTANCE_SCALE
+                src_raster = arcpy.sa.Raster(src)
+            src_raster = arcpy.sa.SetNull(src_raster <= 0, src_raster)
+            scaled[band] = Float(src_raster) * _ASTER_REFLECTANCE_SCALE
 
         # Per-scene multi-spectral cloud test (hardened, VNIR-driven).
         # Primary test runs on VNIR alone so the post-Apr-2008 majority
