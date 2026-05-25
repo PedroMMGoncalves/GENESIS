@@ -1196,6 +1196,62 @@ def _emit_phase3_summary(ok, failed, total_elapsed_s, failures=None):
             arcpy.AddMessage(f"    [{idx}] {sid_clip} {msg}")
 
 
+def _per_band_median_composite(stacks, output_path):
+    """Per-band, per-pixel median across a list of multi-band scene
+    stacks. A/B alternative to ``arcpy.ia.GeometricMedian`` for
+    diagnosing whether the L1-median iteration is producing artefacts
+    on NoData-asymmetric inputs.
+
+    For each band index N (count derived from the first stack),
+    extracts band N from every input scene via ``arcpy.ia.ExtractBand``
+    and computes a per-pixel median via
+    ``arcpy.sa.CellStatistics(..., MEDIAN, DATA)``. The per-band
+    median rasters are then combined via ``CompositeBands`` into the
+    final multi-band output.
+
+    Spectral-consistency caveat: a pixel's per-band values may come
+    from different scenes (band 1 from scene A, band 2 from scene B).
+    For mineral-mapping use cases that pull on band ratios this is a
+    small loss vs GeometricMedian's same-scene constraint; for visual
+    mosaicking or per-band statistics it is fine.
+
+    NoData handling is the explicit ``ignore_nodata="DATA"`` flag on
+    CellStatistics, which is documented behaviour (unlike
+    GeometricMedian's silent NoData semantics).
+
+    AOI clipping and cell size flow from ``arcpy.env.mask`` /
+    ``arcpy.env.extent`` / ``arcpy.env.cellSize`` (caller already sets
+    these in AsterMosaic._run_mosaic_pipeline).
+    """
+    if not stacks:
+        raise ValueError("Empty stacks list passed to _per_band_median_composite")
+    n_bands = int(arcpy.Raster(stacks[0]).bandCount)
+    scratch_dir = os.path.dirname(output_path)
+    per_band_paths = []
+    try:
+        for band_idx in range(1, n_bands + 1):
+            band_extracts = [
+                arcpy.ia.ExtractBand(p, [band_idx]) for p in stacks
+            ]
+            per_band_median = arcpy.sa.CellStatistics(
+                band_extracts, statistics_type="MEDIAN",
+                ignore_nodata="DATA",
+            )
+            out_band_path = os.path.join(
+                scratch_dir, f"_per_band_median_b{band_idx:02d}.tif",
+            )
+            per_band_median.save(out_band_path)
+            per_band_paths.append(out_band_path)
+        arcpy.management.CompositeBands(per_band_paths, output_path)
+    finally:
+        for p in per_band_paths:
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
+
+
 def _resolve_worker_python():
     """Return a real python.exe to spawn subprocess workers with.
 
@@ -7051,6 +7107,32 @@ class AsterMosaic(object):
         subprocess_batch_size.filter.type = "Range"
         subprocess_batch_size.filter.list = [0, 100]
 
+        compositor = arcpy.Parameter(
+            displayName=(
+                "Compositor (advanced; the per-pixel reducer over the "
+                "cleaned multi-scene stack. GeometricMedian (default) "
+                "computes the L1-median across the multi-band spectral "
+                "signature, preserving same-scene consistency across "
+                "bands at the cost of opaque NoData handling. Per-band "
+                "median computes each band's median independently via "
+                "arcpy.sa.CellStatistics with explicit ignore_nodata "
+                "semantics; a pixel's band-1 value can come from a "
+                "different scene than its band-2 value. Use Per-band "
+                "median as an A/B for diagnosing GeometricMedian "
+                "artefacts on NoData-asymmetric inputs."
+            ),
+            name="compositor",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        compositor.filter.list = [
+            "GeometricMedian (default)",
+            "Per-band median",
+        ]
+        compositor.value = "GeometricMedian (default)"
+
         # Return order: master toggles BEFORE the values they gate so
         # the dialog reads top-down. Per-scene cloud-mask family (always
         # active) sits with the AST_08 thermal family (opt-in) above the
@@ -7064,6 +7146,7 @@ class AsterMosaic(object):
             use_ast08_thermal, bt_threshold_k,
             enable_temporal_clean, temporal_k, temporal_min_obs,
             subprocess_batch_size,
+            compositor,
         ]
 
     def updateParameters(self, parameters):
@@ -7202,6 +7285,11 @@ class AsterMosaic(object):
                 if len(parameters) > 19 and parameters[19].value is not None
                 else 10
             )
+            compositor = (
+                parameters[20].valueAsText
+                if len(parameters) > 20 and parameters[20].valueAsText
+                else "GeometricMedian (default)"
+            )
 
             # ----------------------------------------------------------------
             # AOI-first scoping. See LandsatMosaic.execute() for the full
@@ -7253,6 +7341,7 @@ class AsterMosaic(object):
                     "  AST_08:     thermal cloud test disabled "
                     "(default; AST_08 is clear-sky-only)."
                 )
+            arcpy.AddMessage(f"  Compositor: {compositor}")
             if enable_temporal_clean:
                 arcpy.AddMessage(
                     f"  Temporal:   outlier cleaner ON "
@@ -7379,6 +7468,7 @@ class AsterMosaic(object):
                     temporal_min_obs=temporal_min_obs,
                     cloud_buffer_px=cloud_buffer_px,
                     subprocess_batch_size=subprocess_batch_size,
+                    compositor=compositor,
                 )
                 if output_full:
                     outputs.append(output_full)
@@ -7401,6 +7491,7 @@ class AsterMosaic(object):
                 temporal_min_obs=temporal_min_obs,
                 cloud_buffer_px=cloud_buffer_px,
                 subprocess_batch_size=subprocess_batch_size,
+                compositor=compositor,
             )
             if output_vnir:
                 outputs.append(output_vnir)
@@ -7447,6 +7538,7 @@ class AsterMosaic(object):
         temporal_k=_TMASK_K, temporal_min_obs=_TMASK_MIN_OBS,
         cloud_buffer_px=_ASTER_CLOUD_BUFFER_PX,
         subprocess_batch_size=10,
+        compositor="GeometricMedian (default)",
     ):
         """Run Phases 3-5 over a scene list in one of the supported modes.
 
@@ -7706,24 +7798,34 @@ class AsterMosaic(object):
                             f"{os.path.basename(src)}: {e}"
                         )
 
-        # Phase 5 — GeometricMedian
-        arcpy.SetProgressor("default", f"Computing GeometricMedian [{label}]...")
+        # Phase 5 — compositor
+        compositor_tag = (
+            "PerBandMedian" if compositor.startswith("Per-band")
+            else "GeometricMedian"
+        )
+        arcpy.SetProgressor(
+            "default", f"Computing {compositor_tag} [{label}]...",
+        )
         try:
             with phase(
-                f"Phase 5 [{label}] — GeometricMedian over {len(composite_inputs)} stacks",
+                f"Phase 5 [{label}] — {compositor_tag} over "
+                f"{len(composite_inputs)} stacks",
                 quiet_close=True,
             ) as ph:
-                median = arcpy.ia.GeometricMedian(
-                    composite_inputs,
-                    epsilon=_GEOMETRIC_MEDIAN_EPSILON,
-                    max_iteration=_GEOMETRIC_MEDIAN_MAX_ITER,
-                    extent_type="UnionOf",
-                    cellsize_type="FirstOf",
-                )
-                median.save(output_path)
+                if compositor.startswith("Per-band"):
+                    _per_band_median_composite(composite_inputs, output_path)
+                else:
+                    median = arcpy.ia.GeometricMedian(
+                        composite_inputs,
+                        epsilon=_GEOMETRIC_MEDIAN_EPSILON,
+                        max_iteration=_GEOMETRIC_MEDIAN_MAX_ITER,
+                        extent_type="UnionOf",
+                        cellsize_type="FirstOf",
+                    )
+                    median.save(output_path)
                 arcpy.ResetProgressor()
             arcpy.AddMessage(
-                f"  ✓ GeometricMedian in {ph.elapsed:.1f}s "
+                f"  ✓ {compositor_tag} in {ph.elapsed:.1f}s "
                 f"→ {os.path.basename(output_path)}"
             )
             _sanity_check_output(
