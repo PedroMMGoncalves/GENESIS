@@ -8994,7 +8994,20 @@ class AsterMosaic(object):
             # band with NaN sentinels and use ``~isnan`` as the
             # observed-pixel mask. Matches the convention applied to
             # the DL mask in Phase 4 via _ocm_mask_class_fractions.
-            cm_arr = arcpy.RasterToNumPyArray(cloud_mask, nodata_to_value=0)
+            #
+            # cm_arr is read with NaN-sentinel because cloud_mask can
+            # legitimately be NoData at pixels where the spectral
+            # test's inputs (e.g. SWIR bands B04..B09 on pre-2008
+            # scenes) carried NoData. SetNull(NoData_condition, x)
+            # returns NoData, so those NaN pixels ARE drops in the
+            # downstream masking. Treating them as "not flagged"
+            # (the previous nodata_to_value=0 behaviour) under-
+            # reported drops on VnirSwir scenes vs Phase 4's DL
+            # number. Counting (cm == 1) OR isnan(cm) as drops
+            # aligns the diagnostic with what SetNull actually does.
+            cm_arr = arcpy.RasterToNumPyArray(
+                cloud_mask, nodata_to_value=np.nan,
+            )
             try:
                 ref_band_arr = arcpy.RasterToNumPyArray(
                     scaled[required_bands[0]],
@@ -9009,10 +9022,13 @@ class AsterMosaic(object):
                 n_observed = int(cm_arr.size)
                 observed = None
             if n_observed:
+                # SetNull-equivalent: a pixel is dropped if cloud_mask
+                # is True (==1) OR if cloud_mask is NoData.
+                dropped = (cm_arr == 1) | np.isnan(cm_arr)
                 if observed is not None:
-                    cm_flagged = int(((cm_arr == 1) & observed).sum())
+                    cm_flagged = int((dropped & observed).sum())
                 else:
-                    cm_flagged = int(cm_arr.sum())
+                    cm_flagged = int(dropped.sum())
                 cm_pct = 100.0 * cm_flagged / n_observed
             else:
                 cm_pct = 0.0
