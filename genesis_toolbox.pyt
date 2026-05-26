@@ -1315,12 +1315,19 @@ def _dl_cloud_mask_infer_scene(red_path, green_path, nir_path,
     from omnicloudmask import predict_from_array
 
     arrays = []
+    nodata_masks = []
     for label, path in (("R", red_path), ("G", green_path), ("NIR", nir_path)):
         if not os.path.exists(path):
             raise FileNotFoundError(f"missing {label} band: {path}")
         arr = arcpy.RasterToNumPyArray(
             path, nodata_to_value=0,
         ).astype(_np.float32)
+        # Track per-band no-data footprint (DN 0 in AST_07XT is the
+        # conventional no-data marker for out-of-footprint pixels).
+        # OmniCloudMask cannot tell "no observation" from "dark clear
+        # ground" when it sees 0.0 reflectance; we re-inject that
+        # distinction into the output mask after inference.
+        nodata_masks.append(arr == 0.0)
         # ASTER L2 DN -> reflectance (0..1). OmniCloudMask normalises
         # per-patch internally, so absolute scale is not strictly needed,
         # but scaled values match Sentinel-2's training distribution.
@@ -1348,6 +1355,18 @@ def _dl_cloud_mask_infer_scene(red_path, green_path, nir_path,
         )
     mask = mask.astype(_np.uint8)
 
+    # Mark off-footprint pixels as NoData using uint8 sentinel 255.
+    # A pixel is "no observation" if any band's source value was 0
+    # (the conventional AST_07XT no-data marker). OCM classified those
+    # pixels as Clear (class 0) because it saw 0.0 reflectance; we
+    # overwrite with 255 so the saved TIFF carries explicit NoData
+    # metadata via the value_to_nodata=255 kwarg on the save below.
+    # Downstream cloud-fraction reporting then normalises against
+    # observed pixels, not against the saved grid that includes the
+    # off-footprint stripe.
+    no_observation = _np.logical_or.reduce(nodata_masks)
+    mask[no_observation] = 255
+
     src = arcpy.Raster(red_path)
     out_raster = arcpy.NumPyArrayToRaster(
         mask,
@@ -1356,12 +1375,55 @@ def _dl_cloud_mask_infer_scene(red_path, green_path, nir_path,
         ),
         x_cell_size=src.meanCellWidth,
         y_cell_size=src.meanCellHeight,
+        value_to_nodata=255,
     )
     out_raster.save(output_path)
     arcpy.management.DefineProjection(
         output_path, src.spatialReference,
     )
     return output_path
+
+
+def _ocm_mask_class_fractions(mask_path,
+                               cloud_classes=(1, 2),
+                               shadow_classes=(3,),
+                               sentinel=255):
+    """Return ``(cloud_pct, shadow_pct)`` over OBSERVED pixels only.
+
+    Reads the saved OmniCloudMask TIFF (uint8 with explicit NoData
+    sentinel set by ``_dl_cloud_mask_infer_scene``) and computes
+    class fractions against the count of OBSERVED pixels, never the
+    raw saved-grid size. Matches the remote-sensing convention of
+    reporting cloud cover over observed land (Landsat
+    ``CLOUD_COVER_LAND``, Sentinel-2 SCL-normalised fractions)
+    rather than diluted by the off-footprint NoData stripe each
+    ASTER scene carries.
+
+    The sentinel default (255) matches what
+    ``_dl_cloud_mask_infer_scene`` writes; OCM class IDs are 0..3 so
+    255 cannot collide with a real class.
+
+    Returns ``(0.0, 0.0)`` on read failure or empty observed area.
+    """
+    try:
+        import numpy as _np
+        arr = arcpy.RasterToNumPyArray(mask_path, nodata_to_value=sentinel)
+        observed = arr != sentinel
+        n_observed = int(observed.sum())
+        if n_observed == 0:
+            return 0.0, 0.0
+        cloud_mem = _np.zeros_like(observed)
+        for cls in cloud_classes:
+            cloud_mem |= (arr == cls)
+        cloud_n = int(cloud_mem.sum())
+        shadow_mem = _np.zeros_like(observed)
+        for cls in shadow_classes:
+            shadow_mem |= (arr == cls)
+        shadow_n = int(shadow_mem.sum())
+        return (100.0 * cloud_n / n_observed,
+                100.0 * shadow_n / n_observed)
+    except Exception:
+        return 0.0, 0.0
 
 
 def _compute_aoi_overlap_pct(scene_band_path, aoi_sr, aoi_ext, aoi_area):
@@ -7906,18 +7968,14 @@ class AsterMosaic(object):
                                 device=device,
                             )
                             elapsed = time.time() - t_scene
-                            # Per-scene class fractions from the saved mask.
-                            mask_arr = arcpy.RasterToNumPyArray(
-                                out_path, nodata_to_value=0,
-                            )
-                            total_px = int(mask_arr.size)
-                            cloud_pct = (
-                                100.0 * int(((mask_arr == 1) | (mask_arr == 2)).sum())
-                                / max(1, total_px)
-                            )
-                            shadow_pct = (
-                                100.0 * int((mask_arr == 3).sum())
-                                / max(1, total_px)
+                            # Per-scene class fractions over OBSERVED
+                            # pixels only (excludes the off-footprint
+                            # stripe encoded as NoData sentinel 255 by
+                            # _dl_cloud_mask_infer_scene). See
+                            # ``_ocm_mask_class_fractions`` docstring
+                            # for the remote-sensing convention.
+                            cloud_pct, shadow_pct = _ocm_mask_class_fractions(
+                                out_path,
                             )
                             arcpy.AddMessage(_format_scene_log_line(
                                 idx, total_dl, sid, elapsed,
@@ -8903,10 +8961,35 @@ class AsterMosaic(object):
         try:
             cloud_mask.save(cloud_mask_path)
             cloud_mask = arcpy.sa.Raster(cloud_mask_path)
+            # Report flagged fraction over OBSERVED pixels only, not
+            # over the saved-grid size. The per-band SetNull(<= 0)
+            # guard up-stream makes ``scaled[required_bands[0]]``
+            # NoData where the source was off-footprint; load that
+            # band with NaN sentinels and use ``~isnan`` as the
+            # observed-pixel mask. Matches the convention applied to
+            # the DL mask in Phase 4 via _ocm_mask_class_fractions.
             cm_arr = arcpy.RasterToNumPyArray(cloud_mask, nodata_to_value=0)
-            cm_total = int(cm_arr.size)
-            cm_flagged = int(cm_arr.sum())
-            cm_pct = 100.0 * cm_flagged / cm_total if cm_total else 0.0
+            try:
+                ref_band_arr = arcpy.RasterToNumPyArray(
+                    scaled[required_bands[0]],
+                    nodata_to_value=np.nan,
+                )
+                observed = ~np.isnan(ref_band_arr)
+                n_observed = int(observed.sum())
+            except Exception:
+                # Fall back to "all pixels observed" if the reference
+                # band can't be reduced to a NaN-bearing array; the
+                # number is then approximate but never zero-divides.
+                n_observed = int(cm_arr.size)
+                observed = None
+            if n_observed:
+                if observed is not None:
+                    cm_flagged = int(((cm_arr == 1) & observed).sum())
+                else:
+                    cm_flagged = int(cm_arr.sum())
+                cm_pct = 100.0 * cm_flagged / n_observed
+            else:
+                cm_pct = 0.0
             # Attach to the shared metadata dict so the provenance CSV
             # row for this scene can surface it without re-deriving.
             # ``dict(scene, ...)`` on line 7213 creates a new outer dict
