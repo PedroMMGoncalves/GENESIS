@@ -1850,6 +1850,32 @@ _RAM_WARNING_GB = 4.0
 _GEOMETRIC_MEDIAN_EPSILON = 0.001
 _GEOMETRIC_MEDIAN_MAX_ITER = 20
 
+
+def _save_geomedian_clean(median_raster, output_path):
+    """Save a GeometricMedian output with placeholder leak cleanup.
+
+    arcpy.ia.GeometricMedian writes float32 -MAX (-3.4e38) and other
+    out-of-range values into pixels where per-band sample counts are
+    too low for the iteration to converge, WITHOUT updating the
+    raster's NoData metadata. Downstream viewers (Pro auto-stretch,
+    composite-band renderers) then see those values as real data and
+    crush the stretch, producing single-channel-only false-color
+    renderings (e.g. uniform green when only one band escapes the
+    leak).
+
+    Surface reflectance is physically bounded to [0, ~1.5]. Mark
+    anything outside [-0.01, 1.5] as NoData before save. The
+    -0.01 lower bound preserves legitimate near-zero shadow pixels
+    that may carry a small negative noise offset from atmospheric
+    correction; values outside that are either placeholder leaks
+    (-3.4e38) or partially-converged GM outputs (~-1e29).
+    """
+    cleaned = arcpy.sa.SetNull(
+        (median_raster < -0.01) | (median_raster > 1.5),
+        median_raster,
+    )
+    cleaned.save(output_path)
+
 # ASTER per-scene multi-spectral cloud test. The AST_07XT QA Data Plane
 # only flags SR retrieval status (not clouds), so the per-scene path
 # uses a hardened multi-spectral test that runs on VNIR alone (works
@@ -4326,7 +4352,7 @@ class LandsatMosaic(object):
                     extent_type="UnionOf",
                     cellsize_type="FirstOf",
                 )
-                geomedian.save(output_path)
+                _save_geomedian_clean(geomedian, output_path)
                 arcpy.ResetProgressor()
             arcpy.AddMessage(
                 f"  ✓ GeometricMedian complete in {ph.elapsed:.1f}s "
@@ -6252,7 +6278,7 @@ class Sentinel2Mosaic(object):
                             extent_type="UnionOf",
                             cellsize_type="FirstOf",
                         )
-                        median.save(tile_mosaic_path)
+                        _save_geomedian_clean(median, tile_mosaic_path)
                         tile_mosaics.append(tile_mosaic_path)
                         arcpy.AddMessage(
                             f"  ✓ [{tile}] {len(stacked_paths)} scenes → "
@@ -8404,7 +8430,7 @@ class AsterMosaic(object):
                         extent_type="UnionOf",
                         cellsize_type="FirstOf",
                     )
-                    median.save(output_path)
+                    _save_geomedian_clean(median, output_path)
                 arcpy.ResetProgressor()
             arcpy.AddMessage(
                 f"  ✓ {compositor_tag} in {ph.elapsed:.1f}s "
