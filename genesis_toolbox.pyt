@@ -1252,6 +1252,171 @@ def _per_band_median_composite(stacks, output_path):
                 pass
 
 
+# ---------------------------------------------------------------------------
+# Deep-learning cloud mask helpers (OmniCloudMask)
+# ---------------------------------------------------------------------------
+#
+# AsterMosaic Phase 4 runs DL cloud-mask inference per scene in the parent
+# process (GPU init is amortised across the full scene set; subprocess
+# workers in Phase 5 just read the saved mask TIFFs). PyTorch and
+# omnicloudmask are lazy-imported inside the helper so the toolbox loads
+# cleanly without the DL stack installed; users who do not opt into
+# `use_dl_cloud_mask` never trigger the imports.
+#
+# OmniCloudMask outputs uint8 class rasters: 0=Clear, 1=Thick Cloud,
+# 2=Thin Cloud, 3=Cloud Shadow. The mosaic consumer picks which classes
+# to treat as "drop" via the aggressiveness preset.
+
+_DL_CLOUD_MASK_FILENAME_FMT = "{sid}_cloudmask.tif"
+
+
+def _dl_cloud_classes_for(aggressiveness):
+    """Map a UI aggressiveness preset to the set of OmniCloudMask class
+    IDs to treat as cloud / shadow (i.e. drop in the per-scene mosaic).
+
+    Aggressive (default)  -> {1, 2, 3}  thick + thin + shadow
+    Moderate              -> {1, 3}     thick + shadow, keep thin
+    Conservative          -> {1}        thick only
+
+    Mirrors S2's Cloud Mask Aggressiveness pattern (Aggressive /
+    Moderate / Conservative) for consistency with the rest of the
+    toolbox. Returns a Python ``set[int]`` so it round-trips cleanly
+    through the subprocess JSON spec.
+    """
+    s = (aggressiveness or "").lower()
+    if s.startswith("conservative"):
+        return {1}
+    if s.startswith("moderate"):
+        return {1, 3}
+    return {1, 2, 3}
+
+
+def _dl_cloud_mask_infer_scene(red_path, green_path, nir_path,
+                                output_path, device="cuda"):
+    """Run OmniCloudMask on one ASTER VNIR scene; save the per-pixel
+    cloud-class mask aligned with the source scene grid.
+
+    ``red_path`` / ``green_path`` / ``nir_path`` are absolute paths to
+    AST_07XT VNIR band TIFFs (B02 / B01 / B03N respectively). All three
+    must share the same extent + cell size; the helper does not
+    reproject. Output is a uint8 single-band raster (class IDs 0..3).
+    Returns the saved path on success; raises on failure (caller
+    formats the per-scene log line and decides whether to skip).
+
+    PyTorch and omnicloudmask are lazy-imported here so the toolbox
+    loads on machines without the DL stack. The Esri Deep Learning
+    Frameworks MSI installs PyTorch into arcgispro-py3; ``pip install
+    omnicloudmask`` adds the wrapper. See AsterMosaic's
+    ``use_dl_cloud_mask`` parameter docstring for the full install
+    sequence.
+    """
+    import numpy as _np
+    import torch  # noqa: F401  (imported for caller's device hints)
+    from omnicloudmask import predict_from_array
+
+    arrays = []
+    for label, path in (("R", red_path), ("G", green_path), ("NIR", nir_path)):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"missing {label} band: {path}")
+        arr = arcpy.RasterToNumPyArray(
+            path, nodata_to_value=0,
+        ).astype(_np.float32)
+        # ASTER L2 DN -> reflectance (0..1). OmniCloudMask normalises
+        # per-patch internally, so absolute scale is not strictly needed,
+        # but scaled values match Sentinel-2's training distribution.
+        arr *= _ASTER_REFLECTANCE_SCALE
+        arrays.append(arr)
+    ref_shape = arrays[0].shape
+    for label, arr in zip(("G", "NIR"), arrays[1:]):
+        if arr.shape != ref_shape:
+            raise ValueError(
+                f"band shape mismatch: {label} {arr.shape} vs R {ref_shape}"
+            )
+
+    stack = _np.stack(arrays, axis=0)  # (3, H, W) in (R, G, NIR) order
+
+    # Newer OmniCloudMask releases accept a `device` kwarg; older ones
+    # auto-detect. Fall back gracefully.
+    try:
+        mask = predict_from_array(stack, device=device)
+    except TypeError:
+        mask = predict_from_array(stack)
+    mask = _np.asarray(mask).squeeze()
+    if mask.shape != ref_shape:
+        raise ValueError(
+            f"OCM output shape {mask.shape} != input {ref_shape}"
+        )
+    mask = mask.astype(_np.uint8)
+
+    src = arcpy.Raster(red_path)
+    out_raster = arcpy.NumPyArrayToRaster(
+        mask,
+        lower_left_corner=arcpy.Point(
+            src.extent.XMin, src.extent.YMin,
+        ),
+        x_cell_size=src.meanCellWidth,
+        y_cell_size=src.meanCellHeight,
+    )
+    out_raster.save(output_path)
+    arcpy.management.DefineProjection(
+        output_path, src.spatialReference,
+    )
+    return output_path
+
+
+def _compute_aoi_overlap_pct(scene_band_path, aoi_sr, aoi_ext, aoi_area):
+    """Return the per-cent overlap of a scene's bounding box with the
+    AOI bounding box, in AOI CRS. Used by AsterMosaic Phase 3 to drop
+    zero-overlap scenes before per-scene work begins.
+
+    ``aoi_sr`` / ``aoi_ext`` / ``aoi_area`` are pre-computed by the
+    caller (one Describe + one extent calc per AOI, reused across all
+    scenes) to avoid N redundant Describes on the same mask feature.
+
+    Scene CRS may differ from AOI CRS; the scene extent is projected
+    via a corner polygon (PTRA08_UTM_Zone_26N vs WGS_1984_UTM_Zone_26N
+    is the common Faial case; the difference is sub-pixel at 15 m but
+    enough to skew the bbox math at the edges). Returns 0.0 on
+    projection failure; the caller treats that as "no overlap" and
+    drops the scene.
+    """
+    try:
+        desc = arcpy.Describe(scene_band_path)
+        scene_sr = desc.spatialReference
+        scene_ext = desc.extent
+        if scene_sr.factoryCode != aoi_sr.factoryCode:
+            corners = arcpy.Array([
+                arcpy.Point(scene_ext.XMin, scene_ext.YMin),
+                arcpy.Point(scene_ext.XMax, scene_ext.YMin),
+                arcpy.Point(scene_ext.XMax, scene_ext.YMax),
+                arcpy.Point(scene_ext.XMin, scene_ext.YMax),
+            ])
+            poly = arcpy.Polygon(corners, scene_sr)
+            scene_in_aoi = poly.projectAs(aoi_sr).extent
+        else:
+            scene_in_aoi = scene_ext
+        ix_min = max(scene_in_aoi.XMin, aoi_ext.XMin)
+        ix_max = min(scene_in_aoi.XMax, aoi_ext.XMax)
+        iy_min = max(scene_in_aoi.YMin, aoi_ext.YMin)
+        iy_max = min(scene_in_aoi.YMax, aoi_ext.YMax)
+        if ix_max <= ix_min or iy_max <= iy_min:
+            return 0.0
+        return 100.0 * (ix_max - ix_min) * (iy_max - iy_min) / max(1.0, aoi_area)
+    except Exception:
+        return 0.0
+
+
+def _resolve_dl_mask_folder(user_folder, data_folder):
+    """Resolve the DL cloud-mask cache folder. If the user provided one,
+    use it; otherwise default to a ``_dl_cloud_masks/`` sibling of the
+    source data folder so masks persist across mosaic re-runs and stay
+    co-located with the archive they describe.
+    """
+    if user_folder and user_folder.strip():
+        return user_folder
+    return os.path.join(os.path.dirname(data_folder), "_dl_cloud_masks")
+
+
 def _resolve_worker_python():
     """Return a real python.exe to spawn subprocess workers with.
 
@@ -1524,18 +1689,35 @@ def _worker_aster_batch(spec, mode):
     bt_threshold_k = spec.get("bt_threshold_k")
     use_ast08_thermal = bool(spec.get("use_ast08_thermal", False))
     cloud_buffer_px = int(spec.get("cloud_buffer_px", _ASTER_CLOUD_BUFFER_PX))
+    dl_mask_folder = spec.get("dl_mask_folder")
+    dl_cloud_classes_list = spec.get("dl_cloud_classes")
+    dl_cloud_classes = (
+        set(dl_cloud_classes_list) if dl_cloud_classes_list else None
+    )
     aster_mode = (
         _ASTER_MODE_VNIR if mode == "vnir" else _ASTER_MODE_FULL
     )
     for scene in spec["scenes"]:
         sid = scene.get("scene_id") or "?"
         t = time.time()
+        # Resolve per-scene DL cloud-mask path; falls through silently
+        # when DL is off or the cache miss for this scene.
+        dl_mask_path = None
+        if dl_mask_folder:
+            candidate = os.path.join(
+                dl_mask_folder,
+                _DL_CLOUD_MASK_FILENAME_FMT.format(sid=sid),
+            )
+            if os.path.exists(candidate):
+                dl_mask_path = candidate
         try:
             tool._process_scene(
                 scene, scratch_dir, use_qa, aster_mode,
                 bt_threshold_k=bt_threshold_k,
                 use_ast08_thermal=use_ast08_thermal,
                 cloud_buffer_px=cloud_buffer_px,
+                dl_cloud_mask_path=dl_mask_path,
+                dl_cloud_classes=dl_cloud_classes,
             )
             elapsed = time.time() - t
             meta = scene.get("metadata") or {}
@@ -7036,15 +7218,20 @@ class AsterMosaic(object):
         bt_threshold_k.value = _ASTER_CLOUD_BT_MAX_K
         bt_threshold_k.enabled = False
 
-        # Temporal outlier cleaner master toggle. Affirmative phrasing:
-        # default ON, the cleaner is the layer that defeats warm marine
-        # cloud over Faial. Renamed in May 2026 from the double-negative
-        # ``disable_temporal_clean`` so the dialog reads naturally.
+        # Temporal outlier cleaner master toggle. Default flipped to OFF
+        # in 2026-05-26 alongside the DL cloud-mask integration: with
+        # OmniCloudMask (Phase 4) catching the persistent orographic
+        # cloud over Faial that the Tmask-reduction layer cannot flag
+        # (cloud is modal at those pixels, so robust-z does not see it
+        # as outlier), the cleaner's net value drops. Kept as an opt-in
+        # for archives where DL is unavailable or as a second line of
+        # defence; reconsider default after V8 comparison evidence.
         enable_temporal_clean = arcpy.Parameter(
             displayName=(
-                "Enable temporal outlier cleaner (default ON). This "
-                "is the Tmask-reduction layer that defeats warm marine "
-                "cloud over Faial. Disable only for A/B comparison runs."
+                "Enable temporal outlier cleaner (default OFF since "
+                "DL cloud masking became the primary path). Tmask-"
+                "reduction layer; opt in for archives without DL cloud "
+                "masks or to A/B against DL-only output."
             ),
             name="enable_temporal_clean",
             datatype="GPBoolean",
@@ -7052,7 +7239,7 @@ class AsterMosaic(object):
             direction="Input",
             category="Advanced Options",
         )
-        enable_temporal_clean.value = True
+        enable_temporal_clean.value = False
 
         temporal_k = arcpy.Parameter(
             displayName=(
@@ -7133,6 +7320,68 @@ class AsterMosaic(object):
         ]
         compositor.value = "GeometricMedian (default)"
 
+        # DL cloud-mask family. ASTER AST_07XT ships without a cloud
+        # mask (unlike S2 SCL / Landsat QA_PIXEL); OmniCloudMask
+        # (Wright et al. 2025) is a sensor-agnostic R/G/NIR U-Net
+        # ensemble whose outputs (0=Clear, 1=Thick, 2=Thin, 3=Shadow)
+        # replace or augment the hand-rolled spectral cloud test.
+        # Phase 4 runs inference per scene in the parent (GPU init
+        # amortised); Phase 5 subprocess workers consume the cached
+        # mask TIFFs. Default OFF so the toolbox still runs without
+        # the optional PyTorch + omnicloudmask install.
+        use_dl_cloud_mask = arcpy.Parameter(
+            displayName=(
+                "Use DL cloud mask via OmniCloudMask (default OFF). "
+                "When ON, Phase 4 runs U-Net inference per scene "
+                "(parent process, GPU when available) and Phase 5 "
+                "consumes the cached masks alongside the existing "
+                "spectral cloud test. Requires PyTorch (Esri Deep "
+                "Learning Frameworks MSI) and omnicloudmask (pip / "
+                "Pro Package Manager into a cloned arcgispro-py3 env)."
+            ),
+            name="use_dl_cloud_mask",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        use_dl_cloud_mask.value = False
+
+        dl_mask_aggressiveness = arcpy.Parameter(
+            displayName=(
+                "DL mask aggressiveness (mirrors S2's Cloud Mask "
+                "Aggressiveness). Aggressive drops classes "
+                "{Thick, Thin, Shadow}; Moderate drops {Thick, "
+                "Shadow} (keeps Thin to recover observations in "
+                "haze-prone scenes); Conservative drops {Thick} only."
+            ),
+            name="dl_mask_aggressiveness",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        dl_mask_aggressiveness.filter.list = [
+            "Aggressive (Thick + Thin + Shadow)",
+            "Moderate (Thick + Shadow, keep Thin)",
+            "Conservative (Thick only)",
+        ]
+        dl_mask_aggressiveness.value = "Aggressive (Thick + Thin + Shadow)"
+
+        dl_mask_folder = arcpy.Parameter(
+            displayName=(
+                "DL cloud-mask cache folder (optional; defaults to a "
+                "'_dl_cloud_masks/' sibling of the ASTER Data Folder "
+                "so masks persist across mosaic re-runs). One uint8 "
+                "TIFF per scene named '{scene_id}_cloudmask.tif'."
+            ),
+            name="dl_mask_folder",
+            datatype="DEFolder",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+
         # Return order: master toggles BEFORE the values they gate so
         # the dialog reads top-down. Per-scene cloud-mask family (always
         # active) sits with the AST_08 thermal family (opt-in) above the
@@ -7147,6 +7396,7 @@ class AsterMosaic(object):
             enable_temporal_clean, temporal_k, temporal_min_obs,
             subprocess_batch_size,
             compositor,
+            use_dl_cloud_mask, dl_mask_aggressiveness, dl_mask_folder,
         ]
 
     def updateParameters(self, parameters):
@@ -7180,13 +7430,24 @@ class AsterMosaic(object):
 
             # Temporal cleaner family gate: enable_temporal_clean
             # (idx 16) controls temporal_k (17) and temporal_min_obs
-            # (18). Default ON keeps the cleaner active.
+            # (18). Default OFF since DL cloud masking became primary.
             enable_temporal_clean = parameters[16]
             temporal_k = parameters[17]
             temporal_min_obs = parameters[18]
             cleaner_on = bool(enable_temporal_clean.value)
             temporal_k.enabled = cleaner_on
             temporal_min_obs.enabled = cleaner_on
+
+            # DL cloud-mask family gate: use_dl_cloud_mask (idx 21)
+            # controls dl_mask_aggressiveness (22) and dl_mask_folder
+            # (23). Default OFF keeps the toolbox loadable without the
+            # PyTorch + omnicloudmask dependency stack.
+            use_dl_cloud_mask = parameters[21]
+            dl_mask_aggressiveness = parameters[22]
+            dl_mask_folder = parameters[23]
+            dl_on = bool(use_dl_cloud_mask.value)
+            dl_mask_aggressiveness.enabled = dl_on
+            dl_mask_folder.enabled = dl_on
         except Exception:
             pass
 
@@ -7289,6 +7550,20 @@ class AsterMosaic(object):
                 parameters[20].valueAsText
                 if len(parameters) > 20 and parameters[20].valueAsText
                 else "GeometricMedian (default)"
+            )
+            use_dl_cloud_mask = (
+                bool(parameters[21].value)
+                if len(parameters) > 21 and parameters[21].value is not None
+                else False
+            )
+            dl_mask_aggressiveness = (
+                parameters[22].valueAsText
+                if len(parameters) > 22 and parameters[22].valueAsText
+                else "Aggressive (Thick + Thin + Shadow)"
+            )
+            dl_mask_folder_param = (
+                parameters[23].valueAsText
+                if len(parameters) > 23 else None
             )
 
             # ----------------------------------------------------------------
@@ -7452,6 +7727,224 @@ class AsterMosaic(object):
                     "cloud test runs on VIS/SWIR only"
                 )
 
+            # ----------------------------------------------------------------
+            # Phase 3 — AOI mask + scene intersection filter
+            # ----------------------------------------------------------------
+            # Promoted from the silent env.mask setup at execute() startup
+            # to an explicit phase so the workflow visibility matches the
+            # cost. Two jobs: (1) set env.mask + env.extent so every
+            # downstream raster op is auto-clipped to AOI (already
+            # happening); (2) drop scenes whose bounding box has zero
+            # overlap with the AOI bbox so Phase 4 (DL inference) and
+            # Phase 5 (per-scene processing) don't waste compute on
+            # scenes that contribute nothing. For Faial's 257-scene
+            # archive this typically drops 3 scenes (~1%) but the win
+            # scales with AOI tightness.
+            arcpy.AddMessage("\n▶ Phase 3 — AOI intersection")
+            if mask_feature and arcpy.Exists(mask_feature):
+                aoi_desc = arcpy.Describe(mask_feature)
+                aoi_sr = aoi_desc.spatialReference
+                aoi_ext = aoi_desc.extent
+                aoi_area = max(
+                    1.0,
+                    (aoi_ext.XMax - aoi_ext.XMin)
+                    * (aoi_ext.YMax - aoi_ext.YMin),
+                )
+                arcpy.AddMessage(
+                    f"  AOI bbox area: {aoi_area / 1e6:.1f} km^2 "
+                    f"({aoi_sr.name})"
+                )
+                # Per-scene overlap requires a representative band path.
+                # B01 is present on every AST_07XT scene; HDF format
+                # scenes use the .hdf as the descriptor target.
+                survivors = []
+                dropped_zero = 0
+                for s in kept_scenes:
+                    band_path = None
+                    files = s.get("files") or {}
+                    if s.get("format") == "tiff":
+                        band_path = files.get("B01") or files.get("B02")
+                    else:
+                        band_path = files.get("hdf")
+                    if not band_path:
+                        # Scene with unknown geometry: keep, let
+                        # downstream phases handle the missing-band case.
+                        survivors.append(s)
+                        continue
+                    cov_pct = _compute_aoi_overlap_pct(
+                        band_path, aoi_sr, aoi_ext, aoi_area,
+                    )
+                    s["metadata"] = s.get("metadata") or {}
+                    s["metadata"]["aoi_overlap_pct"] = round(cov_pct, 2)
+                    if cov_pct <= 0.0:
+                        dropped_zero += 1
+                    else:
+                        survivors.append(s)
+                if dropped_zero:
+                    arcpy.AddMessage(
+                        f"  ✓ Filtered scenes: kept {len(survivors)} / "
+                        f"{len(kept_scenes)} (dropped {dropped_zero} "
+                        f"with 0% AOI bbox overlap)"
+                    )
+                else:
+                    arcpy.AddMessage(
+                        f"  ✓ All {len(kept_scenes)} scenes intersect AOI"
+                    )
+                kept_scenes = survivors
+                full_scenes = [s for s in kept_scenes if self._has_swir_bands(s)]
+            else:
+                arcpy.AddMessage(
+                    "  No AOI provided — processing all scenes at full extent"
+                )
+
+            # ----------------------------------------------------------------
+            # Phase 4 — DL cloud masking (OmniCloudMask)
+            # ----------------------------------------------------------------
+            # Sensor-agnostic R/G/NIR U-Net ensemble (Wright et al. 2025,
+            # Remote Sensing of Environment). Runs in the parent process
+            # (GPU init amortised across all scenes); Phase 5 subprocess
+            # workers consume the cached mask TIFFs alongside source
+            # bands. Cache folder defaults to a sibling of the data
+            # folder so masks persist across mosaic re-runs.
+            dl_mask_folder = None
+            dl_cloud_classes = None
+            if use_dl_cloud_mask:
+                dl_mask_folder = _resolve_dl_mask_folder(
+                    dl_mask_folder_param, data_folder,
+                )
+                dl_cloud_classes = _dl_cloud_classes_for(dl_mask_aggressiveness)
+                arcpy.AddMessage(
+                    f"\n▶ Phase 4 — DL Cloud Masking ({len(kept_scenes)} scenes)"
+                )
+                arcpy.AddMessage(f"  Aggressiveness: {dl_mask_aggressiveness}")
+                arcpy.AddMessage(
+                    f"  Classes dropped: {sorted(dl_cloud_classes)} "
+                    f"(0=Clear, 1=Thick, 2=Thin, 3=Shadow)"
+                )
+                arcpy.AddMessage(f"  Cache folder:   {dl_mask_folder}")
+                try:
+                    os.makedirs(dl_mask_folder, exist_ok=True)
+                except OSError as e:
+                    arcpy.AddError(
+                        f"  ✗ Cannot create DL mask folder "
+                        f"{dl_mask_folder!r}: {e}"
+                    )
+                    return None
+                # Lazy-import the DL stack only when the user opted in.
+                # ImportError surfaces install instructions for the
+                # Esri Deep Learning Frameworks MSI + the Pro Package
+                # Manager omnicloudmask install.
+                try:
+                    import torch
+                    import omnicloudmask  # noqa: F401  (presence check)
+                except ImportError as e:
+                    arcpy.AddError(
+                        f"  ✗ DL cloud-mask path requires PyTorch + "
+                        f"omnicloudmask: {e}.\n"
+                        f"  Install: (1) Esri Deep Learning Frameworks "
+                        f"MSI (https://github.com/Esri/deep-learning-"
+                        f"frameworks) into arcgispro-py3; (2) Pro: "
+                        f"clone arcgispro-py3 and activate the clone; "
+                        f"(3) Pro Package Manager -> Add Packages -> "
+                        f"omnicloudmask; (4) close and reopen Pro."
+                    )
+                    return None
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                device_name = (
+                    torch.cuda.get_device_name(0)
+                    if torch.cuda.is_available() else "CPU"
+                )
+                arcpy.AddMessage(f"  Device:         {device} ({device_name})")
+                arcpy.SetProgressor(
+                    "step", "DL cloud-mask inference",
+                    0, max(1, len(kept_scenes)), 1,
+                )
+                t0_dl = time.time()
+                ok_dl = 0
+                skipped_dl = 0
+                failures_dl = []
+                total_dl = len(kept_scenes)
+                try:
+                    for idx, scene in enumerate(kept_scenes, 1):
+                        if arcpy.env.isCancelled:
+                            arcpy.AddWarning(
+                                f"  ✗ Cancelled after {idx - 1}/{total_dl} scenes."
+                            )
+                            return None
+                        sid = scene.get("scene_id") or "?"
+                        arcpy.SetProgressorLabel(f"[{idx}/{total_dl}] {sid}")
+                        out_path = os.path.join(
+                            dl_mask_folder,
+                            _DL_CLOUD_MASK_FILENAME_FMT.format(sid=sid),
+                        )
+                        if os.path.exists(out_path):
+                            arcpy.AddMessage(_format_scene_log_line(
+                                idx, total_dl, sid, 0.0,
+                                extras={"status": "skipped(exists)"},
+                            ))
+                            skipped_dl += 1
+                            arcpy.SetProgressorPosition(idx)
+                            continue
+                        files = scene.get("files") or {}
+                        if scene.get("format") != "tiff" or not all(
+                            b in files for b in ("B01", "B02", "B03N")
+                        ):
+                            fail_msg = "TIFF B01/B02/B03N required for DL inference"
+                            arcpy.AddMessage(_format_scene_log_line(
+                                idx, total_dl, sid, 0.0, fail=fail_msg,
+                            ))
+                            failures_dl.append((idx, sid, fail_msg))
+                            arcpy.SetProgressorPosition(idx)
+                            continue
+                        t_scene = time.time()
+                        try:
+                            _dl_cloud_mask_infer_scene(
+                                red_path=files["B02"],
+                                green_path=files["B01"],
+                                nir_path=files["B03N"],
+                                output_path=out_path,
+                                device=device,
+                            )
+                            elapsed = time.time() - t_scene
+                            # Per-scene class fractions from the saved mask.
+                            mask_arr = arcpy.RasterToNumPyArray(
+                                out_path, nodata_to_value=0,
+                            )
+                            total_px = int(mask_arr.size)
+                            cloud_pct = (
+                                100.0 * int(((mask_arr == 1) | (mask_arr == 2)).sum())
+                                / max(1, total_px)
+                            )
+                            shadow_pct = (
+                                100.0 * int((mask_arr == 3).sum())
+                                / max(1, total_px)
+                            )
+                            arcpy.AddMessage(_format_scene_log_line(
+                                idx, total_dl, sid, elapsed,
+                                extras={
+                                    "cloud": f"{cloud_pct:.1f}%",
+                                    "shadow": f"{shadow_pct:.1f}%",
+                                },
+                            ))
+                            ok_dl += 1
+                        except Exception as e:
+                            elapsed = time.time() - t_scene
+                            fail_msg = f"{type(e).__name__}: {e}"
+                            arcpy.AddMessage(_format_scene_log_line(
+                                idx, total_dl, sid, elapsed, fail=fail_msg,
+                            ))
+                            failures_dl.append((idx, sid, fail_msg))
+                        arcpy.SetProgressorPosition(idx)
+                finally:
+                    arcpy.ResetProgressor()
+                _emit_phase3_summary(
+                    ok_dl, len(failures_dl), time.time() - t0_dl, failures_dl,
+                )
+                if skipped_dl:
+                    arcpy.AddMessage(
+                        f"  Skipped (cached on disk): {skipped_dl} scene(s)"
+                    )
+
             outputs = []
             total_start = datetime.now()
 
@@ -7469,6 +7962,8 @@ class AsterMosaic(object):
                     cloud_buffer_px=cloud_buffer_px,
                     subprocess_batch_size=subprocess_batch_size,
                     compositor=compositor,
+                    dl_mask_folder=dl_mask_folder,
+                    dl_cloud_classes=dl_cloud_classes,
                 )
                 if output_full:
                     outputs.append(output_full)
@@ -7492,6 +7987,8 @@ class AsterMosaic(object):
                 cloud_buffer_px=cloud_buffer_px,
                 subprocess_batch_size=subprocess_batch_size,
                 compositor=compositor,
+                dl_mask_folder=dl_mask_folder,
+                dl_cloud_classes=dl_cloud_classes,
             )
             if output_vnir:
                 outputs.append(output_vnir)
@@ -7534,13 +8031,23 @@ class AsterMosaic(object):
         self, scenes, gdb_path, output_name, scratch_dir,
         use_qa, mask_feature, save_stats, mode, label,
         bt_threshold_k=None, use_ast08_thermal=False,
-        enable_temporal_clean=True,
+        enable_temporal_clean=False,
         temporal_k=_TMASK_K, temporal_min_obs=_TMASK_MIN_OBS,
         cloud_buffer_px=_ASTER_CLOUD_BUFFER_PX,
         subprocess_batch_size=10,
         compositor="GeometricMedian (default)",
+        dl_mask_folder=None,
+        dl_cloud_classes=None,
     ):
-        """Run Phases 3-5 over a scene list in one of the supported modes.
+        """Run Phases 5-8 over a scene list in one of the supported modes.
+
+        Phases 1-2 (scene discovery, temporal filter), 3 (AOI mask +
+        intersection filter) and 4 (DL cloud mask inference) all happen
+        once at AsterMosaic.execute() level since they are shared
+        across the VNIR+SWIR (9-band) and VNIR-only (3-band) mosaic
+        modes. This method picks up at Phase 5 with the per-scene
+        processing and runs through Phase 8 cleanup/provenance per
+        mode.
 
         Returns the final raster path on success, or None if no scenes
         survived per-scene processing (in which case a warning has
@@ -7548,7 +8055,7 @@ class AsterMosaic(object):
         """
         n_scenes = len(scenes)
         arcpy.AddMessage(
-            f"\n▶ Phase 3 [{label}] — Per-scene processing ({n_scenes} scenes)"
+            f"\n▶ Phase 5 [{label}] — Per-scene processing ({n_scenes} scenes)"
         )
         stacked_paths = []
         scenes_used = []
@@ -7608,6 +8115,10 @@ class AsterMosaic(object):
                 "bt_threshold_k": bt_threshold_k,
                 "use_ast08_thermal": use_ast08_thermal,
                 "cloud_buffer_px": cloud_buffer_px,
+                "dl_mask_folder": dl_mask_folder,
+                "dl_cloud_classes": (
+                    sorted(dl_cloud_classes) if dl_cloud_classes else None
+                ),
             }
             worker_kind = (
                 "aster_vnir" if mode == _ASTER_MODE_VNIR
@@ -7656,12 +8167,25 @@ class AsterMosaic(object):
                     f"[{idx}/{len(to_process)}] [{scene.get('format','?')}] {sid}"
                 )
                 scene_start = time.time()
+                # Resolve per-scene DL cloud mask path if the cache
+                # exists; falls through silently when DL is off or the
+                # mask for this scene was not generated.
+                dl_mask_path = None
+                if dl_mask_folder:
+                    candidate = os.path.join(
+                        dl_mask_folder,
+                        _DL_CLOUD_MASK_FILENAME_FMT.format(sid=sid),
+                    )
+                    if os.path.exists(candidate):
+                        dl_mask_path = candidate
                 try:
                     stacked = self._process_scene(
                         scene, scratch_dir, use_qa, mode,
                         bt_threshold_k=bt_threshold_k,
                         use_ast08_thermal=use_ast08_thermal,
                         cloud_buffer_px=cloud_buffer_px,
+                        dl_cloud_mask_path=dl_mask_path,
+                        dl_cloud_classes=dl_cloud_classes,
                     )
                     elapsed = time.time() - scene_start
                 except Exception as e:
@@ -7727,7 +8251,7 @@ class AsterMosaic(object):
         cloud_freq_pub = None
         if not enable_temporal_clean:
             arcpy.AddMessage(
-                f"\n▶ Phase 4 [{label}]: Temporal cleaner DISABLED"
+                f"\n▶ Phase 6 [{label}]: Temporal cleaner DISABLED"
             )
         else:
             scratch_obs = os.path.join(
@@ -7739,7 +8263,7 @@ class AsterMosaic(object):
             cleaner_ran = False
             try:
                 with phase(
-                    f"Phase 4 [{label}]: Temporal outlier cleaner "
+                    f"Phase 6 [{label}]: Temporal outlier cleaner "
                     f"(k={temporal_k}, min_obs={temporal_min_obs})",
                     quiet_close=True,
                 ) as ph4:
@@ -7798,7 +8322,7 @@ class AsterMosaic(object):
                             f"{os.path.basename(src)}: {e}"
                         )
 
-        # Phase 5 — compositor
+        # Phase 7 — compositor
         compositor_tag = (
             "PerBandMedian" if compositor.startswith("Per-band")
             else "GeometricMedian"
@@ -7808,7 +8332,7 @@ class AsterMosaic(object):
         )
         try:
             with phase(
-                f"Phase 5 [{label}] — {compositor_tag} over "
+                f"Phase 7 [{label}] — {compositor_tag} over "
                 f"{len(composite_inputs)} stacks",
                 quiet_close=True,
             ) as ph:
@@ -7843,23 +8367,16 @@ class AsterMosaic(object):
             arcpy.ResetProgressor()
             return None
 
-        # Phase 6 — AOI mask + provenance
-        with phase(f"Phase 6 [{label}] — Mask / cleanup / provenance") as ph6:
-            final_path, unmasked_to_delete = _apply_aoi_mask_and_save(
-                output_path, mask_feature, gdb_path, output_name,
-            )
-
-            if unmasked_to_delete and unmasked_to_delete != final_path:
-                try:
-                    if arcpy.Exists(unmasked_to_delete):
-                        arcpy.management.Delete(unmasked_to_delete)
-                        arcpy.AddMessage(
-                            f"  ✓ Removed intermediate: {os.path.basename(unmasked_to_delete)}"
-                        )
-                except arcpy.ExecuteError as e:
-                    arcpy.AddWarning(
-                        f"  Could not delete intermediate {unmasked_to_delete}: {e}"
-                    )
+        # Phase 8 — cleanup + provenance
+        # The redundant ExtractByMask that used to live here was
+        # dropped 2026-05-26: env.mask + env.extent are set in Phase 3
+        # and honoured by every downstream op including GeometricMedian,
+        # so output_path is already AOI-clipped at save time. There's
+        # no merge step (unlike S2's MosaicToNewRaster across MGRS
+        # tiles) that would break the AOI envelope. One intersection
+        # at Phase 3 suffices.
+        with phase(f"Phase 8 [{label}] — Cleanup / provenance") as ph6:
+            final_path = output_path
 
             if save_stats:
                 run_config = {
@@ -7879,6 +8396,12 @@ class AsterMosaic(object):
                         f"on(k={temporal_k:g},min_obs={temporal_min_obs})"
                         if enable_temporal_clean else "off"
                     ),
+                    "dl_cloud_mask": (
+                        f"on(classes={sorted(dl_cloud_classes)})"
+                        if dl_cloud_classes else "off"
+                    ),
+                    "dl_mask_folder": dl_mask_folder or "n/a",
+                    "compositor": compositor,
                     "toolbox_version": TOOLBOX_VERSION,
                 }
                 self._write_provenance_csv(
@@ -8130,7 +8653,9 @@ class AsterMosaic(object):
 
     def _process_scene(self, scene, scratch_dir, use_qa, mode,
                        bt_threshold_k=None, use_ast08_thermal=False,
-                       cloud_buffer_px=_ASTER_CLOUD_BUFFER_PX):
+                       cloud_buffer_px=_ASTER_CLOUD_BUFFER_PX,
+                       dl_cloud_mask_path=None,
+                       dl_cloud_classes=None):
         """Apply scale + resample + QA mask + stack → single multi-band raster.
 
         Parameters
@@ -8320,6 +8845,27 @@ class AsterMosaic(object):
             cloud_mask = cloud_vis_swir | (bt_kelvin < bt_threshold)
         else:
             cloud_mask = cloud_vis_swir
+
+        # OmniCloudMask DL output, when generated by Phase 4. Classes
+        # are uint8 (0=Clear, 1=Thick, 2=Thin, 3=Shadow); the caller
+        # picks which to drop via ``dl_cloud_classes`` (see
+        # _dl_cloud_classes_for). OR-ing into ``cloud_mask`` BEFORE
+        # the FocalStatistics dilation below means the cloud-edge
+        # buffer applies uniformly across spectral and DL detections.
+        if dl_cloud_mask_path and dl_cloud_classes:
+            try:
+                dl_mask_raster = arcpy.sa.Raster(dl_cloud_mask_path)
+                dl_drop = None
+                for cls in dl_cloud_classes:
+                    term = (dl_mask_raster == cls)
+                    dl_drop = term if dl_drop is None else (dl_drop | term)
+                if dl_drop is not None:
+                    cloud_mask = cloud_mask | dl_drop
+            except Exception as e:
+                arcpy.AddWarning(
+                    f"    DL cloud mask load failed ({e}); proceeding "
+                    "with spectral test only"
+                )
 
         # Edge dilation. Marine cloud has a soft 1-3 pixel halo from
         # subpixel mixing that the per-pixel test misses; a circular
