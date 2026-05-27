@@ -8497,7 +8497,7 @@ class AsterMosaic(object):
             os.makedirs(coreg_cache_dir, exist_ok=True)
             arcpy.AddMessage(f"  Coreg cache: {coreg_cache_dir}")
 
-            # AOI bbox + CRS for the worker to pass to AROSICS as
+            # Constraint bbox + CRS for the worker to pass to AROSICS as
             # ``data_corners_tgt``. Without this, AROSICS auto-detects
             # the target's footprint and picks the LARGEST connected
             # part — for ASTER scenes covering Faial + neighbouring
@@ -8505,28 +8505,43 @@ class AsterMosaic(object):
             # the largest part is often NOT Faial, so phase
             # correlation runs against the wrong island and either
             # asserts "no spatial overlap" or produces a meaningless
-            # shift. Constraining the target footprint to the AOI
-            # bbox forces AROSICS to consider only the Faial area
-            # regardless of what else the scene captures.
+            # shift.
+            #
+            # Derive the constraint bbox from the REFERENCE IMAGE
+            # itself (the S2 mosaic) rather than from the separate
+            # AOI polygon parameter. The reference is the geographic
+            # ground truth for AROSICS — its actual data extent is
+            # precisely the area where AROSICS has reference pixels
+            # to match against. Targeting any area outside the
+            # reference is wasted search. Mask_feature is still used
+            # downstream (env.mask + env.extent for Phases 3, 6, 7,
+            # 8) and may be a sub-AOI within the reference, but the
+            # AROSICS-side constraint follows the reference.
             aoi_bbox_for_spec = None
             aoi_crs_wkt_for_spec = None
-            if mask_feature and arcpy.Exists(mask_feature):
-                try:
-                    _aoi_desc = arcpy.Describe(mask_feature)
-                    _aoi_ext = _aoi_desc.extent
-                    aoi_bbox_for_spec = [
-                        float(_aoi_ext.XMin), float(_aoi_ext.YMin),
-                        float(_aoi_ext.XMax), float(_aoi_ext.YMax),
-                    ]
-                    aoi_crs_wkt_for_spec = (
-                        _aoi_desc.spatialReference.exportToString()
-                    )
-                except Exception as _e:
-                    arcpy.AddWarning(
-                        f"  Could not derive AOI bbox for AROSICS "
-                        f"data_corners_tgt ({_e}); AROSICS will fall "
-                        "back to auto-detecting target footprint."
-                    )
+            try:
+                _ref_raster = arcpy.sa.Raster(ref_nir_path)
+                _ref_ext = _ref_raster.extent
+                aoi_bbox_for_spec = [
+                    float(_ref_ext.XMin), float(_ref_ext.YMin),
+                    float(_ref_ext.XMax), float(_ref_ext.YMax),
+                ]
+                aoi_crs_wkt_for_spec = (
+                    _ref_raster.spatialReference.exportToString()
+                )
+                arcpy.AddMessage(
+                    f"  AROSICS target constraint: derived from "
+                    f"reference extent "
+                    f"({aoi_bbox_for_spec[2] - aoi_bbox_for_spec[0]:.0f}m x "
+                    f"{aoi_bbox_for_spec[3] - aoi_bbox_for_spec[1]:.0f}m)"
+                )
+            except Exception as _e:
+                arcpy.AddWarning(
+                    f"  Could not derive bbox from reference for AROSICS "
+                    f"data_corners_tgt ({_e}); AROSICS will fall back "
+                    "to auto-detecting target footprint (may pick wrong "
+                    "island on multi-island ASTER scenes)."
+                )
 
             t0_arosics = time.time()
             ok = _run_scene_batches(
