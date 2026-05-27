@@ -2383,6 +2383,13 @@ def _worker_arosics_batch(spec):
                                    [0, 15, 0, 0, 0, -15])[1]
                 )) or 15.0
                 rmse_m = ((mean_dx_px ** 2 + mean_dy_px ** 2) ** 0.5) * cell_size_m
+                # Global shift in map units (metres), applied below as
+                # a uniform geotransform translation to every band.
+                # See the deshift block for why we use the global shift
+                # rather than DESHIFTER's local deformation grid.
+                _mean_map = coreg_info.get("mean_shifts_map") or {}
+                shift_map_x = float(_mean_map.get("x") or 0.0)
+                shift_map_y = float(_mean_map.get("y") or 0.0)
             except AssertionError as e:
                 # AROSICS' own consistency check fired. Common causes:
                 # no actual overlap between target footprint and
@@ -2421,23 +2428,50 @@ def _worker_arosics_batch(spec):
                     "the S2 NIR reference. Scene dropped from the run."
                 )
 
-            # Apply the same deformation to every clipped band. Each
-            # DESHIFTER call reads the ``_clip.tif`` intermediate
-            # and writes the final deshifted+clipped ``<sid>_<band>.tif``
-            # to the cache. Downstream phases consume the latter via
-            # the scene_dict.files rewrite in the orchestrator.
+            # Apply the co-registration to every band as a single
+            # GLOBAL geotransform translation (mean_shifts_map, in
+            # metres), NOT via DESHIFTER's local deformation grid.
+            #
+            # Why not DESHIFTER: over a small AOI (Faial, ~20 km) the
+            # number of valid tie points is low (often 5-30). AROSICS
+            # COREG_LOCAL builds a spatially-varying deformation grid
+            # from those points; with sparse points the grid is mostly
+            # empty and DESHIFTER's warp resamples large regions to
+            # NoData - it silently writes all-zero output for a subset
+            # of bands. With DESHIFTER's default multi-core path that
+            # subset is even non-deterministic (different bands zero
+            # on each run). Both failure modes produced empty / part-
+            # transparent composites. tests/_arosics_*_probe.py capture
+            # this: at min_reliability 30/10/0 DESHIFTER zeroed a
+            # varying set of bands every run, while the global
+            # translation below keeps 100% of pixels in all 9 bands
+            # deterministically.
+            #
+            # Physically a global shift is the right model here: we are
+            # removing AST_07XT's systematic L1B geolocation offset
+            # (~10-50 m) over a 20 km island, where local intra-scene
+            # distortion is negligible. The translation never touches
+            # pixel values (no resampling) and works identically for
+            # 15 m VNIR and 30 m SWIR bands.
+            import rasterio as _rio
+            from rasterio.transform import Affine as _Affine
             for band_name, clipped_path in clipped_files.items():
                 out_path = os.path.join(
                     cache_dir, f"{sid}_{band_name}.tif",
                 )
-                DSH = DESHIFTER(
-                    clipped_path, coreg_info,
-                    path_out=out_path,
-                    fmt_out="GTiff",
-                    q=True,
-                    progress=False,
-                )
-                DSH.correct_shifts()
+                with _rio.open(clipped_path) as _src:
+                    _data = _src.read()
+                    _prof = _src.profile.copy()
+                    _t = _src.transform
+                    _prof.update(
+                        transform=_Affine(
+                            _t.a, _t.b, _t.c + shift_map_x,
+                            _t.d, _t.e, _t.f + shift_map_y,
+                        ),
+                        compress="lzw",
+                    )
+                    with _rio.open(out_path, "w", **_prof) as _dst:
+                        _dst.write(_data)
             # Remove the _clip intermediates now that DESHIFTER has
             # written the final outputs. Keeps the cache to a single
             # canonical file per band per scene.
