@@ -47,6 +47,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 import arcpy.sa
@@ -1639,6 +1640,7 @@ def _resolve_arosics_python():
 def _run_scene_batches(
     worker_kind, scenes, batch_size, scratch_dir,
     spec_extra=None, log_prefix="  ", worker_python_override=None,
+    max_silent_secs=900,
 ):
     """Run ``scenes`` through the matching worker in batches of
     ``batch_size``, one fresh python.exe per batch.
@@ -1718,7 +1720,39 @@ def _run_scene_batches(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, bufsize=1, env=env,
                 )
+                # Stdout-silence watchdog. A worker hung inside (e.g.)
+                # AROSICS.calculate_spatial_shifts() prints no JSON; the
+                # for-loop below blocks on stdout.readline() and never
+                # checks isCancelled. The watchdog thread polls every
+                # 5 s and terminates the process if no stdout line has
+                # arrived for max_silent_secs. Typical per-scene worker
+                # times: S2/ASTER ~30-60 s, AROSICS ~2-6 min, so a 15-
+                # min silence threshold is conservative and only fires
+                # on real hangs.
+                silence_state = {
+                    "last_io": time.time(), "killed": False,
+                }
+                def _silence_watchdog():
+                    while proc.poll() is None:
+                        time.sleep(5)
+                        if (time.time() - silence_state["last_io"]
+                                > max_silent_secs):
+                            silence_state["killed"] = True
+                            try:
+                                proc.terminate()
+                                proc.wait(timeout=5)
+                            except Exception:
+                                try:
+                                    proc.kill()
+                                except Exception:
+                                    pass
+                            return
+                watchdog = threading.Thread(
+                    target=_silence_watchdog, daemon=True,
+                )
+                watchdog.start()
                 for line in proc.stdout:
+                    silence_state["last_io"] = time.time()
                     stripped = line.rstrip()
                     if not stripped:
                         continue
@@ -1759,6 +1793,13 @@ def _run_scene_batches(
                         )
                         return False
                 rc = proc.wait()
+                if silence_state["killed"]:
+                    arcpy.AddWarning(
+                        f"{log_prefix}Worker stdout silent for "
+                        f">{max_silent_secs}s; terminated by watchdog. "
+                        "Remaining scenes in this batch will be "
+                        "synthesised as failures."
+                    )
             except Exception as e:
                 arcpy.AddError(
                     f"{log_prefix}Worker spawn failed: "
@@ -1887,6 +1928,19 @@ def _worker_arosics_batch(spec):
     ref_nir_path = spec["ref_nir_path"]
     grid_res = int(spec.get("arosics_grid_res", 200))
     window_size = int(spec.get("arosics_window_size", 256))
+    # Minimum tie-point count for a co-registration to be trusted.
+    # Below this, AROSICS produces an essentially-zero shift vector
+    # that DESHIFTER applies as an identity transform — the scene
+    # silently flows into Phase 6+ carrying its original L1B
+    # geolocation, mixing geolocation regimes in the final composite.
+    # This is the exact failure mode AROSICS was added to prevent;
+    # the threshold rejects degenerate matches over water-dominant
+    # AOI overlaps (S2 NIR ≈ 0 + ASTER NIR ≈ 0 → no phase contrast),
+    # heavy cloud, or scenes where the AOI overlap with land is too
+    # small to support a stable Weiszfeld solve. Tuned for the
+    # default grid_res=50 / window_size=128 setup on small AOIs;
+    # raise for larger AOIs where many more tie points are expected.
+    min_gcps = int(spec.get("arosics_min_gcps", 5))
     max_shift_px = int(spec.get("arosics_max_shift_px", 10))
     arosics_ver = getattr(_arosics, "__version__", "unknown")
 
@@ -1960,6 +2014,20 @@ def _worker_arosics_batch(spec):
                 coreg_info.get("updated geotransform", [0, 15, 0, 0, 0, -15])[1]
             )) or 15.0
             rmse_m = ((mean_dx_px ** 2 + mean_dy_px ** 2) ** 0.5) * cell_size_m
+
+            # Refuse degenerate AROSICS matches. See min_gcps comment
+            # at the top of the function for the rationale; raises
+            # cleanly so the orchestrator FAIL event drops the scene
+            # from Phase 5+ rather than silently passing a non-co-
+            # registered scene through as "status: ok".
+            if gcp_count < min_gcps:
+                raise RuntimeError(
+                    f"AROSICS found only {gcp_count} tie point(s) "
+                    f"(<{min_gcps} required). Likely the AOI overlap "
+                    "with this scene is too small or dominated by "
+                    "water/cloud to support phase correlation against "
+                    "the S2 NIR reference. Scene dropped from the run."
+                )
 
             # Apply the same deformation to every band file.
             for band_name, src_path in band_files.items():
@@ -7791,7 +7859,12 @@ class AsterMosaic(object):
             arcpy.env.autoCancelling = False
 
             gdb_path = parameters[0].valueAsText
-            mosaic_name = parameters[1].valueAsText
+            # Sanitise mosaic_name before any downstream concatenation
+            # — output FGDB raster names reject ``-``, ``.``, leading
+            # digits, spaces; users typing "Faial-2024.SR" would
+            # otherwise fail at Phase 9 save with an opaque arcpy
+            # error. Mirrors the S2 / Landsat tool convention.
+            mosaic_name = _sanitize_arcpy_name(parameters[1].valueAsText)
             data_folder = parameters[2].valueAsText
             # arosics_reference at index 3 (mandatory for Phase 4 co-
             # registration). Resolved to a catalog path so the AROSICS
@@ -7991,18 +8064,10 @@ class AsterMosaic(object):
                 f"(pre-Apr-2008) + {vnir_only_count} VNIR-only "
                 f"(post-Apr-2008 SWIR failure)"
             )
-            paired = sum(1 for s in kept_scenes if s.get("thermal"))
-            if paired:
-                arcpy.AddMessage(
-                    f"  Thermal:    {paired}/{len(kept_scenes)} scenes paired with "
-                    f"AST_08 — thermal cloud channel active for those scenes"
-                )
-            else:
-                arcpy.AddMessage(
-                    "  Thermal:    no AST_08 (Surface Kinetic Temperature) "
-                    "files found alongside AST_07XT — "
-                    "cloud test runs on VIS/SWIR only"
-                )
+            # (AST_08 thermal pairing log was removed 2026-05-27 along
+            # with the thermal cloud test — OmniCloudMask handles cloud
+            # detection now. The earlier post-removal pass left the log
+            # block lying about the pairing status.)
 
             # ----------------------------------------------------------------
             # Phase 3 — AOI mask + scene intersection filter
