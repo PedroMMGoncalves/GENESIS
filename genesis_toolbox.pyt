@@ -7355,6 +7355,22 @@ class AsterMosaic(object):
             direction="Input",
         )
 
+        # Mandatory geometric anchor for AROSICS Phase 4 co-registration.
+        # GPRasterLayer gives the user both a dropdown of rasters in the
+        # active Pro map AND a Browse button for files on disk — the
+        # idiomatic Pro "layer or file" picker. Expected: a Sentinel-2
+        # mosaic over the same AOI with band 8 (B08 NIR ~842 nm) at the
+        # 8th band index (matches the S2 mosaic tool's output layout).
+        # Single-band NIR-only rasters are also accepted (band 1 used).
+        # See _worker_arosics_batch for the matching algorithm.
+        arosics_reference = arcpy.Parameter(
+            displayName="Co-registration Reference Image (Sentinel-2)",
+            name="arosics_reference",
+            datatype="GPRasterLayer",
+            parameterType="Required",
+            direction="Input",
+        )
+
         thermal_folder = arcpy.Parameter(
             displayName=(
                 "Optional ASTER Thermal Data Folder (AST_08, Surface "
@@ -7705,12 +7721,20 @@ class AsterMosaic(object):
         )
 
         # Return order: master toggles BEFORE the values they gate so
-        # the dialog reads top-down. Per-scene cloud-mask family (always
-        # active) sits with the AST_08 thermal family (opt-in) above the
-        # temporal-cleaner family. Resume safety stays first under
-        # Advanced Options.
+        # the dialog reads top-down. arosics_reference sits prominently
+        # at index 3 (between data_folder and thermal_folder) because
+        # AROSICS co-registration is now a mandatory Phase 4 step; the
+        # dialog reads "where is the data, what's the geometric anchor"
+        # top-down. Per-scene cloud-mask family (always active) sits
+        # with the AST_08 thermal family (opt-in) above the temporal-
+        # cleaner family. Resume safety stays first under Advanced
+        # Options. Indices on every parameter after data_folder shifted
+        # +1 vs the pre-AROSICS layout; updateParameters / updateMessages
+        # / execute were updated to match.
         return [
-            gdb, mosaic_name, data_folder, thermal_folder,
+            gdb, mosaic_name, data_folder,
+            arosics_reference,
+            thermal_folder,
             region, time_type, year, month, season,
             use_qa_planes, mask_feature, save_stats, preserve_scratch,
             cloud_buffer_px,
@@ -7723,12 +7747,13 @@ class AsterMosaic(object):
 
     def updateParameters(self, parameters):
         try:
-            # Existing time-filter logic: time_type at index 5 gates
-            # year (6), month (7), season (8).
-            time_type = parameters[5]
-            year = parameters[6]
-            month = parameters[7]
-            season = parameters[8]
+            # Time-filter logic: time_type at index 6 (was 5 pre-AROSICS;
+            # +1 because arosics_reference was inserted at index 3) gates
+            # year (7), month (8), season (9).
+            time_type = parameters[6]
+            year = parameters[7]
+            month = parameters[8]
+            season = parameters[9]
             if time_type.valueAsText == "all_images":
                 year.enabled = False; month.enabled = False; season.enabled = False
             elif time_type.valueAsText == "year_month":
@@ -7740,33 +7765,33 @@ class AsterMosaic(object):
             elif time_type.valueAsText == "season_all_years":
                 year.enabled = False; month.enabled = False; season.enabled = True
 
-            # AST_08 thermal family gate: use_ast08_thermal (idx 14)
-            # controls visibility of thermal_folder (idx 3) AND the BT
-            # threshold (idx 15). Default OFF keeps the dialog clean.
-            thermal_folder = parameters[3]
-            use_ast08_thermal = parameters[14]
-            bt_threshold_k = parameters[15]
+            # AST_08 thermal family gate: use_ast08_thermal (idx 15)
+            # controls visibility of thermal_folder (idx 4) AND the BT
+            # threshold (idx 16). Default OFF keeps the dialog clean.
+            thermal_folder = parameters[4]
+            use_ast08_thermal = parameters[15]
+            bt_threshold_k = parameters[16]
             thermal_on = bool(use_ast08_thermal.value)
             thermal_folder.enabled = thermal_on
             bt_threshold_k.enabled = thermal_on
 
             # Temporal cleaner family gate: enable_temporal_clean
-            # (idx 16) controls temporal_k (17) and temporal_min_obs
-            # (18). Default OFF since DL cloud masking became primary.
-            enable_temporal_clean = parameters[16]
-            temporal_k = parameters[17]
-            temporal_min_obs = parameters[18]
+            # (idx 17) controls temporal_k (18) and temporal_min_obs
+            # (19). Default OFF since DL cloud masking became primary.
+            enable_temporal_clean = parameters[17]
+            temporal_k = parameters[18]
+            temporal_min_obs = parameters[19]
             cleaner_on = bool(enable_temporal_clean.value)
             temporal_k.enabled = cleaner_on
             temporal_min_obs.enabled = cleaner_on
 
-            # DL cloud-mask family gate: use_dl_cloud_mask (idx 21)
-            # controls dl_mask_aggressiveness (22) and dl_mask_folder
-            # (23). Default OFF keeps the toolbox loadable without the
+            # DL cloud-mask family gate: use_dl_cloud_mask (idx 22)
+            # controls dl_mask_aggressiveness (23) and dl_mask_folder
+            # (24). Default OFF keeps the toolbox loadable without the
             # PyTorch + omnicloudmask dependency stack.
-            use_dl_cloud_mask = parameters[21]
-            dl_mask_aggressiveness = parameters[22]
-            dl_mask_folder = parameters[23]
+            use_dl_cloud_mask = parameters[22]
+            dl_mask_aggressiveness = parameters[23]
+            dl_mask_folder = parameters[24]
             dl_on = bool(use_dl_cloud_mask.value)
             dl_mask_aggressiveness.enabled = dl_on
             dl_mask_folder.enabled = dl_on
@@ -7780,7 +7805,7 @@ class AsterMosaic(object):
         visible in the dialog any time the user opts in, so an
         accidental check doesn't sail through to a multi-hour run."""
         try:
-            use_ast08_thermal = parameters[14]
+            use_ast08_thermal = parameters[15]
             if use_ast08_thermal.value:
                 use_ast08_thermal.setWarningMessage(
                     "AST_08 is clear-sky-only by construction. Over a "
@@ -7812,36 +7837,41 @@ class AsterMosaic(object):
             gdb_path = parameters[0].valueAsText
             mosaic_name = parameters[1].valueAsText
             data_folder = parameters[2].valueAsText
-            thermal_folder = parameters[3].valueAsText
-            region = parameters[4].valueAsText
-            time_type = parameters[5].valueAsText
-            year = parameters[6].value
-            month = parameters[7].value
-            season = parameters[8].valueAsText
-            use_qa = bool(parameters[9].value)
-            mask_feature = parameters[10].valueAsText
-            save_stats = bool(parameters[11].value)
-            preserve_scratch = bool(parameters[12].value)
-            # Advanced Options reads. Indices match the new return
-            # order in getParameterInfo: cloud_buffer_px (13) is the
-            # always-active per-scene edge dilation; use_ast08_thermal
-            # (14) gates bt_threshold_k (15); enable_temporal_clean
-            # (16) gates temporal_k (17) and temporal_min_obs (18).
-            # bt_threshold_k stays float, not int, since 295.5 K etc.
-            # are valid thresholds.
+            # arosics_reference at index 3 (NEW mandatory parameter for
+            # Phase 4 co-registration). Resolved to a catalog path so
+            # the AROSICS worker subprocesses (which have no Pro map
+            # open) can find the raster on disk by path.
+            arosics_reference_raw = parameters[3].valueAsText
+            arosics_reference = _resolve_to_catalog_path(arosics_reference_raw)
+            thermal_folder = parameters[4].valueAsText
+            region = parameters[5].valueAsText
+            time_type = parameters[6].valueAsText
+            year = parameters[7].value
+            month = parameters[8].value
+            season = parameters[9].valueAsText
+            use_qa = bool(parameters[10].value)
+            mask_feature = parameters[11].valueAsText
+            save_stats = bool(parameters[12].value)
+            preserve_scratch = bool(parameters[13].value)
+            # Advanced Options reads. Indices shifted +1 vs the pre-
+            # AROSICS layout because arosics_reference was inserted at
+            # index 3. cloud_buffer_px (14) is the always-active per-
+            # scene edge dilation; use_ast08_thermal (15) gates
+            # bt_threshold_k (16); enable_temporal_clean (17) gates
+            # temporal_k (18) and temporal_min_obs (19).
             cloud_buffer_px = (
-                int(parameters[13].value)
-                if len(parameters) > 13 and parameters[13].value is not None
+                int(parameters[14].value)
+                if len(parameters) > 14 and parameters[14].value is not None
                 else _ASTER_CLOUD_BUFFER_PX
             )
             use_ast08_thermal = (
-                bool(parameters[14].value)
-                if len(parameters) > 14 and parameters[14].value is not None
+                bool(parameters[15].value)
+                if len(parameters) > 15 and parameters[15].value is not None
                 else False
             )
             bt_threshold_k = (
-                float(parameters[15].value)
-                if len(parameters) > 15 and parameters[15].value is not None
+                float(parameters[16].value)
+                if len(parameters) > 16 and parameters[16].value is not None
                 else _ASTER_CLOUD_BT_MAX_K
             )
             # Affirmative phrasing: enable_temporal_clean defaults True
@@ -7849,43 +7879,43 @@ class AsterMosaic(object):
             # disable_temporal_clean (double negative); the call sites
             # below consume the affirmative value directly.
             enable_temporal_clean = (
-                bool(parameters[16].value)
-                if len(parameters) > 16 and parameters[16].value is not None
+                bool(parameters[17].value)
+                if len(parameters) > 17 and parameters[17].value is not None
                 else True
             )
             temporal_k = (
-                float(parameters[17].value)
-                if len(parameters) > 17 and parameters[17].value is not None
+                float(parameters[18].value)
+                if len(parameters) > 18 and parameters[18].value is not None
                 else _TMASK_K
             )
             temporal_min_obs = (
-                int(parameters[18].value)
-                if len(parameters) > 18 and parameters[18].value is not None
+                int(parameters[19].value)
+                if len(parameters) > 19 and parameters[19].value is not None
                 else _TMASK_MIN_OBS
             )
             subprocess_batch_size = (
-                int(parameters[19].value)
-                if len(parameters) > 19 and parameters[19].value is not None
+                int(parameters[20].value)
+                if len(parameters) > 20 and parameters[20].value is not None
                 else 10
             )
             compositor = (
-                parameters[20].valueAsText
-                if len(parameters) > 20 and parameters[20].valueAsText
+                parameters[21].valueAsText
+                if len(parameters) > 21 and parameters[21].valueAsText
                 else "GeometricMedian (default)"
             )
             use_dl_cloud_mask = (
-                bool(parameters[21].value)
-                if len(parameters) > 21 and parameters[21].value is not None
+                bool(parameters[22].value)
+                if len(parameters) > 22 and parameters[22].value is not None
                 else False
             )
             dl_mask_aggressiveness = (
-                parameters[22].valueAsText
-                if len(parameters) > 22 and parameters[22].valueAsText
+                parameters[23].valueAsText
+                if len(parameters) > 23 and parameters[23].valueAsText
                 else "Aggressive (Thick + Thin + Shadow)"
             )
             dl_mask_folder_param = (
-                parameters[23].valueAsText
-                if len(parameters) > 23 else None
+                parameters[24].valueAsText
+                if len(parameters) > 24 else None
             )
 
             # ----------------------------------------------------------------
@@ -8120,7 +8150,194 @@ class AsterMosaic(object):
                 )
 
             # ----------------------------------------------------------------
-            # Phase 4 — DL cloud masking (OmniCloudMask)
+            # Phase 4 — AROSICS scene-to-scene co-registration
+            # ----------------------------------------------------------------
+            # AST_07XT V004 inherits L1B-grade geolocation (~20-50m per-
+            # scene RMSE per Iwasaki & Fujisada 2001 SPIE 4540) which
+            # blurs multi-scene median composites to ~30-50m effective
+            # resolution despite 15m native — visible as washed-out
+            # drainage and scene-stripe artefacts. Sentinel-2 L2A post-
+            # GRI is <6m absolute, providing the geometric anchor.
+            #
+            # Single-band NIR-to-NIR phase correlation (S2 B08 vs ASTER
+            # B03N) sidesteps the AROSICS multiband perf bug (GFZ/
+            # arosics#69); DESHIFTER applies the same deformation grid
+            # to every band file in the scene. Outputs land in the
+            # _aster_coreg_cache_<MOSAIC> sibling folder. Downstream
+            # phases consume deshifted bands transparently via the
+            # rewritten scene_dict.files paths.
+            arcpy.AddMessage(
+                f"\n▶ Phase 4 — AROSICS co-registration "
+                f"({len(kept_scenes)} scenes)"
+            )
+
+            if not arosics_reference:
+                arcpy.AddError(
+                    "  AROSICS reference image is required but did not "
+                    "resolve. Pick a Sentinel-2 mosaic from the map "
+                    "dropdown or browse to a multi-band raster on disk "
+                    "(B08 NIR expected at band 8)."
+                )
+                return None
+            if not arcpy.Exists(arosics_reference):
+                arcpy.AddError(
+                    f"  AROSICS reference image not found: {arosics_reference}"
+                )
+                return None
+
+            # Resolve the AROSICS env's python.exe up front so install
+            # failure surfaces immediately, not 4 hours into the run.
+            try:
+                arosics_python = _resolve_arosics_python()
+            except RuntimeError as e:
+                arcpy.AddError(f"  {e}")
+                return None
+            arcpy.AddMessage(f"  AROSICS env: {arosics_python}")
+
+            # Pre-extract S2 NIR to a GeoTIFF in scratch. AROSICS uses
+            # GDAL directly and can't read FileGDB rasters; extracting
+            # once here lets the workers read by path regardless of
+            # where the user stored the S2 mosaic. Band 8 is the S2
+            # L2A B08 convention (matches this toolbox's S2 mosaic
+            # output layout); single-band rasters (already NIR-only)
+            # use band 1.
+            ref_nir_path = os.path.join(scratch_dir, "_s2_nir_ref.tif")
+            try:
+                if os.path.exists(ref_nir_path):
+                    os.remove(ref_nir_path)
+                src_ref = arcpy.sa.Raster(arosics_reference)
+                n_bands = int(src_ref.bandCount)
+                if n_bands >= 8:
+                    ref_band_idx = 8
+                    arcpy.AddMessage(
+                        f"  Reference NIR: band {ref_band_idx} of "
+                        f"{n_bands} (S2 L2A B08 convention)"
+                    )
+                elif n_bands == 1:
+                    ref_band_idx = 1
+                    arcpy.AddMessage(
+                        "  Reference NIR: band 1 (single-band reference)"
+                    )
+                else:
+                    arcpy.AddError(
+                        f"  Reference has {n_bands} bands; cannot "
+                        "identify NIR. Expected single-band NIR or "
+                        "multi-band raster with B08 NIR at band 8."
+                    )
+                    return None
+                ref_band = arcpy.ia.ExtractBand(
+                    src_ref, band_ids=[ref_band_idx],
+                )
+                ref_band.save(ref_nir_path)
+            except Exception as e:
+                arcpy.AddError(
+                    f"  Failed to extract NIR band from "
+                    f"{arosics_reference}: {e}"
+                )
+                return None
+
+            # Cache directory — sibling of data_folder, mosaic-name
+            # suffixed. Same layout convention as the DL cloud-mask
+            # cache so the user can spot per-run artefacts at a glance.
+            coreg_cache_dir = _aster_coreg_cache_dir(data_folder, mosaic_name)
+            os.makedirs(coreg_cache_dir, exist_ok=True)
+            arcpy.AddMessage(f"  Coreg cache: {coreg_cache_dir}")
+
+            t0_arosics = time.time()
+            ok = _run_scene_batches(
+                worker_kind="arosics",
+                scenes=kept_scenes,
+                batch_size=max(1, int(subprocess_batch_size)),
+                scratch_dir=scratch_dir,
+                spec_extra={
+                    "coreg_cache_dir": coreg_cache_dir,
+                    "ref_nir_path": ref_nir_path,
+                    "arosics_grid_res": 50,
+                    "arosics_window_size": 128,
+                    "arosics_max_shift_px": 10,
+                },
+                log_prefix="  ",
+                worker_python_override=arosics_python,
+            )
+            if not ok:
+                arcpy.AddWarning("  Phase 4 cancelled.")
+                return None
+
+            # Filter to AROSICS survivors and rewrite scene_dict.files
+            # to the cache. Scenes that failed AROSICS are dropped
+            # from Phase 5+ entirely (loud-fail at scene level — each
+            # already logged via FAIL event + Phase tail summary).
+            survivors = []
+            arosics_failures = []
+            for scene in kept_scenes:
+                sid = scene.get("scene_id") or "?"
+                meta_path = os.path.join(
+                    coreg_cache_dir, f"{sid}_meta.json",
+                )
+                if not os.path.exists(meta_path):
+                    arosics_failures.append(sid)
+                    continue
+                try:
+                    with open(meta_path, encoding="utf-8") as fh:
+                        meta = json.load(fh)
+                    if meta.get("status") != "ok":
+                        arosics_failures.append(sid)
+                        continue
+                except (OSError, ValueError):
+                    arosics_failures.append(sid)
+                    continue
+                new_files = {}
+                cache_ok = True
+                for band_name, src_path in (scene.get("files") or {}).items():
+                    if band_name.startswith("B"):
+                        cached = os.path.join(
+                            coreg_cache_dir, f"{sid}_{band_name}.tif",
+                        )
+                        if os.path.exists(cached):
+                            new_files[band_name] = cached
+                        else:
+                            cache_ok = False
+                            break
+                    else:
+                        new_files[band_name] = src_path
+                if cache_ok:
+                    scene["files"] = new_files
+                    scene["metadata"] = scene.get("metadata") or {}
+                    scene["metadata"]["coreg_rmse_m"] = meta.get("rmse_m")
+                    scene["metadata"]["coreg_gcp_count"] = (
+                        meta.get("gcp_count")
+                    )
+                    survivors.append(scene)
+                else:
+                    arosics_failures.append(sid)
+
+            if not survivors:
+                arcpy.AddError(
+                    "  All scenes failed AROSICS co-registration. "
+                    "Verify the S2 reference covers the AOI and has "
+                    "clean NIR (B08) data. Run aborted."
+                )
+                return None
+
+            total_attempted = len(survivors) + len(arosics_failures)
+            arcpy.AddMessage(
+                f"  ✓ Phase 4 in {time.time() - t0_arosics:.0f}s "
+                f"({len(survivors)}/{total_attempted} co-registered)"
+            )
+            if arosics_failures:
+                arcpy.AddWarning(
+                    f"  Dropped {len(arosics_failures)} scene(s) "
+                    "due to AROSICS failure; downstream phases "
+                    "proceed with survivors."
+                )
+
+            kept_scenes = survivors
+            full_scenes = [
+                s for s in kept_scenes if self._has_swir_bands(s)
+            ]
+
+            # ----------------------------------------------------------------
+            # Phase 5 — DL cloud masking (OmniCloudMask)
             # ----------------------------------------------------------------
             # Sensor-agnostic R/G/NIR U-Net ensemble (Wright et al. 2025,
             # Remote Sensing of Environment). Runs in the parent process
@@ -8136,7 +8353,7 @@ class AsterMosaic(object):
                 )
                 dl_cloud_classes = _dl_cloud_classes_for(dl_mask_aggressiveness)
                 arcpy.AddMessage(
-                    f"\n▶ Phase 4 — DL Cloud Masking ({len(kept_scenes)} scenes)"
+                    f"\n▶ Phase 5 — DL Cloud Masking ({len(kept_scenes)} scenes)"
                 )
                 arcpy.AddMessage(f"  Aggressiveness: {dl_mask_aggressiveness}")
                 arcpy.AddMessage(
@@ -8373,7 +8590,7 @@ class AsterMosaic(object):
         """
         n_scenes = len(scenes)
         arcpy.AddMessage(
-            f"\n▶ Phase 5 [{label}] — Per-scene processing ({n_scenes} scenes)"
+            f"\n▶ Phase 6 [{label}] — Per-scene processing ({n_scenes} scenes)"
         )
         stacked_paths = []
         scenes_used = []
@@ -8569,7 +8786,7 @@ class AsterMosaic(object):
         cloud_freq_pub = None
         if not enable_temporal_clean:
             arcpy.AddMessage(
-                f"\n▶ Phase 6 [{label}]: Temporal cleaner DISABLED"
+                f"\n▶ Phase 7 [{label}]: Temporal cleaner DISABLED"
             )
         else:
             scratch_obs = os.path.join(
@@ -8581,7 +8798,7 @@ class AsterMosaic(object):
             cleaner_ran = False
             try:
                 with phase(
-                    f"Phase 6 [{label}]: Temporal outlier cleaner "
+                    f"Phase 7 [{label}]: Temporal outlier cleaner "
                     f"(k={temporal_k}, min_obs={temporal_min_obs})",
                     quiet_close=True,
                 ) as ph4:
@@ -8650,7 +8867,7 @@ class AsterMosaic(object):
         )
         try:
             with phase(
-                f"Phase 7 [{label}] — {compositor_tag} over "
+                f"Phase 8 [{label}] — {compositor_tag} over "
                 f"{len(composite_inputs)} stacks",
                 quiet_close=True,
             ) as ph:
@@ -8693,7 +8910,7 @@ class AsterMosaic(object):
         # no merge step (unlike S2's MosaicToNewRaster across MGRS
         # tiles) that would break the AOI envelope. One intersection
         # at Phase 3 suffices.
-        with phase(f"Phase 8 [{label}] — Cleanup / provenance") as ph6:
+        with phase(f"Phase 9 [{label}] — Cleanup / provenance") as ph6:
             final_path = output_path
 
             if save_stats:
