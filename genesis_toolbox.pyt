@@ -2173,7 +2173,7 @@ def _save_geomedian_clean(median_raster, output_path):
 # Spectral flatness separates true cloud tops (flat across VNIR) from
 # bright bare basalt / sand (red-dominated) without needing SWIR. The
 # vegetation guard prevents canopy from tripping the brightness term
-# in healthy NIR. Coupled with the new Phase 4 temporal cleaner the
+# in healthy NIR. Coupled with the optional Phase 7 temporal cleaner the
 # per-scene test is intentionally recall-oriented: catch gross cloud
 # cheaply, let the temporal layer handle the residue. Thresholds are
 # starting points calibrated against Faial; log to provenance and
@@ -2195,39 +2195,24 @@ _ASTER_CLOUD_BUFFER_PX   = 3      # edge dilation radius (cells); catches the
                                   # 1-3 px halo around marine cloud that the
                                   # per-pixel test misses
 
-# Optional brightness-temperature cloud channel. When AST_08 (Surface
-# Kinetic Temperature, V004) scenes are paired with the AST_07XT input
-# by scene ID, pixels colder than this threshold are flagged as cloud
-# regardless of VIS/SWIR brightness. The May 2026 Faial diagnostic
-# showed that Hulley & Hook (2008)'s 295 K threshold, calibrated for
-# tropical scenes, over-masks mid-latitude Atlantic land, where
-# daytime surface temperatures legitimately sit in the 275-296 K range
-# (cool forest canopy, north-facing slopes, early-morning passes).
-# The earlier 270 K floor proved too cold to catch warm maritime
-# stratus that sits on the Faial caldera at ~275-285 K and was leaking
-# through the (B02 AND B04) bright-cloud conjunction; bumped to 280 K
-# after the May 2026 visual inspection of AsterV3_VnirSwir_Masked.
-# Still well below typical daytime Faial land (vegetated slopes report
-# 285-296 K) and captures both clear cumulus tops (250-275 K) and warm
-# low-altitude marine cloud (275-280 K).
-#
-# ASTER product family caveat: AST_08 (Surface Kinetic Temperature),
-# AST_09 (VNIR/SWIR surface radiance), and AST_09T (TIR surface-
-# leaving radiance) are ALL produced AFTER the operational L2 cloud
-# mask is applied and are therefore clear-sky-only by construction.
-# None of them describe a cloud and none can be used as a cloud
-# detector. The only ASTER thermal quantity valid over cloud is at-
-# sensor TOA brightness temperature from L1B / L1T radiance; that
-# path is not implemented in GENESIS today but is the logical entry
-# point if a thermal channel is ever revisited.
-_ASTER_CLOUD_BT_MAX_K = 280.0
+# Thermal cloud channel: removed 2026-05-27. AST_08 / AST_09 / AST_09T
+# are all produced AFTER the operational L2 cloud mask is applied and
+# are therefore clear-sky-only by construction — over cloud they are
+# NoData or a corrupted retrieval, so they fail on exactly the pixels
+# a cloud test needs to flag. OmniCloudMask (mandatory Phase 5)
+# handles cloud detection now. The only ASTER thermal quantity valid
+# over cloud is at-sensor TOA brightness temperature from L1B / L1T
+# radiance; not implemented today, would be the entry point if a
+# thermal channel is ever revisited.
 
 # AST_08 V004 stores Surface Kinetic Temperature as Int16 with a scale
 # factor of 0.1 (DN x 0.1 = Kelvin). The earlier comment in this
 # module claimed COG TIFFs export already-scaled Kelvin; the
 # diagnostic on Faial scratch showed otherwise (raw values 2700-3000,
-# the literal DN). Applied inside ``_load_bt_kelvin`` immediately
-# after the 90 m to 15 m Resample.
+# the literal DN). Applied inside ``_aster_bt_kelvin_from_path``
+# immediately after the 90 m to 15 m Resample. Consumed by the
+# TemporalStatistics tool's AST_08 LST mode; AsterMosaic no longer
+# uses it (thermal cloud test removed 2026-05-27).
 _ASTER_TIR_SCALE = 0.1
 
 # Lower validity bound for AST_08 Surface Kinetic Temperature, in
@@ -7316,60 +7301,60 @@ def _aster_bt_kelvin_from_path(path, scratch_dir, target_cellsize=None, scene_id
 
 
 class AsterMosaic(object):
-    """Tool 03 — ASTER AST_07XT V004 mineral-mapping mosaic.
+    """Tool 03 — ASTER AST_07XT V004 multi-temporal mosaic.
 
     Accepts a folder of ASTER L2 Surface Reflectance products, either as:
-      a) Per-band TIFFs following the standard naming convention
+      a) Per-band TIFFs following the standard LP DAAC naming convention
          (`AST_07XT_<sceneID>_<procDT>_SRF_<VNIR|SWIR>_<band>.tif`) —
          3 VNIR + 6 SWIR + 2 QA per scene.
       b) HDF-EOS `.hdf` archives (best-effort via osgeo.gdal — extracted
          to TIFFs in a scratch folder before processing).
 
-    Optionally also accepts paired AST_08 (Surface Kinetic Temperature,
-    V004) files (`AST_08_<sceneID>_<procDT>_SKT.tif` or the equivalent
-    HDF) — either co-located in the main data folder, or in a separate
-    folder pointed to by the optional "ASTER Thermal Data Folder"
-    parameter (the natural LP DAAC by-product download layout). When
-    present, the thermal channel is folded into the per-scene cloud test
-    — pixels colder than ~280 K (below typical mid-latitude land BT but
-    above warm maritime stratus on Atlantic island summits) are flagged
-    as cloud regardless of VIS/SWIR brightness, which catches thin
-    cirrus and warm low cloud and reduces false positives over warm
-    bare ground.
+    Pipeline (2026-05-27 redesign):
+      Phase 1: Scene discovery
+      Phase 2: Temporal filter
+      Phase 3: AOI intersection (env.mask + env.extent + env.snapRaster)
+      Phase 4: AROSICS scene-to-scene co-registration against a
+               Sentinel-2 reference (mandatory; corrects AST_07XT
+               V004's L1B-grade ~20-50m per-scene geolocation drift
+               that otherwise blurs a multi-scene median to ~30-50m
+               effective resolution).
+      Phase 5: OmniCloudMask DL cloud detection (Wright et al. 2025;
+               mandatory primary cloud mask — AST_07XT ships without
+               one, unlike S2 SCL / Landsat QA_PIXEL).
+      Phase 6: Per-scene processing — uniform per-band SetNull(<=0)
+               source-NoData mask, hardened VNIR spectral cloud test
+               (brightness + flatness + NDVI + NDWI water guard, with
+               optional SWIR confirmation on pre-Apr-2008 scenes),
+               OR with DL classes, edge dilation, stack save.
+      Phase 7: Optional temporal outlier cleaner (Tmask robust-z).
+      Phase 8: GeometricMedian compositor (with placeholder leak
+               cleanup); runs once per requested output (VNIR / SWIR).
+      Phase 9: Cleanup + provenance CSV.
 
-    Per-scene processing:
-      1. Load 3 VNIR bands at native 15m + 6 SWIR bands resampled to 15m
-         (BILINEAR).
-      2. Apply scale factor 0.001 to convert DN → surface reflectance [0, 1].
-      3. Apply QA cloud mask from the QA Data Plane layers (best-effort
-         bit decoding — exact layout per ASTER User Handbook V004).
-      4. Build a multi-spectral cloud mask
-         ``(B02 > 0.45 AND B04 > 0.25) OR (BT < 280 K)`` — Hulley & Hook
-         (2008)-style ACCA-on-ASTER with a mid-latitude-adjusted thermal
-         threshold tuned for warm maritime stratus. The thermal term is
-         dropped when no AST_08 is paired; the SWIR term is dropped for
-         VNIR-only scenes.
-      5. Stack into a 9-band float32 raster (3-band for VNIR-only mode).
-
-    Mosaicking: Esri arcpy.ia.GeometricMedian across the cloud-masked
-    stack, then optional AOI clip and provenance CSV.
+    Two outputs are produced per run by default (gates: produce_vnir
+    and produce_vnir_swir):
+      <mosaic_name>_Vnir       — 3-band VNIR composite from all scenes
+                                 (best spatial baseline, 2001-2025).
+      <mosaic_name>_VnirSwir   — 9-band VNIR+SWIR composite from the
+                                 pre-Apr-2008 subset (ASTER SWIR
+                                 detector failed after that date).
     """
 
     def __init__(self):
         self.label = "03 — ASTER L2 Mosaic"
         self.description = (
-            "Build a mineral-mapping mosaic from ASTER AST_07XT V004 "
+            "Build a multi-temporal mosaic from ASTER AST_07XT V004 "
             "Surface Reflectance scenes (VNIR + crosstalk-corrected SWIR). "
             "Accepts per-band TIFFs (the common LP DAAC export) or HDF-EOS "
-            "archives. SWIR (30m) is resampled to 15m to match VNIR. Cloud "
-            "handling combines the QA Data Plane non-zero flag with a "
-            "per-scene multi-spectral test on B02 (red) + B04 (SWIR1); "
-            "paired AST_08 Surface Kinetic Temperature scenes (either "
-            "co-located, or supplied through the optional thermal folder "
-            "parameter) add a brightness-temperature channel that catches "
-            "thin cirrus and warm bare ground that VIS/SWIR alone would "
-            "miss. The temporal stack is reduced to a geometric median. A "
-            "provenance CSV is written alongside the output."
+            "archives. Per-scene scenes are co-registered against a "
+            "Sentinel-2 reference (AROSICS) to correct L1B-grade geolocation "
+            "drift, cloud-masked via OmniCloudMask (mandatory DL primary "
+            "+ a hardened VNIR spectral test as second-line defence), and "
+            "reduced to a GeometricMedian composite. Two products are "
+            "produced per run: a 3-band VNIR mosaic from all scenes and "
+            "a 9-band VNIR+SWIR mosaic from the pre-Apr-2008 subset. A "
+            "provenance CSV is written alongside each output."
         )
         self.canRunInBackground = True
 
@@ -7566,7 +7551,7 @@ class AsterMosaic(object):
 
         # Temporal outlier cleaner master toggle. Default flipped to OFF
         # in 2026-05-26 alongside the DL cloud-mask integration: with
-        # OmniCloudMask (Phase 4) catching the persistent orographic
+        # OmniCloudMask (Phase 5) catching the persistent orographic
         # cloud over Faial that the Tmask-reduction layer cannot flag
         # (cloud is modal at those pixels, so robust-z does not see it
         # as outlier), the cleaner's net value drops. Kept as an opt-in
@@ -8027,8 +8012,9 @@ class AsterMosaic(object):
             # cost. Two jobs: (1) set env.mask + env.extent so every
             # downstream raster op is auto-clipped to AOI (already
             # happening); (2) drop scenes whose bounding box has zero
-            # overlap with the AOI bbox so Phase 4 (DL inference) and
-            # Phase 5 (per-scene processing) don't waste compute on
+            # overlap with the AOI bbox so Phase 4 (AROSICS), Phase 5
+            # (DL inference) and Phase 6 (per-scene processing) don't
+            # waste compute on
             # scenes that contribute nothing. For Faial's 257-scene
             # archive this typically drops 3 scenes (~1%) but the win
             # scales with AOI tightness.
@@ -8749,24 +8735,25 @@ class AsterMosaic(object):
             )
             return None
 
-        # Output path is resolved BEFORE Phase 4 so the evidence-layer
+        # Output path is resolved BEFORE Phase 7 so the evidence-layer
         # publish can be tied to the mosaic's GDB stem from the start.
-        # If Phase 5 (GeometricMedian) fails downstream, the sidecars
-        # published in Phase 4 still survive at their final location.
+        # If Phase 8 (GeometricMedian) fails downstream, the sidecars
+        # published in Phase 7 still survive at their final location.
         output_path = os.path.join(gdb_path, output_name)
 
-        # Phase 4: Temporal outlier cleaner (Tmask reduction).
+        # Phase 7: Temporal outlier cleaner (Tmask reduction).
         # Runs per-pixel robust z-score against each pixel's own clear-
         # sky history; flags warm marine cloud that no per-scene
-        # spectral threshold can separate from warm land. Default ON;
-        # disabled only for A/B comparison runs. Emits two evidence-
-        # quality sidecar rasters tied to this mosaic's output name:
+        # spectral threshold can separate from warm land. Default OFF
+        # since OmniCloudMask became mandatory in Phase 5; opt in for
+        # A/B comparison runs. Emits two evidence-quality sidecar
+        # rasters tied to this mosaic's output name:
         # ``{name}_obs_count`` (valid clear observations per pixel)
         # and ``{name}_cloud_freq`` (flagged fraction per pixel).
         # Treat both as inputs to downstream uncertainty propagation,
         # not as QA to discard. Sidecars are CopyRaster-published from
         # scratch to the GDB sidecar folder inside this phase so they
-        # survive both scratch cleanup AND a Phase 5 failure. The
+        # survive both scratch cleanup AND a Phase 8 failure. The
         # cleaner output is the diagnostic users need to triage a
         # GeometricMedian crash.
         composite_inputs = stacked_paths
@@ -8816,7 +8803,7 @@ class AsterMosaic(object):
                 composite_inputs = stacked_paths
 
             # Publish evidence layers from scratch to the GDB sidecar
-            # folder. Independent of Phase 5 outcome; runs as long as
+            # folder. Independent of Phase 8 outcome; runs as long as
             # the cleaner produced files. Delete-then-CopyRaster is
             # tolerant of catalog locks from a previous run that
             # ``.save()`` overwrite would trip on.
@@ -8880,7 +8867,7 @@ class AsterMosaic(object):
                 label=f"{os.path.basename(output_path)} [{label}]",
             )
         except arcpy.ExecuteError:
-            # phase manager already warned with the canonical "✗ Phase 5
+            # phase manager already warned with the canonical "✗ Phase 8
             # ... failed after Xs" line; no need for a duplicate AddError.
             arcpy.ResetProgressor()
             return None
@@ -8931,7 +8918,7 @@ class AsterMosaic(object):
             )
 
             # Evidence layers were published to the GDB sidecar folder
-            # in Phase 4, using ``output_path``'s stem. If AOI mask was
+            # in Phase 7, using ``output_path``'s stem. If AOI mask was
             # applied, ``final_path`` carries a ``_Masked`` suffix; the
             # sidecars are renamed to match so downstream pairing on
             # basename works unambiguously. When AOI was not applied
@@ -8970,18 +8957,20 @@ class AsterMosaic(object):
     def _find_aster_scenes(cls, data_folder, thermal_folder=None):
         """Discover ASTER scenes in data_folder. Groups per-band TIFFs by
         sceneID; for HDF, each .hdf is one scene (extracted lazily by
-        _process_scene). If ``thermal_folder`` is supplied, AST_08 files
-        are sourced from it (so AST_07XT and AST_08 can live in sibling
-        folders, the LP DAAC default); otherwise the main data folder is
-        scanned for AST_08 too.
+        _process_scene).
+
+        ``thermal_folder`` is preserved in the signature for backwards
+        compatibility but ignored — the AST_08 thermal pairing was used
+        only by the now-removed thermal cloud test (stripped
+        2026-05-27 when OmniCloudMask became the mandatory primary
+        cloud detection layer). The TemporalStatistics tool's AST_08
+        LST mode has its own discovery path.
 
         Returns a list of dicts with keys:
             scene_id:   17-char ASTER granule identifier
             format:     "tiff" or "hdf"
             files:      dict {band_name: path} (for tiff) or {hdf: path}
             metadata:   {acquisition_date: date, pass_number: str, ...}
-            thermal:    optional {"format", "path"} when an AST_08 file
-                        was paired by scene ID.
         """
         if not data_folder or not os.path.isdir(data_folder):
             return []
@@ -9038,41 +9027,10 @@ class AsterMosaic(object):
                 },
             }
 
-        # Third pass: AST_08 (Surface Kinetic Temperature) — optional
-        # thermal companion. Attached to the matching AST_07XT scene by
-        # scene_id; AST_08 files with no AST_07XT counterpart are
-        # ignored. TIFF is preferred over HDF when both exist (the COG
-        # TIFF is already in Kelvin; HDF needs gdal subdataset extraction).
-        # When ``thermal_folder`` is supplied AND exists, scan it for
-        # AST_08; otherwise look in the main data folder. The thermal
-        # folder also matches sibling-of-main when the user only set the
-        # main folder but co-located both products on disk.
-        thermal_folder = thermal_folder or None
-        if thermal_folder and os.path.isdir(thermal_folder):
-            scan_root = thermal_folder
-            scan_entries = os.listdir(thermal_folder)
-        else:
-            scan_root = data_folder
-            scan_entries = entries
-        for entry in scan_entries:
-            full = os.path.join(scan_root, entry)
-            if not os.path.isfile(full):
-                continue
-            scene_id = cls._parse_ast08_filename(entry)
-            if not scene_id or scene_id not in scenes_by_id:
-                continue
-            existing = scenes_by_id[scene_id].get("thermal")
-            is_tiff = entry.lower().endswith((".tif", ".tiff"))
-            is_hdf = entry.lower().endswith(".hdf")
-            if not (is_tiff or is_hdf):
-                continue
-            # Prefer TIFF; do not overwrite a TIFF entry with an HDF.
-            if existing and existing.get("format") == "tiff" and is_hdf:
-                continue
-            scenes_by_id[scene_id]["thermal"] = {
-                "format": "tiff" if is_tiff else "hdf",
-                "path": full,
-            }
+        # (Third pass for AST_08 thermal pairing was removed
+        # 2026-05-27 along with the thermal cloud test. The
+        # TemporalStatistics tool's AST_08 LST mode owns its own
+        # discovery path.)
 
         return sorted(scenes_by_id.values(), key=lambda s: s["scene_id"])
 
@@ -9314,7 +9272,7 @@ class AsterMosaic(object):
         # vegetation is high-NDVI; bare basalt is bright but red-
         # dominated (not flat); water and shadow are dark. Optional
         # SWIR confirmation tightens the test on pre-failure scenes.
-        # Coupled with the temporal cleaner in Phase 4, the per-scene
+        # Coupled with the optional Phase 7 temporal cleaner, the per-scene
         # path is deliberately recall-oriented: catch gross cloud
         # cheaply, let the temporal layer handle the residue.
         b1 = scaled["B01"]      # green
@@ -9362,7 +9320,7 @@ class AsterMosaic(object):
 
         cloud_mask = cloud_vis_swir
 
-        # OmniCloudMask DL output, when generated by Phase 4. Classes
+        # OmniCloudMask DL output, generated by Phase 5. Classes
         # are uint8 (0=Clear, 1=Thick, 2=Thin, 3=Shadow); the caller
         # picks which to drop via ``dl_cloud_classes`` (see
         # _dl_cloud_classes_for). OR-ing into ``cloud_mask`` BEFORE
@@ -9425,7 +9383,7 @@ class AsterMosaic(object):
             # NoData where the source was off-footprint; load that
             # band with NaN sentinels and use ``~isnan`` as the
             # observed-pixel mask. Matches the convention applied to
-            # the DL mask in Phase 4 via _ocm_mask_class_fractions.
+            # the DL mask in Phase 5 via _ocm_mask_class_fractions.
             #
             # cm_arr counts a pixel as "dropped" if cloud_mask is
             # True (==1) OR if cloud_mask is NoData. The NoData
@@ -9436,7 +9394,7 @@ class AsterMosaic(object):
             # so those pixels ARE drops in the downstream masking.
             # Treating them as "not flagged" (the previous
             # nodata_to_value=0 behaviour) under-reported drops on
-            # VnirSwir scenes vs Phase 4's DL number.
+            # VnirSwir scenes vs Phase 5's DL number.
             #
             # cloud_mask is integer (uint8 binary) at this point, so
             # we can't use NaN as the NoData placeholder. Use 255
@@ -9516,7 +9474,7 @@ class AsterMosaic(object):
         # Per-scene scratch cleanup: drop QA_15m, per-band 15m resamples,
         # per-band masked rasters, cloudmask diagnostic save, cloudbuf
         # dilation save, and any HDF subdataset extracts. Keeps the
-        # final stack + resume marker; the Phase 4 temporal cleaner's
+        # final stack + resume marker; the optional Phase 7 temporal cleaner's
         # brightness extracts and cleaned stacks are created LATER (in
         # ``_temporal_outlier_clean``) and therefore aren't touched.
         _cleanup_per_scene_intermediates(
@@ -9644,32 +9602,6 @@ class AsterMosaic(object):
             return None
         except Exception as e:
             arcpy.AddWarning(f"    AST_08 HDF extraction error: {e}")
-            return None
-
-    def _load_bt_kelvin(self, thermal_meta, scratch_dir, scene_id):
-        """Load the paired AST_08 surface kinetic temperature at the 15 m
-        grid used by the per-scene cloud test. Returns ``None`` when no
-        thermal pairing exists or the load fails (the caller falls back
-        to VIS/SWIR-only cloud detection). The actual load logic lives
-        in module-level ``_aster_bt_kelvin_from_path``; this method
-        preserves the per-scene warning convention of the cloud-test
-        path.
-        """
-        if not thermal_meta:
-            return None
-        fmt = thermal_meta.get("format")
-        path = thermal_meta.get("path")
-        if not (fmt and path):
-            return None
-        try:
-            return _aster_bt_kelvin_from_path(
-                path, scratch_dir, target_cellsize=15, scene_id=scene_id,
-            )
-        except Exception as e:
-            arcpy.AddWarning(
-                f"  ✗ {scene_id}: AST_08 BT load failed ({e}); "
-                "continuing without thermal cloud channel"
-            )
             return None
 
     # ------------------------------------------------------------------
