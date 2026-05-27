@@ -1922,7 +1922,9 @@ def _run_scene_batches(
                             or "row/column rotation" in lstripped
                             or "overflow encountered in reduce" in lstripped
                             or "pyproj unable to set PROJ database" in lstripped
-                            or "Value 0 in the source dataset has been changed to" in lstripped):
+                            or "Value 0 in the source dataset has been changed to" in lstripped
+                            or "Automatic nodata value detection returned" in lstripped
+                            or "Nodata value could not be clearly identified" in lstripped):
                         continue
                     try:
                         evt = json.loads(stripped)
@@ -2240,6 +2242,17 @@ def _worker_arosics_batch(spec):
                 "width": data.shape[2],
                 "transform": new_transform,
                 "count": data.shape[0],
+                # Declare nodata=0 explicitly so AROSICS does NOT
+                # need to auto-detect via 4-corner sampling. The
+                # clipped raster is mostly land (Faial + 1km buffer),
+                # so 0 may only appear in 1-2 corners — too few for
+                # AROSICS' auto-detection to declare confidently
+                # ("seems to be unreliable" warning from
+                # geoarray:806). Without an explicit value, AROSICS
+                # treats valid land pixels as NoData and fails every
+                # scene with 0 tie points. AST_07XT and the S2
+                # reference both use DN 0 as no-data by convention.
+                "nodata": 0,
             })
             with rasterio.open(out_path, "w", **profile) as dst:
                 dst.write(data)
@@ -2312,6 +2325,15 @@ def _worker_arosics_batch(spec):
                 window_size=(window_size, window_size),
                 max_shift=max_shift_px,
                 min_reliability=min_reliability,
+                # Both reference (S2 NIR) and target (ASTER B03N)
+                # use DN 0 as the no-data convention. Pass explicitly
+                # so AROSICS does NOT try to auto-detect (its 4-
+                # corner sampling is unreliable on small clipped
+                # rasters where 0 may only appear in 1-2 corners,
+                # producing the "Automatic nodata value detection ...
+                # seems to be unreliable" warning + downstream
+                # matching failure on every scene).
+                nodata=(0, 0),
                 projectDir=proj_dir,
                 q=True,
                 progress=False,
