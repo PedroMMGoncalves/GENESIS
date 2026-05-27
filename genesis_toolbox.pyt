@@ -1892,26 +1892,33 @@ def _run_scene_batches(
                     # failures still surface via FAIL events; tuning
                     # hints (low GCP reliability, RANSAC skipped) are
                     # already captured in our normalised FAIL messages.
-                    # Suppress at the orchestrator pass-through so
-                    # users see only actionable lines.
+                    #
+                    # Two match modes: PREFIX for source-code / progress
+                    # lines that we know start exactly with a marker;
+                    # SUBSTRING for Python warning lines that prepend a
+                    # file path + line number before the message text
+                    # (``D:\...\foo.py:99: UserWarning: <message>``).
+                    # Using SUBSTRING for warning text catches them
+                    # regardless of where in the env they originate.
                     lstripped = stripped.lstrip()
                     if (lstripped.startswith("Warping progress")
                             or lstripped.startswith("Adapting the reference image")
                             or lstripped.startswith("Calculating tie point grid")
-                            or lstripped.startswith("First attempt to check")
-                            or lstripped.startswith("RANSAC skipped because")
-                            or lstripped.startswith("RANSAC filtering could not be applied")
-                            or lstripped.startswith("The footprint of the")
-                            or lstripped.startswith("More than 70%")
                             or lstripped.startswith("warn(")
                             or lstripped.startswith("warnings.warn(")
                             or lstripped.startswith("ret = umr_sum")
                             or lstripped.startswith("_set_context_ca_bundle_path")
                             or lstripped.startswith("_worker_arosics_batch(")
+                            or "The footprint of the" in lstripped
+                            or "More than 70%" in lstripped
+                            or "First attempt to check" in lstripped
+                            or "RANSAC skipped because" in lstripped
+                            or "RANSAC filtering could not be applied" in lstripped
                             or "max_workers cannot exceed" in lstripped
                             or "row/column rotation" in lstripped
                             or "overflow encountered in reduce" in lstripped
-                            or "pyproj unable to set PROJ database" in lstripped):
+                            or "pyproj unable to set PROJ database" in lstripped
+                            or "Value 0 in the source dataset has been changed to" in lstripped):
                         continue
                     try:
                         evt = json.loads(stripped)
@@ -2121,6 +2128,18 @@ def _worker_arosics_batch(spec):
     # raise for larger AOIs where many more tie points are expected.
     min_gcps = int(spec.get("arosics_min_gcps", 5))
     max_shift_px = int(spec.get("arosics_max_shift_px", 10))
+    # AROSICS' min_reliability filters tie points by phase-correlation
+    # confidence. Default 60 (% of cross-correlation peak above mean)
+    # is calibrated for full-scene Landsat/S2 matching with abundant
+    # high-contrast features. Over small mountainous AOIs (Faial,
+    # ~21x14 km) most found tie points score 30-50% because the
+    # AOI doesn't contain enough strong-edge features for confident
+    # matches; AROSICS then filters out 70%+ as "false positives"
+    # and RANSAC has nothing left to fit. Lowering to 30 keeps more
+    # tie points; RANSAC's geometric-consistency filtering then
+    # rejects the actual outliers. Tuneable via spec for users who
+    # need stricter matching.
+    min_reliability = int(spec.get("arosics_min_reliability", 30))
     aoi_bbox = spec.get("aoi_bbox")   # [minx, miny, maxx, maxy] in aoi_crs
     aoi_crs_wkt = spec.get("aoi_crs_wkt")
     arosics_ver = getattr(_arosics, "__version__", "unknown")
@@ -2249,6 +2268,7 @@ def _worker_arosics_batch(spec):
                 grid_res=grid_res,
                 window_size=(window_size, window_size),
                 max_shift=max_shift_px,
+                min_reliability=min_reliability,
                 projectDir=proj_dir,
                 q=True,
                 progress=False,
@@ -8588,6 +8608,7 @@ class AsterMosaic(object):
                     "arosics_grid_res": 50,
                     "arosics_window_size": 128,
                     "arosics_max_shift_px": 10,
+                    "arosics_min_reliability": 30,
                     "aoi_bbox": aoi_bbox_for_spec,
                     "aoi_crs_wkt": aoi_crs_wkt_for_spec,
                 },
