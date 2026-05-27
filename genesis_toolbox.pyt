@@ -1472,13 +1472,22 @@ def _compute_aoi_overlap_pct(scene_band_path, aoi_sr, aoi_ext, aoi_area):
 
 def _resolve_dl_mask_folder(user_folder, data_folder):
     """Resolve the DL cloud-mask cache folder. If the user provided one,
-    use it; otherwise default to a ``_dl_cloud_masks/`` sibling of the
-    source data folder so masks persist across mosaic re-runs and stay
-    co-located with the archive they describe.
+    use it; otherwise default to a ``_dl_cloud_masks_coreg/`` sibling
+    of the source data folder. The ``_coreg`` suffix is intentional:
+    DL inference now runs on AROSICS-deshifted bands (Phase 5 reads
+    from the coreg cache by way of the rewritten scene_dict.files),
+    so masks generated against pre-AROSICS raw bands are not
+    interchangeable with those generated against deshifted bands.
+    Renaming the default folder breaks accidental reuse of a pre-
+    AROSICS ``_dl_cloud_masks`` cache from an earlier toolbox version;
+    mtime-based invalidation on cache hit (see Phase 5 in
+    ``AsterMosaic.execute``) handles the within-AROSICS rerun case.
     """
     if user_folder and user_folder.strip():
         return user_folder
-    return os.path.join(os.path.dirname(data_folder), "_dl_cloud_masks")
+    return os.path.join(
+        os.path.dirname(data_folder), "_dl_cloud_masks_coreg",
+    )
 
 
 def _aster_coreg_cache_dir(data_folder, mosaic_name):
@@ -1542,43 +1551,88 @@ _AROSICS_PYTHON_ENV_VAR = "GENESIS_AROSICS_PYTHON"
 _AROSICS_PYTHON_CONVENTIONAL = (
     r"D:\Genesis\ArcGISPRO_Environment\GENESIS\python.exe"
 )
+# Soft cap on the import probe; cold-starts of arcpy + arosics in
+# Pro 3.x are usually 5-12 s, never minutes.
+_AROSICS_IMPORT_PROBE_TIMEOUT_S = 30
+
+
+def _validate_arosics_python(python_path):
+    """Return True if ``python_path``'s env can ``from arosics import
+    COREG_LOCAL, DESHIFTER`` without error.
+
+    Spawns a one-shot subprocess that exits 0 on success, non-zero on
+    ImportError or any other failure. Used by _resolve_arosics_python
+    to reject candidate interpreters that exist on disk but lack the
+    AROSICS install (e.g., bare arcgispro-py3 when the user hasn't
+    cloned + installed AROSICS into the existing worker env).
+
+    Errors during the probe (timeout, subprocess crash) return False
+    so the caller falls through to the next candidate.
+    """
+    try:
+        proc = subprocess.run(
+            [python_path, "-c",
+             "from arosics import COREG_LOCAL, DESHIFTER"],
+            capture_output=True,
+            timeout=_AROSICS_IMPORT_PROBE_TIMEOUT_S,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
 
 
 def _resolve_arosics_python():
     """Return the python.exe of the conda env where AROSICS is installed.
 
-    Resolution order:
+    Resolution order, each candidate validated via a one-shot
+    ``import arosics`` subprocess probe before it's returned:
       1. ``GENESIS_AROSICS_PYTHON`` environment variable (per-user
          per-machine override, no toolbox edit needed).
       2. Conventional install path
          ``D:\\Genesis\\ArcGISPRO_Environment\\GENESIS\\python.exe`` —
          the canonical location for this project.
-      3. Falls through to ``_resolve_worker_python()`` (same env as
-         the other subprocess workers; works when AROSICS was
-         installed into the existing worker env).
+      3. ``_resolve_worker_python()`` (same env as the other
+         subprocess workers; works only when AROSICS happens to be
+         installed there too).
 
-    Raises ``RuntimeError`` with an actionable install hint if none of
-    the candidates resolve. ASTER mosaic execution should hard-fail
-    early (in ``execute``) rather than mid-run on Phase 4.
+    Raises ``RuntimeError`` with an actionable install hint if no
+    candidate can import AROSICS. Eager validation here (vs lazy in
+    the worker subprocess) saves the user from waiting for the ~90 s
+    cold-start of batch 1 only to see every scene FAIL with
+    ``worker exit 1 before scene reported`` and trace to a missing
+    install.
     """
+    candidates = []
     override = os.environ.get(_AROSICS_PYTHON_ENV_VAR)
-    if override and os.path.exists(override):
-        return override
-    if os.path.exists(_AROSICS_PYTHON_CONVENTIONAL):
-        return _AROSICS_PYTHON_CONVENTIONAL
-    # Last resort: the same env as the other workers. Works if AROSICS
-    # was installed alongside arcpy in the existing subprocess env.
+    if override:
+        candidates.append((override, f"{_AROSICS_PYTHON_ENV_VAR} env var"))
+    candidates.append(
+        (_AROSICS_PYTHON_CONVENTIONAL, "convention path")
+    )
     try:
-        return _resolve_worker_python()
+        candidates.append(
+            (_resolve_worker_python(), "fallback to worker env")
+        )
     except RuntimeError:
         pass
+    tried = []
+    for path, label in candidates:
+        if not path or not os.path.exists(path):
+            tried.append(f"{label}={path!r}: not found")
+            continue
+        if _validate_arosics_python(path):
+            return path
+        tried.append(f"{label}={path!r}: exists but AROSICS import failed")
+    tried_block = "\n  ".join(tried) if tried else "(no candidates)"
     raise RuntimeError(
-        "Could not locate AROSICS env python.exe. Install AROSICS into "
-        f"{_AROSICS_PYTHON_CONVENTIONAL!r} (recommended), or set the "
-        f"{_AROSICS_PYTHON_ENV_VAR!r} environment variable to a "
-        "python.exe whose env has AROSICS installed. Create a new env "
-        "with: conda create -n arosics_env -c conda-forge python=3.13 "
-        "arosics rasterio"
+        "Could not locate a Python env with AROSICS installed.\n  "
+        + tried_block
+        + "\nInstall: conda create -n arosics_env -c conda-forge "
+        "python=3.13 arosics rasterio  (then set "
+        f"{_AROSICS_PYTHON_ENV_VAR}=<that env's python.exe>, or "
+        f"install into {_AROSICS_PYTHON_CONVENTIONAL!r}).\n"
+        f"Verify with: <python.exe> -c "
+        "\"from arosics import COREG_LOCAL, DESHIFTER\""
     )
 
 
@@ -7911,7 +7965,11 @@ class AsterMosaic(object):
 
             # Phase 1 — discover scenes (TIFF and HDF)
             arcpy.AddMessage("\n▶ Phase 1 — Scene discovery")
-            scenes = self._find_aster_scenes(data_folder, thermal_folder)
+            # thermal_folder removed in Stage 3; pass None so the
+            # helper's default kicks in. AST_08 thermal cloud test no
+            # longer consumes scene["thermal"]; the AST_08 pairing scan
+            # in _find_aster_scenes is now wasted I/O but harmless.
+            scenes = self._find_aster_scenes(data_folder, None)
             if not scenes:
                 arcpy.AddError("  ✗ No ASTER scenes found.")
                 return None
@@ -8297,7 +8355,26 @@ class AsterMosaic(object):
                         dl_mask_folder,
                         _DL_CLOUD_MASK_FILENAME_FMT.format(sid=sid),
                     )
-                    if os.path.exists(out_path):
+                    # mtime-based cache invalidation. After Phase 4,
+                    # scene["files"]["B03N"] points at the deshifted
+                    # NIR in the coreg cache. If the cached DL mask
+                    # was written BEFORE the current deshifted band,
+                    # AROSICS state changed since the cache was made
+                    # (different shifts → different ground positions
+                    # for the same scene_id) and the cached mask is
+                    # mis-aligned with the input it would be applied
+                    # to. Re-run DL in that case. Same scene with
+                    # unchanged AROSICS keeps the deshifted band's
+                    # mtime stable across reruns and reuses cache.
+                    nir_path = (scene.get("files") or {}).get("B03N")
+                    cache_fresh = (
+                        os.path.exists(out_path)
+                        and nir_path
+                        and os.path.exists(nir_path)
+                        and os.path.getmtime(out_path)
+                            > os.path.getmtime(nir_path)
+                    )
+                    if cache_fresh:
                         arcpy.AddMessage(_format_scene_log_line(
                             idx, total_dl, sid, 0.0,
                             extras={"status": "skipped(exists)"},
@@ -8382,6 +8459,7 @@ class AsterMosaic(object):
                         compositor=compositor,
                         dl_mask_folder=dl_mask_folder,
                         dl_cloud_classes=dl_cloud_classes,
+                        coreg_cache_dir=coreg_cache_dir,
                     )
                     if output_full:
                         outputs.append(output_full)
@@ -8413,6 +8491,7 @@ class AsterMosaic(object):
                     compositor=compositor,
                     dl_mask_folder=dl_mask_folder,
                     dl_cloud_classes=dl_cloud_classes,
+                    coreg_cache_dir=coreg_cache_dir,
                 )
                 if output_vnir:
                     outputs.append(output_vnir)
@@ -8466,6 +8545,7 @@ class AsterMosaic(object):
         compositor="GeometricMedian (default)",
         dl_mask_folder=None,
         dl_cloud_classes=None,
+        coreg_cache_dir=None,
     ):
         """Run Phases 6-9 over a scene list in one of the supported modes.
 
@@ -8490,17 +8570,39 @@ class AsterMosaic(object):
         scene_times = []
 
         # Resume scan — reuse any per-scene stack that survives in scratch
-        # alongside its .complete marker. The stack suffix is mode-specific
-        # so the VNIR+SWIR and VNIR-only mosaics maintain independent
-        # markers and do not collide.
+        # alongside its .complete marker AND is fresher than the
+        # corresponding AROSICS coreg meta.json. The mtime gate handles
+        # two cases that would otherwise produce silently-wrong output:
+        #   - V9 → V10 upgrade: V9 stacks were built from raw L1B bands.
+        #     Phase 4 of V10 writes fresh coreg meta files; their mtime
+        #     beats the V9 stacks' .complete mtime → stacks invalidate.
+        #   - Within-V10 AROSICS parameter change: re-running AROSICS
+        #     updates the coreg cache (newer mtime), older stacks
+        #     invalidate. Reruns with unchanged AROSICS keep the meta
+        #     stable so the same stacks reuse.
+        # Stack suffix is mode-specific so VNIR+SWIR and VNIR-only
+        # mosaics maintain independent markers and don't collide.
         stack_suffix = "_stack_vnir.tif" if mode == _ASTER_MODE_VNIR else "_stack.tif"
         resumed_count = 0
         to_process = []
         for scene in scenes:
             sid = scene.get("scene_id", "")
             expected = os.path.join(scratch_dir, f"{sid}{stack_suffix}")
-            if (sid and os.path.exists(expected)
-                    and os.path.exists(expected + ".complete")):
+            complete_marker = expected + ".complete"
+            coreg_meta_path = (
+                os.path.join(coreg_cache_dir, f"{sid}_meta.json")
+                if coreg_cache_dir else None
+            )
+            resume_ok = (
+                bool(sid)
+                and os.path.exists(expected)
+                and os.path.exists(complete_marker)
+                and coreg_meta_path is not None
+                and os.path.exists(coreg_meta_path)
+                and os.path.getmtime(complete_marker)
+                    > os.path.getmtime(coreg_meta_path)
+            )
+            if resume_ok:
                 stacked_paths.append(expected)
                 scenes_used.append(scene)
                 resumed_count += 1
