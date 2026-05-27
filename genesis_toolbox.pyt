@@ -1479,6 +1479,32 @@ def _resolve_dl_mask_folder(user_folder, data_folder):
     return os.path.join(os.path.dirname(data_folder), "_dl_cloud_masks")
 
 
+def _aster_coreg_cache_dir(data_folder, mosaic_name):
+    """Resolve the AROSICS co-registration cache folder for an ASTER
+    mosaic run.
+
+    Sibling of ``data_folder``, suffixed with the mosaic name so each
+    run's deshifted scenes stay separated and the user can spot which
+    cache belongs to which output by name alone (same pattern as the
+    DL cloud-mask cache and the per-scene scratch). Auto-derived; not
+    user-configurable. Survives across re-runs of the same
+    ``mosaic_name`` for resume safety; deleted with the scratch
+    when ``preserve_scratch`` is off.
+
+    Layout:
+
+        <parent>/_aster_coreg_cache_<MOSAIC>/
+            <scene_id>_B01.tif    (B01..B09 as available per scene)
+            <scene_id>_B02.tif
+            ...
+            <scene_id>_meta.json  (shift vector, RMSE, GCP count, status)
+    """
+    safe = _sanitize_arcpy_name(mosaic_name) or "mosaic"
+    return os.path.join(
+        os.path.dirname(data_folder), f"_aster_coreg_cache_{safe}",
+    )
+
+
 def _resolve_worker_python():
     """Return a real python.exe to spawn subprocess workers with.
 
@@ -1501,9 +1527,62 @@ def _resolve_worker_python():
     )
 
 
+# Resolution order for the AROSICS env's python.exe. AROSICS 1.13.x
+# requires Python 3.13 (conda-forge package pins ``python_abi 3.13``),
+# which is incompatible with the bundled ``arcgispro-py3`` env shipped
+# by ArcGIS Pro 3.x (Python 3.11). A separate conda env is therefore
+# mandatory. The convention is to install it alongside the existing
+# subprocess worker env so a single ``python.exe`` resolves both arcpy
+# (when the env is rebuilt on Python 3.13 with arcpy attached) AND
+# AROSICS. The override env var lets a power user point at a parallel
+# env without editing the .pyt.
+_AROSICS_PYTHON_ENV_VAR = "GENESIS_AROSICS_PYTHON"
+_AROSICS_PYTHON_CONVENTIONAL = (
+    r"D:\Genesis\ArcGISPRO_Environment\GENESIS\python.exe"
+)
+
+
+def _resolve_arosics_python():
+    """Return the python.exe of the conda env where AROSICS is installed.
+
+    Resolution order:
+      1. ``GENESIS_AROSICS_PYTHON`` environment variable (per-user
+         per-machine override, no toolbox edit needed).
+      2. Conventional install path
+         ``D:\\Genesis\\ArcGISPRO_Environment\\GENESIS\\python.exe`` —
+         the canonical location for this project.
+      3. Falls through to ``_resolve_worker_python()`` (same env as
+         the other subprocess workers; works when AROSICS was
+         installed into the existing worker env).
+
+    Raises ``RuntimeError`` with an actionable install hint if none of
+    the candidates resolve. ASTER mosaic execution should hard-fail
+    early (in ``execute``) rather than mid-run on Phase 4.
+    """
+    override = os.environ.get(_AROSICS_PYTHON_ENV_VAR)
+    if override and os.path.exists(override):
+        return override
+    if os.path.exists(_AROSICS_PYTHON_CONVENTIONAL):
+        return _AROSICS_PYTHON_CONVENTIONAL
+    # Last resort: the same env as the other workers. Works if AROSICS
+    # was installed alongside arcpy in the existing subprocess env.
+    try:
+        return _resolve_worker_python()
+    except RuntimeError:
+        pass
+    raise RuntimeError(
+        "Could not locate AROSICS env python.exe. Install AROSICS into "
+        f"{_AROSICS_PYTHON_CONVENTIONAL!r} (recommended), or set the "
+        f"{_AROSICS_PYTHON_ENV_VAR!r} environment variable to a "
+        "python.exe whose env has AROSICS installed. Create a new env "
+        "with: conda create -n arosics_env -c conda-forge python=3.13 "
+        "arosics rasterio"
+    )
+
+
 def _run_scene_batches(
     worker_kind, scenes, batch_size, scratch_dir,
-    spec_extra=None, log_prefix="  ",
+    spec_extra=None, log_prefix="  ", worker_python_override=None,
 ):
     """Run ``scenes`` through the matching worker in batches of
     ``batch_size``, one fresh python.exe per batch.
@@ -1539,7 +1618,7 @@ def _run_scene_batches(
     spec_extra = spec_extra or {}
     total = len(scenes)
     n_batches = (total + batch_size - 1) // batch_size
-    worker_python = _resolve_worker_python()
+    worker_python = worker_python_override or _resolve_worker_python()
     arcpy.AddMessage(
         f"{log_prefix}Subprocess batching: {total} scene"
         f"{'s' if total != 1 else ''} via subprocess, {batch_size}/batch"
@@ -1711,6 +1790,161 @@ def _worker_s2_batch(spec):
             print(json.dumps({
                 "kind": "scene", "sid": sid,
                 "elapsed_s": round(elapsed, 1),
+                "fail": f"{type(e).__name__}: {e}",
+            }), flush=True)
+
+
+def _worker_arosics_batch(spec):
+    """Subprocess entry point for an AROSICS co-registration batch.
+
+    Runs in the AROSICS env (Python 3.13 + arosics 1.13.x). Co-
+    registers each scene against a pre-extracted Sentinel-2 NIR
+    reference image using single-band NIR-to-NIR phase correlation
+    (avoids the known multiband perf bug at GFZ/arosics#69), then
+    applies the resulting deformation grid to every band file in the
+    scene via DESHIFTER. Outputs land in ``coreg_cache_dir/`` as one
+    GeoTIFF per band plus a ``<sid>_meta.json`` sidecar capturing the
+    shift summary.
+
+    Spec format (JSON file on disk, path passed as argv[3]):
+      {"scenes": [scene_dict, ...],
+       "scratch_dir": str,
+       "coreg_cache_dir": str,
+       "ref_nir_path": str,         # pre-extracted S2 NIR GeoTIFF
+       "arosics_grid_res": int,     # tie-point grid spacing, target px
+       "arosics_window_size": int,  # matching window size, target px
+       "arosics_max_shift_px": int} # max acceptable shift
+
+    Per-scene failure policy: log loudly via a FAIL event so the
+    orchestrator drops the scene from downstream phases. The run
+    continues with surviving scenes; the Phase 4 tail summary lists
+    every failure so the user can investigate. Hard-stop on failure
+    is intentional: a scene that can't be co-registered must not slip
+    into the geomedian at L1B accuracy because that mixes geolocation
+    regimes in the same composite.
+    """
+    from arosics import COREG_LOCAL, DESHIFTER
+    import arosics as _arosics
+
+    cache_dir = spec["coreg_cache_dir"]
+    os.makedirs(cache_dir, exist_ok=True)
+    ref_nir_path = spec["ref_nir_path"]
+    grid_res = int(spec.get("arosics_grid_res", 200))
+    window_size = int(spec.get("arosics_window_size", 256))
+    max_shift_px = int(spec.get("arosics_max_shift_px", 10))
+    arosics_ver = getattr(_arosics, "__version__", "unknown")
+
+    for scene in spec["scenes"]:
+        sid = scene.get("scene_id") or "?"
+        files = scene.get("files") or {}
+        # Only band rasters are co-registered. QA planes and other
+        # ancillaries inherit the same shift via re-derivation in
+        # later phases if needed; AROSICS-shifting them adds runtime
+        # without changing pipeline behaviour.
+        band_files = {b: p for b, p in files.items() if b.startswith("B")}
+        meta_path = os.path.join(cache_dir, f"{sid}_meta.json")
+        t0 = time.time()
+
+        # Cache check: every expected band present + meta says ok.
+        all_cached = bool(band_files) and all(
+            os.path.exists(os.path.join(cache_dir, f"{sid}_{b}.tif"))
+            for b in band_files
+        )
+        if all_cached and os.path.exists(meta_path):
+            try:
+                with open(meta_path, encoding="utf-8") as fh:
+                    cached_meta = json.load(fh)
+                if cached_meta.get("status") == "ok":
+                    extras = {
+                        "rmse": f"{cached_meta.get('rmse_m', 0.0):.1f}m",
+                        "gcps": str(cached_meta.get("gcp_count", 0)),
+                        "src": "cache",
+                    }
+                    print(json.dumps({
+                        "kind": "scene", "sid": sid,
+                        "elapsed_s": round(time.time() - t0, 1),
+                        "extras": extras,
+                    }), flush=True)
+                    continue
+            except (OSError, ValueError):
+                pass   # treat as cache miss
+
+        try:
+            if "B03N" not in band_files:
+                raise RuntimeError(
+                    f"Scene {sid} missing B03N NIR for AROSICS matching"
+                )
+            nir_path = band_files["B03N"]
+            proj_dir = os.path.join(cache_dir, f"{sid}_proj")
+
+            CRL = COREG_LOCAL(
+                im_ref=ref_nir_path,
+                im_tgt=nir_path,
+                grid_res=grid_res,
+                window_size=(window_size, window_size),
+                max_shift=max_shift_px,
+                projectDir=proj_dir,
+                q=True,
+                progress=False,
+                CPUs=None,   # AROSICS picks all cores
+            )
+            CRL.calculate_spatial_shifts()
+            coreg_info = CRL.coreg_info
+
+            # GCP count + RMSE from the tiepoint grid. Fall back to
+            # zeros if AROSICS structure varies across versions.
+            gcp_count = 0
+            try:
+                gcp_count = int(len(CRL.tiepoint_grid.GDF))
+            except Exception:
+                pass
+            mean_dx_px = float(coreg_info.get("mean_shifts_px", {}).get("x", 0.0))
+            mean_dy_px = float(coreg_info.get("mean_shifts_px", {}).get("y", 0.0))
+            cell_size_m = abs(float(
+                coreg_info.get("updated geotransform", [0, 15, 0, 0, 0, -15])[1]
+            )) or 15.0
+            rmse_m = ((mean_dx_px ** 2 + mean_dy_px ** 2) ** 0.5) * cell_size_m
+
+            # Apply the same deformation to every band file.
+            for band_name, src_path in band_files.items():
+                out_path = os.path.join(
+                    cache_dir, f"{sid}_{band_name}.tif",
+                )
+                DSH = DESHIFTER(
+                    src_path, coreg_info,
+                    path_out=out_path,
+                    fmt_out="GTiff",
+                    q=True,
+                    progress=False,
+                )
+                DSH.correct_shifts()
+
+            meta_out = {
+                "scene_id": sid,
+                "status": "ok",
+                "rmse_m": rmse_m,
+                "mean_dx_px": mean_dx_px,
+                "mean_dy_px": mean_dy_px,
+                "gcp_count": gcp_count,
+                "ref_nir_path": ref_nir_path,
+                "arosics_version": arosics_ver,
+                "bands": sorted(band_files),
+            }
+            with open(meta_path, "w", encoding="utf-8") as fh:
+                json.dump(meta_out, fh)
+
+            print(json.dumps({
+                "kind": "scene", "sid": sid,
+                "elapsed_s": round(time.time() - t0, 1),
+                "extras": {
+                    "rmse": f"{rmse_m:.1f}m",
+                    "gcps": str(gcp_count),
+                },
+            }), flush=True)
+        except Exception as e:
+            print(json.dumps({
+                "kind": "scene", "sid": sid,
+                "elapsed_s": round(time.time() - t0, 1),
                 "fail": f"{type(e).__name__}: {e}",
             }), flush=True)
 
@@ -13384,6 +13618,8 @@ if __name__ == "__main__":
             _worker_aster_batch(_spec, mode="vnir_swir")
         elif _worker_kind == "aster_vnir":
             _worker_aster_batch(_spec, mode="vnir")
+        elif _worker_kind == "arosics":
+            _worker_arosics_batch(_spec)
         else:
             raise SystemExit(f"Unknown worker kind: {_worker_kind!r}")
         sys.exit(0)
