@@ -8817,43 +8817,61 @@ class AsterMosaic(object):
                     arcpy.AddWarning(f"  ✗ {scene_id}: QA mask build failed ({e}); continuing without")
                     qa_mask = None
 
-        # First pass: build scaled-reflectance rasters for every required
-        # band. SWIR bands are resampled from 30m to 15m first. The
-        # ``SetNull(<= 0)`` after read/resample is applied SYMMETRICALLY
-        # to VNIR and SWIR. Two failure modes it catches:
-        #   - Zero: AST_07XT L2 source TIFFs use 0 as the conventional
-        #     no-data marker for out-of-footprint pixels and
-        #     unrecoverable retrievals. Without this guard, those zeros
-        #     leak through ``Float() * scale = 0`` into the per-scene
-        #     composite. Across many scenes the GeometricMedian then
-        #     pulls toward zero in proportion to how many scenes do not
-        #     cover the pixel; the bias is visible as scene-footprint-
-        #     shaped dark patches in the final composite (the 2026-05-25
-        #     VNIR regression on Faial; AOI mask = 1373x964, NIR mean
-        #     0.10 instead of expected 0.3-0.5).
-        #   - Negative: the float32 NoData sentinel (~-3.4e+38) that
-        #     BILINEAR resample can introduce near scene edges; if it
-        #     survives into Float() * scale it propagates as huge-
-        #     magnitude values that destroy band statistics (the
-        #     symmetric SWIR symptom: bands 4-9 mean ~-2.6e+17 in the
-        #     same V6 run).
-        # Previously the guard was only on the SWIR path; the VNIR
-        # native-15m read bypassed it because no Resample step was
-        # involved. The 2026-05-25 AOI catalog-path fix made env.mask
-        # actually reach the worker, which surfaced both failure modes
-        # because the saved per-scene rasters now span the AOI rather
-        # than the scene's natural footprint.
-        scaled = {}
+        # First pass: read every required band, resampling SWIR
+        # 30m -> 15m where needed. No per-band SetNull yet; that's
+        # done uniformly below.
+        #
+        # Source-NoData handling (the 2026-05-27 fix): AST_07XT L2
+        # TIFFs use DN 0 as the conventional no-data marker for out-
+        # of-footprint pixels, unrecoverable retrievals, and the soft
+        # black-bar fill at scene edges. BILINEAR resample on SWIR
+        # can additionally introduce the float32 NoData sentinel
+        # (~-3.4e+38) at the resample edge.
+        #
+        # Both failure modes are addressed by ``<= 0`` SetNull. The
+        # critical detail: the SetNull must be applied UNIFORMLY
+        # across all bands, not per-band. The original per-band
+        # approach produced asymmetric NoData footprints between
+        # bands within a single stack (each band's source has
+        # slightly different black-bar geometry — sensor B02's
+        # optical path isn't pixel-identical to B01's), which broke
+        # arcpy.ia.GeometricMedian: its Weiszfeld iteration assumes
+        # consistent d-vector samples at every pixel, and writes
+        # garbage on the band with the most-varying NoData
+        # (empirically B02 on Faial — 19% valid in the composite vs
+        # 58% for B01, even with 254 input scenes).
+        #
+        # Sentinel-2 and Landsat avoid this trap because their SCL /
+        # QA_PIXEL fill flags collapse all per-band quality decisions
+        # into one per-pixel value applied uniformly. Mirroring that
+        # pattern here — union the per-band ``<=0`` masks into a
+        # single ``source_nodata`` and SetNull every band against it.
+        # Per-band NoData then stays consistent within a stack, GM
+        # converges cleanly, and ASTER mosaic quality matches the
+        # other two sensors.
+        src_rasters = {}
         for band in required_bands:
             src = files[band]
             if band not in _ASTER_NATIVE_15M:
                 resampled = os.path.join(scratch_dir, f"{scene_id}_{band}_15m.tif")
                 arcpy.management.Resample(src, resampled, 15, "BILINEAR")
-                src_raster = arcpy.sa.Raster(resampled)
+                src_rasters[band] = arcpy.sa.Raster(resampled)
             else:
-                src_raster = arcpy.sa.Raster(src)
-            src_raster = arcpy.sa.SetNull(src_raster <= 0, src_raster)
-            scaled[band] = Float(src_raster) * _ASTER_REFLECTANCE_SCALE
+                src_rasters[band] = arcpy.sa.Raster(src)
+
+        # Uniform source-NoData mask: pixel is treated as no-data if
+        # ANY required band has source <= 0. Applied to every band
+        # downstream so per-band NoData stays symmetric across the
+        # stack.
+        source_nodata = None
+        for band in required_bands:
+            bn = src_rasters[band] <= 0
+            source_nodata = bn if source_nodata is None else (source_nodata | bn)
+
+        scaled = {}
+        for band in required_bands:
+            masked_src = arcpy.sa.SetNull(source_nodata, src_rasters[band])
+            scaled[band] = Float(masked_src) * _ASTER_REFLECTANCE_SCALE
 
         # Per-scene multi-spectral cloud test (hardened, VNIR-driven).
         # Primary test runs on VNIR alone so the post-Apr-2008 majority
