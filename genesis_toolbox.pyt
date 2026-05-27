@@ -1654,13 +1654,33 @@ def _resolve_arosics_python():
     ``worker exit 1 before scene reported`` and trace to a missing
     install.
     """
-    candidates = []
+    # Explicit env-var override is honoured as terminal: if the user
+    # set GENESIS_AROSICS_PYTHON they're declaring "this is the env",
+    # so falling through to a convention path on probe failure would
+    # silently use a different env than they requested. Surface the
+    # probe failure immediately with the install hint.
     override = os.environ.get(_AROSICS_PYTHON_ENV_VAR)
     if override:
-        candidates.append((override, f"{_AROSICS_PYTHON_ENV_VAR} env var"))
-    candidates.append(
-        (_AROSICS_PYTHON_CONVENTIONAL, "convention path")
-    )
+        if not os.path.exists(override):
+            raise RuntimeError(
+                f"{_AROSICS_PYTHON_ENV_VAR}={override!r} does not "
+                "exist. Either fix the env var or unset it to use "
+                f"the convention path ({_AROSICS_PYTHON_CONVENTIONAL!r})."
+            )
+        if not _validate_arosics_python(override):
+            raise RuntimeError(
+                f"{_AROSICS_PYTHON_ENV_VAR}={override!r} exists but "
+                "AROSICS does not import. Verify with: \n"
+                f"  \"{override}\" -c "
+                "\"from arosics import COREG_LOCAL, DESHIFTER\""
+            )
+        return override
+
+    # No env-var override: try convention path, then the existing
+    # worker env as a last resort.
+    candidates = [
+        (_AROSICS_PYTHON_CONVENTIONAL, "convention path"),
+    ]
     try:
         candidates.append(
             (_resolve_worker_python(), "fallback to worker env")
@@ -8362,9 +8382,25 @@ class AsterMosaic(object):
                 return None
 
             total_attempted = len(survivors) + len(arosics_failures)
+            # Cached-vs-newly-computed split: meta.json files newer
+            # than the AROSICS phase start time were written this run;
+            # older ones are reused from a previous cached run.
+            cached_count = 0
+            for scene in survivors:
+                sid = scene.get("scene_id") or ""
+                meta_path = os.path.join(
+                    coreg_cache_dir, f"{sid}_meta.json",
+                )
+                try:
+                    if os.path.getmtime(meta_path) < t0_arosics:
+                        cached_count += 1
+                except OSError:
+                    pass
+            new_count = len(survivors) - cached_count
             arcpy.AddMessage(
                 f"  ✓ Phase 4 in {time.time() - t0_arosics:.0f}s "
-                f"({len(survivors)}/{total_attempted} co-registered)"
+                f"({len(survivors)}/{total_attempted} co-registered; "
+                f"{new_count} new, {cached_count} from cache)"
             )
             if arosics_failures:
                 arcpy.AddWarning(
@@ -8764,10 +8800,9 @@ class AsterMosaic(object):
             else:
                 to_process.append(scene)
         # Schema defence: 9 bands for VNIR+SWIR mode, 3 for VNIR-only.
-        # Scratch from before the May 2026 BT scale fix has the correct
-        # band count but a silently-broken cloud mask (thermal channel
-        # was disabled); the band-count check at least catches the
-        # cross-mode and cross-version layout mismatches.
+        # The band-count check catches cross-mode and cross-version
+        # layout mismatches when resuming from a scratch built by an
+        # older toolbox version with a different stack shape.
         expected_bands = (
             len(_ASTER_VNIR_BANDS) if mode == _ASTER_MODE_VNIR
             else len(_ASTER_STACK_ORDER)
@@ -9420,12 +9455,21 @@ class AsterMosaic(object):
                 src_rasters[band] = arcpy.sa.Raster(src)
 
         # Uniform source-NoData mask: pixel is treated as no-data if
-        # ANY required band has source <= 0. Applied to every band
+        # ANY required band has source < 0. Applied to every band
         # downstream so per-band NoData stays symmetric across the
         # stack.
+        #
+        # ``< 0`` (strict) instead of ``<= 0`` (inclusive) preserves
+        # legitimate reflectance-zero pixels — deep terrain shadow
+        # and deep open water in B03N can retrieve 0.000-0.005 in
+        # AST_07XT V004. The off-footprint dark borders we want to
+        # null are stored as negative sentinels (-3.4e+38 after
+        # BILINEAR resample) or explicit NoData metadata (handled
+        # separately by arcpy), not as DN 0. The previous ``<= 0``
+        # was nulling water unnecessarily.
         source_nodata = None
         for band in required_bands:
-            bn = src_rasters[band] <= 0
+            bn = src_rasters[band] < 0
             source_nodata = bn if source_nodata is None else (source_nodata | bn)
 
         scaled = {}
@@ -9602,11 +9646,6 @@ class AsterMosaic(object):
             # ``dict(scene, ...)`` on line 7213 creates a new outer dict
             # but the metadata reference is shared with the caller.
             scene["metadata"]["cloud_pct"] = round(cm_pct, 2)
-            # Stash BT stats on metadata too (when AST_08 thermal is on)
-            # so the subprocess worker can surface them via the per-scene
-            # log line's extras dict. The orchestrator's unified Phase 3
-            # log replaces the inline arcpy.AddMessage diagnostic that
-            # previously lived here.
         except Exception as e:
             arcpy.AddWarning(
                 f"    cloud diagnostic failed ({e}); proceeding"
