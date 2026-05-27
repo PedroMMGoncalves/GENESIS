@@ -1887,20 +1887,31 @@ def _run_scene_batches(
                     if not stripped:
                         continue
                     # Filter high-volume GDAL/AROSICS internal chatter.
-                    # AROSICS' ``progress=False`` suppresses its own
-                    # status prints but NOT GDAL's internal warping
-                    # progress callback (~200 lines per scene at every
-                    # AROSICS step). The "Adapting the reference image
-                    # pixel grid..." line fires once per scene too.
-                    # Skipping these silently keeps the orchestrator
-                    # log readable while preserving real warnings (the
-                    # pyproj database warning, AROSICS row/column
-                    # rotation warning, and any FAIL events).
+                    # AROSICS / GDAL emit many noisy diagnostics that
+                    # bury the per-scene results otherwise. Real
+                    # failures still surface via FAIL events; tuning
+                    # hints (low GCP reliability, RANSAC skipped) are
+                    # already captured in our normalised FAIL messages.
+                    # Suppress at the orchestrator pass-through so
+                    # users see only actionable lines.
                     lstripped = stripped.lstrip()
                     if (lstripped.startswith("Warping progress")
-                            or lstripped.startswith(
-                                "Adapting the reference image"
-                            )):
+                            or lstripped.startswith("Adapting the reference image")
+                            or lstripped.startswith("Calculating tie point grid")
+                            or lstripped.startswith("First attempt to check")
+                            or lstripped.startswith("RANSAC skipped because")
+                            or lstripped.startswith("RANSAC filtering could not be applied")
+                            or lstripped.startswith("The footprint of the")
+                            or lstripped.startswith("More than 70%")
+                            or lstripped.startswith("warn(")
+                            or lstripped.startswith("warnings.warn(")
+                            or lstripped.startswith("ret = umr_sum")
+                            or lstripped.startswith("_set_context_ca_bundle_path")
+                            or lstripped.startswith("_worker_arosics_batch(")
+                            or "max_workers cannot exceed" in lstripped
+                            or "row/column rotation" in lstripped
+                            or "overflow encountered in reduce" in lstripped
+                            or "pyproj unable to set PROJ database" in lstripped):
                         continue
                     try:
                         evt = json.loads(stripped)
@@ -2110,7 +2121,52 @@ def _worker_arosics_batch(spec):
     # raise for larger AOIs where many more tie points are expected.
     min_gcps = int(spec.get("arosics_min_gcps", 5))
     max_shift_px = int(spec.get("arosics_max_shift_px", 10))
+    aoi_bbox = spec.get("aoi_bbox")   # [minx, miny, maxx, maxy] in aoi_crs
+    aoi_crs_wkt = spec.get("aoi_crs_wkt")
     arosics_ver = getattr(_arosics, "__version__", "unknown")
+
+    # Helper for per-scene reprojection of the AOI bbox into the
+    # target's CRS. Imports are lazy so workers that don't need
+    # data_corners_tgt (no AOI) avoid the pyproj/rasterio cost.
+    def _aoi_corners_for_target(target_path, buffer_m=1000):
+        if not (aoi_bbox and aoi_crs_wkt):
+            return None
+        try:
+            import rasterio
+            from pyproj import CRS, Transformer
+        except ImportError:
+            return None
+        try:
+            with rasterio.open(target_path) as src:
+                tgt_crs = src.crs
+                if tgt_crs is None:
+                    return None
+            src_crs = CRS.from_wkt(aoi_crs_wkt)
+            dst_crs = CRS.from_wkt(tgt_crs.to_wkt())
+            if src_crs.equals(dst_crs):
+                minx, miny, maxx, maxy = aoi_bbox
+            else:
+                tf = Transformer.from_crs(src_crs, dst_crs, always_xy=True)
+                # Transform all four corners to avoid axis-aligned
+                # distortion across non-trivial projections.
+                xs, ys = tf.transform(
+                    [aoi_bbox[0], aoi_bbox[2], aoi_bbox[2], aoi_bbox[0]],
+                    [aoi_bbox[1], aoi_bbox[1], aoi_bbox[3], aoi_bbox[3]],
+                )
+                minx, maxx = min(xs), max(xs)
+                miny, maxy = min(ys), max(ys)
+            minx -= buffer_m
+            miny -= buffer_m
+            maxx += buffer_m
+            maxy += buffer_m
+            return [
+                (minx, maxy),  # UL
+                (maxx, maxy),  # UR
+                (maxx, miny),  # LR
+                (minx, miny),  # LL
+            ]
+        except Exception:
+            return None
 
     for scene in spec["scenes"]:
         sid = scene.get("scene_id") or "?"
@@ -2155,7 +2211,18 @@ def _worker_arosics_batch(spec):
             nir_path = band_files["B03N"]
             proj_dir = os.path.join(cache_dir, f"{sid}_proj")
 
-            CRL = COREG_LOCAL(
+            # Constrain AROSICS to the AOI portion of the target via
+            # data_corners_tgt. Without this, AROSICS auto-detects
+            # the largest connected non-NoData component of the
+            # ASTER scene as the "valid data area" — which for
+            # scenes spanning multiple Azores islands ends up being
+            # Pico / Terceira (the larger islands), not Faial.
+            # Phase correlation then runs against the wrong island
+            # and asserts "no spatial overlap" or returns nonsense
+            # shifts. The bbox is buffered by 1km so tie-point
+            # windows near the AOI edge have valid pixels to match.
+            data_corners_tgt = _aoi_corners_for_target(nir_path)
+            CRL_kwargs = dict(
                 im_ref=ref_nir_path,
                 im_tgt=nir_path,
                 grid_res=grid_res,
@@ -2166,7 +2233,35 @@ def _worker_arosics_batch(spec):
                 progress=False,
                 CPUs=None,   # AROSICS picks all cores
             )
-            CRL.calculate_spatial_shifts()
+            if data_corners_tgt is not None:
+                CRL_kwargs["data_corners_tgt"] = data_corners_tgt
+            CRL = COREG_LOCAL(**CRL_kwargs)
+            try:
+                CRL.calculate_spatial_shifts()
+            except AssertionError as e:
+                # AROSICS' own consistency check fired. The most
+                # common cause is no actual spatial overlap between
+                # AOI-bounded target footprint and the reference —
+                # i.e. the ASTER scene doesn't usefully cover Faial.
+                raise RuntimeError(
+                    f"AROSICS reports no spatial overlap between this "
+                    f"scene's AOI portion and the S2 reference. ASTER "
+                    f"scene likely catches Faial only at a corner or "
+                    f"misses it. ({type(e).__name__}: {e})"
+                )
+            except TypeError as e:
+                # AROSICS internal bug: when RANSAC skips because
+                # too few valid tie points, downstream code tries
+                # ``float(None)`` and raises TypeError. The
+                # diagnostic is identical to the MIN_GCPS gate
+                # below — there just aren't enough tie points.
+                raise RuntimeError(
+                    f"AROSICS could not fit a RANSAC model "
+                    f"(insufficient valid tie points). Likely the "
+                    f"AOI overlap with this scene is too small or "
+                    f"low-contrast to support phase correlation. "
+                    f"({type(e).__name__}: {e})"
+                )
             coreg_info = CRL.coreg_info
 
             # GCP count + RMSE from the tiepoint grid. Fall back to
@@ -8402,6 +8497,37 @@ class AsterMosaic(object):
             os.makedirs(coreg_cache_dir, exist_ok=True)
             arcpy.AddMessage(f"  Coreg cache: {coreg_cache_dir}")
 
+            # AOI bbox + CRS for the worker to pass to AROSICS as
+            # ``data_corners_tgt``. Without this, AROSICS auto-detects
+            # the target's footprint and picks the LARGEST connected
+            # part — for ASTER scenes covering Faial + neighbouring
+            # Azores islands (Pico, São Jorge, Graciosa, Terceira),
+            # the largest part is often NOT Faial, so phase
+            # correlation runs against the wrong island and either
+            # asserts "no spatial overlap" or produces a meaningless
+            # shift. Constraining the target footprint to the AOI
+            # bbox forces AROSICS to consider only the Faial area
+            # regardless of what else the scene captures.
+            aoi_bbox_for_spec = None
+            aoi_crs_wkt_for_spec = None
+            if mask_feature and arcpy.Exists(mask_feature):
+                try:
+                    _aoi_desc = arcpy.Describe(mask_feature)
+                    _aoi_ext = _aoi_desc.extent
+                    aoi_bbox_for_spec = [
+                        float(_aoi_ext.XMin), float(_aoi_ext.YMin),
+                        float(_aoi_ext.XMax), float(_aoi_ext.YMax),
+                    ]
+                    aoi_crs_wkt_for_spec = (
+                        _aoi_desc.spatialReference.exportToString()
+                    )
+                except Exception as _e:
+                    arcpy.AddWarning(
+                        f"  Could not derive AOI bbox for AROSICS "
+                        f"data_corners_tgt ({_e}); AROSICS will fall "
+                        "back to auto-detecting target footprint."
+                    )
+
             t0_arosics = time.time()
             ok = _run_scene_batches(
                 worker_kind="arosics",
@@ -8414,6 +8540,8 @@ class AsterMosaic(object):
                     "arosics_grid_res": 50,
                     "arosics_window_size": 128,
                     "arosics_max_shift_px": 10,
+                    "aoi_bbox": aoi_bbox_for_spec,
+                    "aoi_crs_wkt": aoi_crs_wkt_for_spec,
                 },
                 log_prefix="  ",
                 worker_python_override=arosics_python,
