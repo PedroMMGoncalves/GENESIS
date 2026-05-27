@@ -1370,7 +1370,14 @@ def _dl_cloud_mask_infer_scene(red_path, green_path, nir_path,
     no_observation = _np.logical_or.reduce(nodata_masks)
     mask[no_observation] = 255
 
+    # Atomic write: save to a sibling .tmp.tif, then rename. Prevents
+    # a Pro crash mid-save from leaving a truncated TIFF on disk that
+    # a later cache-hit check would silently reuse. The rename is
+    # atomic on the same filesystem; if it fails, the .tmp file
+    # remains and the cache miss path re-runs cleanly on the next
+    # invocation.
     src = arcpy.Raster(red_path)
+    tmp_path = output_path + ".tmp.tif"
     out_raster = arcpy.NumPyArrayToRaster(
         mask,
         lower_left_corner=arcpy.Point(
@@ -1380,11 +1387,49 @@ def _dl_cloud_mask_infer_scene(red_path, green_path, nir_path,
         y_cell_size=src.meanCellHeight,
         value_to_nodata=255,
     )
-    out_raster.save(output_path)
+    out_raster.save(tmp_path)
     arcpy.management.DefineProjection(
-        output_path, src.spatialReference,
+        tmp_path, src.spatialReference,
     )
+    if os.path.exists(output_path):
+        os.remove(output_path)
+    os.replace(tmp_path, output_path)
     return output_path
+
+
+def _dl_cache_fingerprint(coreg_meta_path):
+    """Compute a content fingerprint for the DL cloud-mask cache.
+
+    Reads the AROSICS per-scene meta.json (which records the shift
+    vector, RMSE, GCP count, reference path, and AROSICS version)
+    and returns a short hash string. The DL mask is invalidated only
+    when this fingerprint changes — re-running AROSICS with identical
+    parameters yields the same fingerprint and the DL cache reuses,
+    avoiding the wasteful re-inference cycle that the previous mtime-
+    based check triggered every time DESHIFTER touched the deshifted
+    bands. Returns None when the meta file is missing or unreadable;
+    callers treat None as cache miss.
+    """
+    if not coreg_meta_path or not os.path.exists(coreg_meta_path):
+        return None
+    try:
+        with open(coreg_meta_path, encoding="utf-8") as fh:
+            meta = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    import hashlib
+    payload = json.dumps(
+        {
+            "rmse_m": meta.get("rmse_m"),
+            "mean_dx_px": meta.get("mean_dx_px"),
+            "mean_dy_px": meta.get("mean_dy_px"),
+            "gcp_count": meta.get("gcp_count"),
+            "ref_nir_path": meta.get("ref_nir_path"),
+            "arosics_version": meta.get("arosics_version"),
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _ocm_mask_class_fractions(mask_path,
@@ -1471,23 +1516,29 @@ def _compute_aoi_overlap_pct(scene_band_path, aoi_sr, aoi_ext, aoi_area):
         return 0.0
 
 
-def _resolve_dl_mask_folder(user_folder, data_folder):
+def _resolve_dl_mask_folder(user_folder, data_folder, mosaic_name=None):
     """Resolve the DL cloud-mask cache folder. If the user provided one,
-    use it; otherwise default to a ``_dl_cloud_masks_coreg/`` sibling
-    of the source data folder. The ``_coreg`` suffix is intentional:
-    DL inference now runs on AROSICS-deshifted bands (Phase 5 reads
-    from the coreg cache by way of the rewritten scene_dict.files),
-    so masks generated against pre-AROSICS raw bands are not
-    interchangeable with those generated against deshifted bands.
-    Renaming the default folder breaks accidental reuse of a pre-
-    AROSICS ``_dl_cloud_masks`` cache from an earlier toolbox version;
-    mtime-based invalidation on cache hit (see Phase 5 in
-    ``AsterMosaic.execute``) handles the within-AROSICS rerun case.
+    use it; otherwise default to a per-mosaic
+    ``_dl_cloud_masks_coreg_<MOSAIC>/`` sibling of the source data
+    folder.
+
+    The ``_coreg`` suffix is intentional: DL inference now runs on
+    AROSICS-deshifted bands (Phase 5 reads from the coreg cache by
+    way of the rewritten scene_dict.files), so masks generated
+    against pre-AROSICS raw bands are not interchangeable with those
+    generated against deshifted bands. The per-mosaic suffix protects
+    against two concurrent AsterMosaic runs on the same data folder
+    with different mosaic names writing the same ``<sid>_cloudmask.tif``
+    (each run produces different deshifted inputs and therefore
+    different valid masks). Within-mosaic resume across runs is still
+    supported via the fingerprint-based cache check in Phase 5.
     """
     if user_folder and user_folder.strip():
         return user_folder
+    suffix = _sanitize_arcpy_name(mosaic_name) if mosaic_name else "default"
     return os.path.join(
-        os.path.dirname(data_folder), "_dl_cloud_masks_coreg",
+        os.path.dirname(data_folder),
+        f"_dl_cloud_masks_coreg_{suffix or 'default'}",
     )
 
 
@@ -8340,7 +8391,7 @@ class AsterMosaic(object):
             # omnicloudmask must be installed in the active env (hard-
             # fail with install hint below if missing).
             dl_mask_folder = _resolve_dl_mask_folder(
-                dl_mask_folder_param, data_folder,
+                dl_mask_folder_param, data_folder, mosaic_name,
             )
             dl_cloud_classes = _dl_cloud_classes_for(dl_mask_aggressiveness)
             arcpy.AddMessage(
@@ -8406,29 +8457,39 @@ class AsterMosaic(object):
                         dl_mask_folder,
                         _DL_CLOUD_MASK_FILENAME_FMT.format(sid=sid),
                     )
-                    # mtime-based cache invalidation. After Phase 4,
-                    # scene["files"]["B03N"] points at the deshifted
-                    # NIR in the coreg cache. If the cached DL mask
-                    # was written BEFORE the current deshifted band,
-                    # AROSICS state changed since the cache was made
-                    # (different shifts → different ground positions
-                    # for the same scene_id) and the cached mask is
-                    # mis-aligned with the input it would be applied
-                    # to. Re-run DL in that case. Same scene with
-                    # unchanged AROSICS keeps the deshifted band's
-                    # mtime stable across reruns and reuses cache.
-                    nir_path = (scene.get("files") or {}).get("B03N")
+                    # Fingerprint-based cache invalidation. The
+                    # previous mtime check would invalidate the DL
+                    # cache whenever AROSICS re-ran, even with
+                    # identical shifts (DESHIFTER touches every band
+                    # file regardless of result identity). Switching
+                    # to a content fingerprint derived from the coreg
+                    # meta.json (RMSE + shift vector + ref path)
+                    # reuses the cache across AROSICS reruns when the
+                    # shifts are unchanged; only invalidates when the
+                    # underlying co-registration result actually
+                    # differs. Fingerprint is written next to the DL
+                    # mask as ``<sid>_cloudmask.fingerprint.json``.
+                    coreg_meta_path = os.path.join(
+                        coreg_cache_dir, f"{sid}_meta.json",
+                    ) if coreg_cache_dir else None
+                    current_fp = _dl_cache_fingerprint(coreg_meta_path)
+                    fp_path = out_path + ".fingerprint.json"
+                    cached_fp = None
+                    if os.path.exists(fp_path):
+                        try:
+                            with open(fp_path, encoding="utf-8") as fh:
+                                cached_fp = json.load(fh).get("fp")
+                        except (OSError, ValueError):
+                            cached_fp = None
                     cache_fresh = (
                         os.path.exists(out_path)
-                        and nir_path
-                        and os.path.exists(nir_path)
-                        and os.path.getmtime(out_path)
-                            > os.path.getmtime(nir_path)
+                        and current_fp is not None
+                        and cached_fp == current_fp
                     )
                     if cache_fresh:
                         arcpy.AddMessage(_format_scene_log_line(
                             idx, total_dl, sid, 0.0,
-                            extras={"status": "skipped(exists)"},
+                            extras={"status": "skipped(cache)"},
                         ))
                         skipped_dl += 1
                         arcpy.SetProgressorPosition(idx)
@@ -8463,6 +8524,15 @@ class AsterMosaic(object):
                         cloud_pct, shadow_pct = _ocm_mask_class_fractions(
                             out_path,
                         )
+                        # Persist the coreg fingerprint alongside the
+                        # mask so future runs can validate cache
+                        # freshness without inspecting file mtimes.
+                        if current_fp is not None:
+                            try:
+                                with open(fp_path, "w", encoding="utf-8") as fh:
+                                    json.dump({"fp": current_fp}, fh)
+                            except OSError:
+                                pass
                         arcpy.AddMessage(_format_scene_log_line(
                             idx, total_dl, sid, elapsed,
                             extras={
@@ -8577,8 +8647,42 @@ class AsterMosaic(object):
                     "  Re-run with the same Output Mosaic Name to resume "
                     "from completed scene stacks."
                 )
+                # AROSICS coreg cache and DL cloud-mask cache are
+                # SIBLINGS of data_folder, so they persist beyond
+                # scratch deletion. Mention them explicitly when
+                # scratch is preserved so the user can spot all
+                # per-mosaic state on disk.
+                _coreg_dir = locals().get("coreg_cache_dir")
+                _dl_dir = locals().get("dl_mask_folder")
+                if _coreg_dir and os.path.isdir(_coreg_dir):
+                    arcpy.AddMessage(
+                        f"  AROSICS cache preserved at: {_coreg_dir}"
+                    )
+                if _dl_dir and os.path.isdir(_dl_dir):
+                    arcpy.AddMessage(
+                        f"  DL cloud-mask cache preserved at: {_dl_dir}"
+                    )
             else:
                 _cleanup_scratch_folder(scratch_dir)
+                # Match scratch lifecycle: with preserve_scratch=False
+                # the user expects no per-mosaic state to linger.
+                # AROSICS cache is per-mosaic and expensive (~38 GB
+                # for 254 VnirSwir scenes); DL cache is per-mosaic
+                # too. DL cache is more reusable so keep it across
+                # runs; the coreg cache is tied to one specific
+                # AROSICS state so cleaner to drop.
+                _coreg_dir = locals().get("coreg_cache_dir")
+                if _coreg_dir and os.path.isdir(_coreg_dir):
+                    try:
+                        shutil.rmtree(_coreg_dir)
+                        arcpy.AddMessage(
+                            f"  Removed AROSICS cache: {_coreg_dir}"
+                        )
+                    except OSError as _e:
+                        arcpy.AddWarning(
+                            f"  Could not remove AROSICS cache "
+                            f"{_coreg_dir}: {_e}"
+                        )
             if arcpy.CheckExtension("Spatial") == "Available":
                 arcpy.CheckInExtension("Spatial")
 
