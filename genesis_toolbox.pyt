@@ -1377,21 +1377,31 @@ def _dl_cloud_mask_infer_scene(red_path, green_path, nir_path,
     # atomic on the same filesystem; if it fails, the .tmp file
     # remains and the cache miss path re-runs cleanly on the next
     # invocation.
-    src = arcpy.Raster(red_path)
+    #
+    # The write uses rasterio, not arcpy.NumPyArrayToRaster +
+    # DefineProjection. On Windows the live arcpy.Raster object keeps
+    # a file lock on the .tmp.tif (and builds .vat.dbf/.vat.cpg/.aux
+    # sidecars for the discrete-valued mask), so the subsequent
+    # os.replace fails with WinError 32 "file in use by another
+    # process" on every scene - no mask ever lands. rasterio closes
+    # the dataset deterministically on context-manager exit, so the
+    # rename always succeeds. rasterio is a hard dependency of
+    # omnicloudmask (rasterio>=1.3), so it is guaranteed importable
+    # wherever this DL path runs. The geotransform + CRS are read
+    # straight from red_path, which is more precise than
+    # reconstructing them from extent + cell size.
+    import rasterio as _rio
     tmp_path = output_path + ".tmp.tif"
-    out_raster = arcpy.NumPyArrayToRaster(
-        mask,
-        lower_left_corner=arcpy.Point(
-            src.extent.XMin, src.extent.YMin,
-        ),
-        x_cell_size=src.meanCellWidth,
-        y_cell_size=src.meanCellHeight,
-        value_to_nodata=255,
+    with _rio.open(red_path) as _ref_ds:
+        profile = _ref_ds.profile.copy()
+    profile.update(
+        dtype="uint8",
+        count=1,
+        nodata=255,
+        compress="lzw",
     )
-    out_raster.save(tmp_path)
-    arcpy.management.DefineProjection(
-        tmp_path, src.spatialReference,
-    )
+    with _rio.open(tmp_path, "w", **profile) as _dst:
+        _dst.write(mask, 1)
     if os.path.exists(output_path):
         os.remove(output_path)
     os.replace(tmp_path, output_path)
