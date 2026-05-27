@@ -44,6 +44,7 @@ import json
 import os
 import gc
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1542,6 +1543,37 @@ def _resolve_dl_mask_folder(user_folder, data_folder, mosaic_name=None):
     )
 
 
+def _safe_rmtree_coreg_cache(path):
+    """Delete an AROSICS coreg cache directory with two defences.
+
+    1. Refuses to operate on a path whose basename doesn't start with
+       ``_aster_coreg_cache_``. Guards against a future regression in
+       _aster_coreg_cache_dir or its callers from accidentally
+       pointing this delete at the user's source data folder.
+    2. ``onerror`` handler clears read-only bits and retries. Pro's
+       ``.lock`` sidecars can be left over from a crashed run with
+       read-only flags; without the retry ``shutil.rmtree`` leaves a
+       half-deleted cache on Windows.
+    """
+    if not path or not os.path.isdir(path):
+        return
+    if not os.path.basename(path).startswith("_aster_coreg_cache_"):
+        raise RuntimeError(
+            f"Refusing rmtree on {path!r}: basename does not start with "
+            "'_aster_coreg_cache_' (this guard is a safety net against "
+            "a future regression that mis-routes the coreg cache path)."
+        )
+
+    def _on_error(func, target, exc_info):
+        try:
+            os.chmod(target, stat.S_IWRITE)
+            func(target)
+        except Exception:
+            raise
+
+    shutil.rmtree(path, onerror=_on_error)
+
+
 def _aster_coreg_cache_dir(data_folder, mosaic_name):
     """Resolve the AROSICS co-registration cache folder for an ASTER
     mosaic run.
@@ -1708,6 +1740,40 @@ def _resolve_arosics_python():
     )
 
 
+def _kill_process_tree(proc, wait_secs=5):
+    """Kill a worker subprocess INCLUDING its grandchildren.
+
+    ``Popen.terminate()`` on Windows maps to ``TerminateProcess``,
+    which only signals the immediate child. AROSICS internally uses
+    ``multiprocessing`` (and rasterio / GDAL can fork helper
+    processes), so grandchildren survive as orphans holding open
+    handles on the scratch and cache folders — the next batch's
+    cleanup then fails with ``WinError 32``. Using ``taskkill /T /F``
+    walks the process tree and kills everything by PID. Non-Windows
+    falls back to plain terminate + kill (Linux/macOS process groups
+    behave better but are outside this toolbox's supported platform).
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True, timeout=wait_secs,
+            )
+        else:
+            proc.terminate()
+            try:
+                proc.wait(timeout=wait_secs)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def _run_scene_batches(
     worker_kind, scenes, batch_size, scratch_dir,
     spec_extra=None, log_prefix="  ", worker_python_override=None,
@@ -1809,14 +1875,7 @@ def _run_scene_batches(
                         if (time.time() - silence_state["last_io"]
                                 > max_silent_secs):
                             silence_state["killed"] = True
-                            try:
-                                proc.terminate()
-                                proc.wait(timeout=5)
-                            except Exception:
-                                try:
-                                    proc.kill()
-                                except Exception:
-                                    pass
+                            _kill_process_tree(proc)
                             return
                 watchdog = threading.Thread(
                     target=_silence_watchdog, daemon=True,
@@ -1854,11 +1913,7 @@ def _run_scene_batches(
                             f"{log_prefix}  {stripped.lstrip()}"
                         )
                     if arcpy.env.isCancelled:
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
+                        _kill_process_tree(proc)
                         arcpy.AddWarning(
                             f"{log_prefix}Worker terminated mid-batch."
                         )
@@ -8710,7 +8765,7 @@ class AsterMosaic(object):
                 _coreg_dir = locals().get("coreg_cache_dir")
                 if _coreg_dir and os.path.isdir(_coreg_dir):
                     try:
-                        shutil.rmtree(_coreg_dir)
+                        _safe_rmtree_coreg_cache(_coreg_dir)
                         arcpy.AddMessage(
                             f"  Removed AROSICS cache: {_coreg_dir}"
                         )
@@ -8719,6 +8774,10 @@ class AsterMosaic(object):
                             f"  Could not remove AROSICS cache "
                             f"{_coreg_dir}: {_e}"
                         )
+                    except RuntimeError as _e:
+                        # _safe_rmtree_coreg_cache's defensive guard
+                        # tripped; surface loud + leave the cache.
+                        arcpy.AddError(f"  {_e}")
             if arcpy.CheckExtension("Spatial") == "Available":
                 arcpy.CheckInExtension("Spatial")
 
