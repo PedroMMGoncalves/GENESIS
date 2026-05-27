@@ -1521,28 +1521,20 @@ def _compute_aoi_overlap_pct(scene_band_path, aoi_sr, aoi_ext, aoi_area):
         return 0.0
 
 
-def _resolve_dl_mask_folder(user_folder, data_folder, mosaic_name=None):
+def _resolve_dl_mask_folder(user_folder, gdb_path, mosaic_name=None):
     """Resolve the DL cloud-mask cache folder. If the user provided one,
     use it; otherwise default to a per-mosaic
-    ``_dl_cloud_masks_coreg_<MOSAIC>/`` sibling of the source data
-    folder.
-
-    The ``_coreg`` suffix is intentional: DL inference now runs on
-    AROSICS-deshifted bands (Phase 5 reads from the coreg cache by
-    way of the rewritten scene_dict.files), so masks generated
-    against pre-AROSICS raw bands are not interchangeable with those
-    generated against deshifted bands. The per-mosaic suffix protects
-    against two concurrent AsterMosaic runs on the same data folder
-    with different mosaic names writing the same ``<sid>_cloudmask.tif``
-    (each run produces different deshifted inputs and therefore
-    different valid masks). Within-mosaic resume across runs is still
-    supported via the fingerprint-based cache check in Phase 5.
+    ``_dl_cloud_masks_coreg_<MOSAIC>/`` sibling of the output GDB
+    (i.e. next to the per-mosaic scratch). Same parent-folder
+    convention as ``_make_mosaic_scratch_dir`` and
+    ``_aster_coreg_cache_dir`` — keeps all derived per-mosaic
+    artefacts colocated and out of the raw-data folder.
     """
     if user_folder and user_folder.strip():
         return user_folder
     suffix = _sanitize_arcpy_name(mosaic_name) if mosaic_name else "default"
     return os.path.join(
-        os.path.dirname(data_folder),
+        os.path.dirname(os.path.normpath(gdb_path)),
         f"_dl_cloud_masks_coreg_{suffix or 'default'}",
     )
 
@@ -1578,21 +1570,21 @@ def _safe_rmtree_coreg_cache(path):
     shutil.rmtree(path, onerror=_on_error)
 
 
-def _aster_coreg_cache_dir(data_folder, mosaic_name):
+def _aster_coreg_cache_dir(gdb_path, mosaic_name):
     """Resolve the AROSICS co-registration cache folder for an ASTER
     mosaic run.
 
-    Sibling of ``data_folder``, suffixed with the mosaic name so each
-    run's deshifted scenes stay separated and the user can spot which
-    cache belongs to which output by name alone (same pattern as the
-    DL cloud-mask cache and the per-scene scratch). Auto-derived; not
-    user-configurable. Survives across re-runs of the same
-    ``mosaic_name`` for resume safety; deleted with the scratch
-    when ``preserve_scratch`` is off.
+    Sibling of the output GDB (next to the per-mosaic scratch and DL
+    mask cache), suffixed with the mosaic name so each run's
+    deshifted scenes stay separated and the user can spot which cache
+    belongs to which output by name alone. Auto-derived; not user-
+    configurable. Survives across re-runs of the same ``mosaic_name``
+    for resume safety; deleted with the scratch when
+    ``preserve_scratch`` is off.
 
     Layout:
 
-        <parent>/_aster_coreg_cache_<MOSAIC>/
+        <gdb_parent>/_aster_coreg_cache_<MOSAIC>/
             <scene_id>_B01.tif    (B01..B09 as available per scene)
             <scene_id>_B02.tif
             ...
@@ -1600,7 +1592,8 @@ def _aster_coreg_cache_dir(data_folder, mosaic_name):
     """
     safe = _sanitize_arcpy_name(mosaic_name) or "mosaic"
     return os.path.join(
-        os.path.dirname(data_folder), f"_aster_coreg_cache_{safe}",
+        os.path.dirname(os.path.normpath(gdb_path)),
+        f"_aster_coreg_cache_{safe}",
     )
 
 
@@ -2342,11 +2335,22 @@ def _worker_arosics_batch(spec):
             try:
                 CRL.calculate_spatial_shifts()
                 coreg_info = CRL.coreg_info
-                gcp_count = 0
-                try:
-                    gcp_count = int(len(CRL.tiepoint_grid.GDF))
-                except Exception:
-                    pass
+                # ``GCPList`` is the post-filter list AROSICS hands
+                # to its own deshifting logic — i.e. tie points that
+                # survived reliability, SSIM and RANSAC filters. This
+                # is the authoritative "valid GCPs" count for the
+                # min_gcps gate below.
+                #
+                # Historical note: this used ``tiepoint_grid.GDF``,
+                # which does not exist in arosics >= 1.13 and silently
+                # AttributeError'd inside a bare except. Every scene
+                # then took gcp_count=0 and was rejected by the
+                # min_gcps check, regardless of how well COREG_LOCAL
+                # had actually matched. The probe at
+                # tests/_arosics_deshifter_probe.py is the regression
+                # test: it reports the real GCPList count alongside
+                # the worker's reported value.
+                gcp_count = int(len(CRL.tiepoint_grid.GCPList))
                 # AROSICS internal bug: when RANSAC skips because of
                 # too-few valid tie points, ``mean_shifts_px`` keys
                 # ``x`` / ``y`` are present-but-None instead of
@@ -8630,10 +8634,11 @@ class AsterMosaic(object):
                 )
                 return None
 
-            # Cache directory — sibling of data_folder, mosaic-name
-            # suffixed. Same layout convention as the DL cloud-mask
-            # cache so the user can spot per-run artefacts at a glance.
-            coreg_cache_dir = _aster_coreg_cache_dir(data_folder, mosaic_name)
+            # Cache directory — sibling of the output GDB (next to
+            # the per-mosaic scratch and DL mask cache), mosaic-name
+            # suffixed. Same layout convention as those, so the user
+            # can spot per-run artefacts at a glance.
+            coreg_cache_dir = _aster_coreg_cache_dir(gdb_path, mosaic_name)
             os.makedirs(coreg_cache_dir, exist_ok=True)
             arcpy.AddMessage(f"  Coreg cache: {coreg_cache_dir}")
 
@@ -8817,7 +8822,7 @@ class AsterMosaic(object):
             # omnicloudmask must be installed in the active env (hard-
             # fail with install hint below if missing).
             dl_mask_folder = _resolve_dl_mask_folder(
-                dl_mask_folder_param, data_folder, mosaic_name,
+                dl_mask_folder_param, gdb_path, mosaic_name,
             )
             dl_cloud_classes = _dl_cloud_classes_for(dl_mask_aggressiveness)
             arcpy.AddMessage(
