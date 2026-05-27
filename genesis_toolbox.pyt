@@ -2126,8 +2126,22 @@ def _worker_arosics_batch(spec):
     arosics_ver = getattr(_arosics, "__version__", "unknown")
 
     # Helper for per-scene reprojection of the AOI bbox into the
-    # target's CRS. Imports are lazy so workers that don't need
+    # target's CRS, intersected with the target's actual raster
+    # bounds. Imports are lazy so workers that don't need
     # data_corners_tgt (no AOI) avoid the pyproj/rasterio cost.
+    #
+    # Intersection with target bounds is critical: AROSICS reads
+    # pixels at the data_corners_tgt corners during initialization;
+    # if any corner extends outside the target raster's extent it
+    # raises "Requested area is not completely within the input
+    # array for image to be shifted" before our outer except clause
+    # can produce a clean diagnostic. By clipping to the actual
+    # raster bounds we guarantee corners are always inside the
+    # target. When the AOI doesn't intersect the target's data
+    # area at all, returning None disables the constraint and
+    # AROSICS falls back to its native footprint detection, which
+    # will then assert "no spatial overlap" — caught cleanly by the
+    # outer AssertionError handler.
     def _aoi_corners_for_target(target_path, buffer_m=1000):
         if not (aoi_bbox and aoi_crs_wkt):
             return None
@@ -2141,14 +2155,13 @@ def _worker_arosics_batch(spec):
                 tgt_crs = src.crs
                 if tgt_crs is None:
                     return None
+                tgt_bounds = src.bounds  # (left, bottom, right, top)
             src_crs = CRS.from_wkt(aoi_crs_wkt)
             dst_crs = CRS.from_wkt(tgt_crs.to_wkt())
             if src_crs.equals(dst_crs):
                 minx, miny, maxx, maxy = aoi_bbox
             else:
                 tf = Transformer.from_crs(src_crs, dst_crs, always_xy=True)
-                # Transform all four corners to avoid axis-aligned
-                # distortion across non-trivial projections.
                 xs, ys = tf.transform(
                     [aoi_bbox[0], aoi_bbox[2], aoi_bbox[2], aoi_bbox[0]],
                     [aoi_bbox[1], aoi_bbox[1], aoi_bbox[3], aoi_bbox[3]],
@@ -2159,11 +2172,19 @@ def _worker_arosics_batch(spec):
             miny -= buffer_m
             maxx += buffer_m
             maxy += buffer_m
+            # Intersect with target's actual bounds — corners must be
+            # inside the target raster or AROSICS asserts out.
+            iminx = max(minx, tgt_bounds.left)
+            iminy = max(miny, tgt_bounds.bottom)
+            imaxx = min(maxx, tgt_bounds.right)
+            imaxy = min(maxy, tgt_bounds.top)
+            if iminx >= imaxx or iminy >= imaxy:
+                return None  # AOI and target don't overlap
             return [
-                (minx, maxy),  # UL
-                (maxx, maxy),  # UR
-                (maxx, miny),  # LR
-                (minx, miny),  # LL
+                (iminx, imaxy),  # UL
+                (imaxx, imaxy),  # UR
+                (imaxx, iminy),  # LR
+                (iminx, iminy),  # LL
             ]
         except Exception:
             return None
@@ -2238,11 +2259,41 @@ def _worker_arosics_batch(spec):
             CRL = COREG_LOCAL(**CRL_kwargs)
             try:
                 CRL.calculate_spatial_shifts()
+                coreg_info = CRL.coreg_info
+                gcp_count = 0
+                try:
+                    gcp_count = int(len(CRL.tiepoint_grid.GDF))
+                except Exception:
+                    pass
+                # AROSICS internal bug: when RANSAC skips because of
+                # too-few valid tie points, ``mean_shifts_px`` keys
+                # ``x`` / ``y`` are present-but-None instead of
+                # absent or zero, so a naive ``.get(k, 0.0)`` falls
+                # through to ``float(None) → TypeError`` that the
+                # outer except can't reach. Check explicitly and
+                # synthesise a TypeError to land in the normaliser.
+                _mean_shifts = coreg_info.get("mean_shifts_px") or {}
+                _x_val = _mean_shifts.get("x")
+                _y_val = _mean_shifts.get("y")
+                if _x_val is None or _y_val is None:
+                    raise TypeError(
+                        "mean_shifts_px contains None values "
+                        "(RANSAC failed; insufficient valid tie points)"
+                    )
+                mean_dx_px = float(_x_val)
+                mean_dy_px = float(_y_val)
+                cell_size_m = abs(float(
+                    coreg_info.get("updated geotransform",
+                                   [0, 15, 0, 0, 0, -15])[1]
+                )) or 15.0
+                rmse_m = ((mean_dx_px ** 2 + mean_dy_px ** 2) ** 0.5) * cell_size_m
             except AssertionError as e:
-                # AROSICS' own consistency check fired. The most
-                # common cause is no actual spatial overlap between
-                # AOI-bounded target footprint and the reference —
-                # i.e. the ASTER scene doesn't usefully cover Faial.
+                # AROSICS' own consistency check fired. Common causes:
+                # no actual overlap between target footprint and
+                # reference; data_corners_tgt exceeds target bounds;
+                # too few non-NoData pixels in the AOI to support a
+                # tie-point grid. All boil down to "this scene
+                # doesn't usefully cover Faial".
                 raise RuntimeError(
                     f"AROSICS reports no spatial overlap between this "
                     f"scene's AOI portion and the S2 reference. ASTER "
@@ -2250,11 +2301,8 @@ def _worker_arosics_batch(spec):
                     f"misses it. ({type(e).__name__}: {e})"
                 )
             except TypeError as e:
-                # AROSICS internal bug: when RANSAC skips because
-                # too few valid tie points, downstream code tries
-                # ``float(None)`` and raises TypeError. The
-                # diagnostic is identical to the MIN_GCPS gate
-                # below — there just aren't enough tie points.
+                # RANSAC-on-too-few-points failure (raised either by
+                # AROSICS internals or by the explicit check above).
                 raise RuntimeError(
                     f"AROSICS could not fit a RANSAC model "
                     f"(insufficient valid tie points). Likely the "
@@ -2262,21 +2310,6 @@ def _worker_arosics_batch(spec):
                     f"low-contrast to support phase correlation. "
                     f"({type(e).__name__}: {e})"
                 )
-            coreg_info = CRL.coreg_info
-
-            # GCP count + RMSE from the tiepoint grid. Fall back to
-            # zeros if AROSICS structure varies across versions.
-            gcp_count = 0
-            try:
-                gcp_count = int(len(CRL.tiepoint_grid.GDF))
-            except Exception:
-                pass
-            mean_dx_px = float(coreg_info.get("mean_shifts_px", {}).get("x", 0.0))
-            mean_dy_px = float(coreg_info.get("mean_shifts_px", {}).get("y", 0.0))
-            cell_size_m = abs(float(
-                coreg_info.get("updated geotransform", [0, 15, 0, 0, 0, -15])[1]
-            )) or 15.0
-            rmse_m = ((mean_dx_px ** 2 + mean_dy_px ** 2) ** 0.5) * cell_size_m
 
             # Refuse degenerate AROSICS matches. See min_gcps comment
             # at the top of the function for the rationale; raises
