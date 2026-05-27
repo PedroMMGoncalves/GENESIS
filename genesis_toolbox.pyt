@@ -1886,6 +1886,22 @@ def _run_scene_batches(
                     stripped = line.rstrip()
                     if not stripped:
                         continue
+                    # Filter high-volume GDAL/AROSICS internal chatter.
+                    # AROSICS' ``progress=False`` suppresses its own
+                    # status prints but NOT GDAL's internal warping
+                    # progress callback (~200 lines per scene at every
+                    # AROSICS step). The "Adapting the reference image
+                    # pixel grid..." line fires once per scene too.
+                    # Skipping these silently keeps the orchestrator
+                    # log readable while preserving real warnings (the
+                    # pyproj database warning, AROSICS row/column
+                    # rotation warning, and any FAIL events).
+                    lstripped = stripped.lstrip()
+                    if (lstripped.startswith("Warping progress")
+                            or lstripped.startswith(
+                                "Adapting the reference image"
+                            )):
+                        continue
                     try:
                         evt = json.loads(stripped)
                     except (ValueError, TypeError):
@@ -2046,6 +2062,32 @@ def _worker_arosics_batch(spec):
     into the geomedian at L1B accuracy because that mixes geolocation
     regimes in the same composite.
     """
+    # Ensure pyproj / GDAL can find the PROJ database BEFORE the
+    # arosics import below. Without PROJ_DATA / PROJ_LIB set, pyproj
+    # at import time prints ``unable to set PROJ database path`` and
+    # any subsequent EPSG lookup (including the S2 reference's CRS
+    # — e.g. EPSG:4326 for WGS84 references, or any Portuguese
+    # ETRS89/PT-TM06 code) fails with ``CRSError: Invalid projection:
+    # EPSG:N (Internal Proj Error: proj_create: no database context
+    # specified)`` — which kills every scene at AROSICS step 1 with
+    # a confusing message that has nothing to do with the actual
+    # bug.
+    #
+    # Discover proj.db dynamically from sys.exec_prefix so the fix is
+    # portable across env names, install drives, and OS conda layouts:
+    #   - Windows conda: <env>/Library/share/proj/proj.db
+    #   - Linux/macOS conda: <env>/share/proj/proj.db
+    # First location with proj.db wins; falls through silently if the
+    # database is already discoverable by pyproj's own auto-discovery.
+    for _candidate in (
+        os.path.join(sys.exec_prefix, "Library", "share", "proj"),
+        os.path.join(sys.exec_prefix, "share", "proj"),
+    ):
+        if os.path.isfile(os.path.join(_candidate, "proj.db")):
+            os.environ["PROJ_DATA"] = _candidate
+            os.environ["PROJ_LIB"] = _candidate
+            break
+
     from arosics import COREG_LOCAL, DESHIFTER
     import arosics as _arosics
 
