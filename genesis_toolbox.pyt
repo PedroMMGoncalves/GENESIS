@@ -1427,6 +1427,10 @@ def _dl_cache_fingerprint(coreg_meta_path):
             "gcp_count": meta.get("gcp_count"),
             "ref_nir_path": meta.get("ref_nir_path"),
             "arosics_version": meta.get("arosics_version"),
+            "aoi_buffer_m": meta.get("aoi_buffer_m"),
+            "arosics_window_size": meta.get("arosics_window_size"),
+            "arosics_grid_res": meta.get("arosics_grid_res"),
+            "arosics_min_reliability": meta.get("arosics_min_reliability"),
         },
         sort_keys=True,
     )
@@ -2140,73 +2144,106 @@ def _worker_arosics_batch(spec):
     # rejects the actual outliers. Tuneable via spec for users who
     # need stricter matching.
     min_reliability = int(spec.get("arosics_min_reliability", 30))
+    # AOI-buffered pre-clip parameters (V10 attempt 5 architecture).
+    # Pre-clipping each source ASTER band to (AOI bbox + buffer) in
+    # the source's CRS before AROSICS solves the structural problem
+    # the previous data_corners_tgt workaround tried to patch:
+    # multi-island ASTER scenes confuse AROSICS' largest-footprint
+    # heuristic, and small AOI areas inside large scenes don't get
+    # AROSICS' full attention. After pre-clip, AROSICS reads ~7x
+    # less data, all of it relevant. The buffer absorbs the
+    # geometric shifts AROSICS applies (max_shift_px * cell_size =
+    # 10 * 15m = 150m worst-case shift); 1km buffer is 6.7x that
+    # and also gives tie-point windows near the AOI edge full
+    # context. env.mask in Phase 7 (compositor) clips the final
+    # output back to the exact AOI polygon, so the buffer area
+    # disappears from the deliverable.
+    aoi_buffer_m = float(spec.get("aoi_buffer_m", 1000.0))
     aoi_bbox = spec.get("aoi_bbox")   # [minx, miny, maxx, maxy] in aoi_crs
     aoi_crs_wkt = spec.get("aoi_crs_wkt")
     arosics_ver = getattr(_arosics, "__version__", "unknown")
 
-    # Helper for per-scene reprojection of the AOI bbox into the
-    # target's CRS, intersected with the target's actual raster
-    # bounds. Imports are lazy so workers that don't need
-    # data_corners_tgt (no AOI) avoid the pyproj/rasterio cost.
+    # Per-scene-per-band pre-clipper. Reprojects the AOI bbox into
+    # the source band's CRS, applies the buffer, intersects with the
+    # source's actual raster bounds, and writes the clipped band to
+    # ``out_path`` via rasterio. This is the structural fix that
+    # replaces the previous data_corners_tgt workaround: by feeding
+    # AROSICS a small, focused, AOI-only target raster, AROSICS'
+    # natural footprint detection and tie-point search both work
+    # cleanly without the multi-island confusion that plagued the
+    # full-extent inputs.
     #
-    # Intersection with target bounds is critical: AROSICS reads
-    # pixels at the data_corners_tgt corners during initialization;
-    # if any corner extends outside the target raster's extent it
-    # raises "Requested area is not completely within the input
-    # array for image to be shifted" before our outer except clause
-    # can produce a clean diagnostic. By clipping to the actual
-    # raster bounds we guarantee corners are always inside the
-    # target. When the AOI doesn't intersect the target's data
-    # area at all, returning None disables the constraint and
-    # AROSICS falls back to its native footprint detection, which
-    # will then assert "no spatial overlap" — caught cleanly by the
-    # outer AssertionError handler.
-    def _aoi_corners_for_target(target_path, buffer_m=1000):
+    # Returns (output_path, was_clipped). When the AOI does not
+    # overlap the source raster at all, raises RuntimeError with a
+    # clean diagnostic message — the orchestrator drops the scene
+    # cleanly via the outer except block.
+    def _clip_band_to_aoi(src_path, out_path):
         if not (aoi_bbox and aoi_crs_wkt):
-            return None
+            return src_path, False   # No AOI → use source as-is
         try:
             import rasterio
+            from rasterio.windows import from_bounds
             from pyproj import CRS, Transformer
         except ImportError:
-            return None
-        try:
-            with rasterio.open(target_path) as src:
-                tgt_crs = src.crs
-                if tgt_crs is None:
-                    return None
-                tgt_bounds = src.bounds  # (left, bottom, right, top)
-            src_crs = CRS.from_wkt(aoi_crs_wkt)
-            dst_crs = CRS.from_wkt(tgt_crs.to_wkt())
-            if src_crs.equals(dst_crs):
-                minx, miny, maxx, maxy = aoi_bbox
-            else:
-                tf = Transformer.from_crs(src_crs, dst_crs, always_xy=True)
-                xs, ys = tf.transform(
-                    [aoi_bbox[0], aoi_bbox[2], aoi_bbox[2], aoi_bbox[0]],
-                    [aoi_bbox[1], aoi_bbox[1], aoi_bbox[3], aoi_bbox[3]],
+            return src_path, False
+        with rasterio.open(src_path) as src:
+            src_crs = src.crs
+            if src_crs is None:
+                return src_path, False
+            src_bounds = src.bounds
+        # Reproject AOI bbox to source CRS (transform all 4 corners
+        # to avoid axis-aligned distortion across non-trivial CRSes).
+        aoi_crs = CRS.from_wkt(aoi_crs_wkt)
+        dst_crs = CRS.from_wkt(src_crs.to_wkt())
+        if aoi_crs.equals(dst_crs):
+            minx, miny, maxx, maxy = aoi_bbox
+        else:
+            tf = Transformer.from_crs(aoi_crs, dst_crs, always_xy=True)
+            xs, ys = tf.transform(
+                [aoi_bbox[0], aoi_bbox[2], aoi_bbox[2], aoi_bbox[0]],
+                [aoi_bbox[1], aoi_bbox[1], aoi_bbox[3], aoi_bbox[3]],
+            )
+            minx, maxx = min(xs), max(xs)
+            miny, maxy = min(ys), max(ys)
+        # Apply buffer
+        minx -= aoi_buffer_m
+        miny -= aoi_buffer_m
+        maxx += aoi_buffer_m
+        maxy += aoi_buffer_m
+        # Intersect with source bounds (clip window must be inside
+        # the source raster or rasterio.read returns empty / errors)
+        iminx = max(minx, src_bounds.left)
+        iminy = max(miny, src_bounds.bottom)
+        imaxx = min(maxx, src_bounds.right)
+        imaxy = min(maxy, src_bounds.top)
+        if iminx >= imaxx or iminy >= imaxy:
+            raise RuntimeError(
+                f"AOI (+{aoi_buffer_m:.0f}m buffer) does not overlap "
+                f"source band {os.path.basename(src_path)!r}; scene "
+                "does not cover Faial."
+            )
+        # Read clipped window and write to out_path
+        with rasterio.open(src_path) as src:
+            window = from_bounds(
+                iminx, iminy, imaxx, imaxy, src.transform,
+            )
+            data = src.read(window=window)
+            if data.size == 0:
+                raise RuntimeError(
+                    f"Empty clip for {os.path.basename(src_path)!r}; "
+                    "AOI window contains no source pixels."
                 )
-                minx, maxx = min(xs), max(xs)
-                miny, maxy = min(ys), max(ys)
-            minx -= buffer_m
-            miny -= buffer_m
-            maxx += buffer_m
-            maxy += buffer_m
-            # Intersect with target's actual bounds — corners must be
-            # inside the target raster or AROSICS asserts out.
-            iminx = max(minx, tgt_bounds.left)
-            iminy = max(miny, tgt_bounds.bottom)
-            imaxx = min(maxx, tgt_bounds.right)
-            imaxy = min(maxy, tgt_bounds.top)
-            if iminx >= imaxx or iminy >= imaxy:
-                return None  # AOI and target don't overlap
-            return [
-                (iminx, imaxy),  # UL
-                (imaxx, imaxy),  # UR
-                (imaxx, iminy),  # LR
-                (iminx, iminy),  # LL
-            ]
-        except Exception:
-            return None
+            new_transform = src.window_transform(window)
+            profile = src.profile.copy()
+            profile.update({
+                "height": data.shape[1],
+                "width": data.shape[2],
+                "transform": new_transform,
+                "count": data.shape[0],
+            })
+            with rasterio.open(out_path, "w", **profile) as dst:
+                dst.write(data)
+        return out_path, True
 
     for scene in spec["scenes"]:
         sid = scene.get("scene_id") or "?"
@@ -2248,21 +2285,27 @@ def _worker_arosics_batch(spec):
                 raise RuntimeError(
                     f"Scene {sid} missing B03N NIR for AROSICS matching"
                 )
-            nir_path = band_files["B03N"]
+            # Pre-clip every source band to (AOI bbox + buffer) in
+            # the band's CRS. Replaces the previous data_corners_tgt
+            # workaround with the real fix: AROSICS reads ~7× less
+            # data (only Faial+buffer instead of full 60×60 km
+            # scene), the multi-island confusion disappears at the
+            # source (no other islands in the cropped raster), and
+            # tie-point search runs on focused relevant pixels.
+            # Intermediate ``*_clip.tif`` files in the cache get
+            # cleaned after DESHIFTER writes the final outputs.
+            clipped_files = {}
+            for band_name, src_path in band_files.items():
+                clip_intermediate = os.path.join(
+                    cache_dir, f"{sid}_{band_name}_clip.tif",
+                )
+                clipped_path, _ = _clip_band_to_aoi(
+                    src_path, clip_intermediate,
+                )
+                clipped_files[band_name] = clipped_path
+            nir_path = clipped_files["B03N"]
             proj_dir = os.path.join(cache_dir, f"{sid}_proj")
-
-            # Constrain AROSICS to the AOI portion of the target via
-            # data_corners_tgt. Without this, AROSICS auto-detects
-            # the largest connected non-NoData component of the
-            # ASTER scene as the "valid data area" — which for
-            # scenes spanning multiple Azores islands ends up being
-            # Pico / Terceira (the larger islands), not Faial.
-            # Phase correlation then runs against the wrong island
-            # and asserts "no spatial overlap" or returns nonsense
-            # shifts. The bbox is buffered by 1km so tie-point
-            # windows near the AOI edge have valid pixels to match.
-            data_corners_tgt = _aoi_corners_for_target(nir_path)
-            CRL_kwargs = dict(
+            CRL = COREG_LOCAL(
                 im_ref=ref_nir_path,
                 im_tgt=nir_path,
                 grid_res=grid_res,
@@ -2274,9 +2317,6 @@ def _worker_arosics_batch(spec):
                 progress=False,
                 CPUs=None,   # AROSICS picks all cores
             )
-            if data_corners_tgt is not None:
-                CRL_kwargs["data_corners_tgt"] = data_corners_tgt
-            CRL = COREG_LOCAL(**CRL_kwargs)
             try:
                 CRL.calculate_spatial_shifts()
                 coreg_info = CRL.coreg_info
@@ -2345,19 +2385,40 @@ def _worker_arosics_batch(spec):
                     "the S2 NIR reference. Scene dropped from the run."
                 )
 
-            # Apply the same deformation to every band file.
-            for band_name, src_path in band_files.items():
+            # Apply the same deformation to every clipped band. Each
+            # DESHIFTER call reads the ``_clip.tif`` intermediate
+            # and writes the final deshifted+clipped ``<sid>_<band>.tif``
+            # to the cache. Downstream phases consume the latter via
+            # the scene_dict.files rewrite in the orchestrator.
+            for band_name, clipped_path in clipped_files.items():
                 out_path = os.path.join(
                     cache_dir, f"{sid}_{band_name}.tif",
                 )
                 DSH = DESHIFTER(
-                    src_path, coreg_info,
+                    clipped_path, coreg_info,
                     path_out=out_path,
                     fmt_out="GTiff",
                     q=True,
                     progress=False,
                 )
                 DSH.correct_shifts()
+            # Remove the _clip intermediates now that DESHIFTER has
+            # written the final outputs. Keeps the cache to a single
+            # canonical file per band per scene.
+            for band_name in clipped_files:
+                clip_intermediate = os.path.join(
+                    cache_dir, f"{sid}_{band_name}_clip.tif",
+                )
+                # Only delete if it actually IS the intermediate, not
+                # the source path (when no clip was performed because
+                # AOI bbox / CRS info was missing the helper returned
+                # the source path unchanged).
+                if (clipped_files.get(band_name) == clip_intermediate
+                        and os.path.exists(clip_intermediate)):
+                    try:
+                        os.remove(clip_intermediate)
+                    except OSError:
+                        pass
 
             meta_out = {
                 "scene_id": sid,
@@ -2367,7 +2428,11 @@ def _worker_arosics_batch(spec):
                 "mean_dy_px": mean_dy_px,
                 "gcp_count": gcp_count,
                 "ref_nir_path": ref_nir_path,
+                "aoi_buffer_m": aoi_buffer_m,
                 "arosics_version": arosics_ver,
+                "arosics_window_size": window_size,
+                "arosics_grid_res": grid_res,
+                "arosics_min_reliability": min_reliability,
                 "bands": sorted(band_files),
             }
             with open(meta_path, "w", encoding="utf-8") as fh:
@@ -8605,10 +8670,19 @@ class AsterMosaic(object):
                 spec_extra={
                     "coreg_cache_dir": coreg_cache_dir,
                     "ref_nir_path": ref_nir_path,
-                    "arosics_grid_res": 50,
-                    "arosics_window_size": 128,
+                    # Smaller window + tighter grid: with the new
+                    # pre-clip the target is only ~23x16 km (Faial +
+                    # 1km buffer). At window_size=128 (1.9km tile)
+                    # we'd only fit ~10x7 tiles inside the AOI; at
+                    # window_size=64 (960m tile) we fit ~24x17 =
+                    # ~4x more tie-point candidates per scene. Grid
+                    # density follows window size; grid_res=25 (375m)
+                    # quadruples grid density vs the old 50.
+                    "arosics_grid_res": 25,
+                    "arosics_window_size": 64,
                     "arosics_max_shift_px": 10,
                     "arosics_min_reliability": 30,
+                    "aoi_buffer_m": 1000.0,
                     "aoi_bbox": aoi_bbox_for_spec,
                     "aoi_crs_wkt": aoi_crs_wkt_for_spec,
                 },
