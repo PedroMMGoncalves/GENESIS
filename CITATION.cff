@@ -52,12 +52,9 @@ keywords:
   - "groundwater-dependent vegetation"
   - "phreatophyte mapping"
 identifiers:
-  # After minting the Zenodo DOI for your first release, paste the
-  # concept DOI here (the one that always points to the latest version).
-  # Format: 10.5281/zenodo.<numeric_id>
   - type: doi
-    value: "10.5281/zenodo.PLACEHOLDER"
-    description: "Concept DOI (latest release, via Zenodo)"
+    value: "10.5281/zenodo.20430828"
+    description: "v1.0 release DOI (via Zenodo)"
 
 references:
   - type: website

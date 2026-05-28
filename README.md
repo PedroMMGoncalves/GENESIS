@@ -5,14 +5,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![ArcGIS Pro](https://img.shields.io/badge/ArcGIS_Pro-3.0%2B-green.svg)](https://www.esri.com/en-us/arcgis/products/arcgis-pro/overview)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org)
-[![DOI](https://img.shields.io/badge/DOI-pending-lightgrey.svg)](https://zenodo.org/)
-<!-- DOI badge: enable Zenodo's GitHub integration (Zenodo → GitHub
-     Settings → flip the GENESIS repo toggle ON), then publish a
-     GitHub release tagged v1.0. Zenodo mints a concept DOI on first
-     release. Replace the badge above with:
-       [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.NNNNNNNN.svg)](https://doi.org/10.5281/zenodo.NNNNNNNN)
-     and update CITATION.cff's identifiers.value field to the same
-     concept DOI. -->
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20430828.svg)](https://doi.org/10.5281/zenodo.20430828)
 
 GENESIS is an ArcGIS Pro toolbox for analysing **Sentinel-2 L2A**,
 **Landsat 8/9 Collection 2 Level 2**, and **ASTER L2 (AST_07XT)** imagery.
