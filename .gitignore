@@ -31,12 +31,5 @@ Thumbs.db
 *~
 
 # Editor / tooling local config — user-specific, not part of the repo
-.claude/
 .vscode/
 .idea/
-
-# Author-side implementation contracts handed to Claude as design memos.
-# Kept locally so the public artefact stays focused on the tool itself
-# (genesis_toolbox.pyt + README + CITATION + LICENSE) and contributors do
-# not mistake an in-progress design doc for the project's actual direction.
-CLAUDE_*.md
