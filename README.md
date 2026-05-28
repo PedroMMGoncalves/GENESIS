@@ -6,8 +6,13 @@
 [![ArcGIS Pro](https://img.shields.io/badge/ArcGIS_Pro-3.0%2B-green.svg)](https://www.esri.com/en-us/arcgis/products/arcgis-pro/overview)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org)
 [![DOI](https://img.shields.io/badge/DOI-pending-lightgrey.svg)](https://zenodo.org/)
-<!-- Once the Zenodo DOI is minted, replace the badge above with:
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.PLACEHOLDER.svg)](https://doi.org/10.5281/zenodo.PLACEHOLDER) -->
+<!-- DOI badge: enable Zenodo's GitHub integration (Zenodo → GitHub
+     Settings → flip the GENESIS repo toggle ON), then publish a
+     GitHub release tagged v1.0. Zenodo mints a concept DOI on first
+     release. Replace the badge above with:
+       [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.NNNNNNNN.svg)](https://doi.org/10.5281/zenodo.NNNNNNNN)
+     and update CITATION.cff's identifiers.value field to the same
+     concept DOI. -->
 
 GENESIS is an ArcGIS Pro toolbox for analysing **Sentinel-2 L2A**,
 **Landsat 8/9 Collection 2 Level 2**, and **ASTER L2 (AST_07XT)** imagery.
@@ -170,6 +175,21 @@ This toolbox was developed to support the author's analytical work on the **GENE
 The author's contribution within GENESIS is the production of cloud-removed multisensor satellite mosaics and the organisation of derived information (spectral indices and statistical transformations were added as analytically useful extensions) for the [Faial demonstrator site](https://genesisnbs.eu/faial/). The Faial demonstrator is designing and building an aquifer storage and recovery system, using excess potable water accumulated in existing earth dams/watering ponds, to re-establish the freshwater supply capacity of *Furo das Cancelas* — the sole water source for ~3,000 inhabitants — and to counter saltwater intrusion in the coastal aquifer.
 
 > Funded by the European Union. Views and opinions expressed are however those of the author(s) only and do not necessarily reflect those of the European Union or CINEA. Neither the European Union nor the granting authority can be held responsible for them.
+
+### Troubleshooting
+
+User-actionable errors most commonly hit on Tool 03 (ASTER); the other tools have very few moving parts and almost never fail except on input-data issues.
+
+| Error / symptom | Likely cause | Resolution |
+| --- | --- | --- |
+| `ImportError: No module named 'omnicloudmask'` at Phase 5 | OmniCloudMask not installed in the active env | In Pro's Python Command Prompt: `pip install omnicloudmask`. Confirm the active env is your Pro-cloned env, not the read-only default. |
+| `ImportError: No module named 'arosics'` or `Could not locate a Python env with AROSICS installed` | AROSICS not installed where the toolbox looks | Single-env install: `pip install arosics rasterio` in Pro's Package Manager. Two-env fallback: `conda create -n arosics_env -c conda-forge arosics rasterio` then set `GENESIS_AROSICS_PYTHON=<that env's python.exe>` as a user environment variable. See § "Tool 03 additional dependencies". |
+| `RuntimeError: Could not load PyTorch / CUDA` at Phase 5 | Deep Learning Frameworks MSI not installed or version mismatched to Pro | Install [Esri Deep Learning Frameworks](https://github.com/Esri/deep-learning-frameworks) matching your Pro release. CPU-only PyTorch works but is ~10-100× slower. |
+| Phase 5 OOM (out-of-memory) on GPU | OmniCloudMask inference exceeds GPU VRAM for very large scene grids | Either run on a GPU with ≥6 GB VRAM, or fall back to CPU inference (slow but works). Bigger AOIs may need a Pro restart between heavy runs to release CUDA memory. |
+| `AROSICS reports no spatial overlap` per-scene failure | The scene's footprint catches the AOI only at a corner, or barely | Expected for marginal-coverage scenes; the run continues with surviving scenes. Phase 4's tail summary lists every per-scene failure. |
+| `AROSICS could not fit a RANSAC model` per-scene failure | Too few valid tie points (sparse high-contrast features in the AOI) | Expected on small-AOI cloud-heavy scenes; not a bug. Lower `min_reliability` in `_worker_arosics_batch` to recover more tie points if needed (advanced). |
+| `DONE — 0 mosaic(s) written` with no per-product error | Almost always a Phase 8 (compositor) silent failure caught by `except Exception: return None` | On versions before [`0298924`](https://github.com/PedroMMGoncalves/GENESIS/commit/0298924): Per-band median on a GDB output path hit `ERROR 010240 FGDBR`. On versions before [`4cfaad8`](https://github.com/PedroMMGoncalves/GENESIS/commit/4cfaad8): cross-product cleanup deleted the other product's cleaner output. Both fixed in the current release; if you see this on 1.0+, file an issue with the log. |
+| Memory pressure when running all three mosaic tools in parallel | Each tool defaults to `subprocess_batch_size=10`; three tools = up to 30 concurrent worker python.exe processes | Drop `Subprocess Batch Size` to 5 in one or more tools, or stagger the launches. |
 
 ### References
 

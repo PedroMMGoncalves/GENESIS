@@ -1,0 +1,20 @@
+# Tool 03 (ASTER) additional dependencies.
+#
+# Install into a clone of arcgispro-py3 made active via ArcGIS Pro's
+# Package Manager. From Pro's Python Command Prompt:
+#
+#   pip install -r requirements-tool03.txt
+#
+# Tools 01, 02, 04, 05, 06, 07 have no dependencies beyond the
+# ArcGIS Pro base (numpy/scipy/matplotlib bundled). Do NOT install
+# this file into Pro's read-only default arcgispro-py3 env - use the
+# clone.
+#
+# PyTorch + torchvision are NOT pip-installed here because Esri's
+# Deep Learning Frameworks MSI is the supported install path on
+# Windows (handles the CUDA toolkit matching). See README §
+# "Tool 03 (ASTER) additional dependencies" for that step.
+
+omnicloudmask>=1.0
+arosics>=1.13
+rasterio>=1.3

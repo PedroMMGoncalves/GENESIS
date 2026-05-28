@@ -26,8 +26,8 @@ abstract: >
   demonstrator site — an aquifer storage and recovery study at
   Furo das Cancelas targeting saltwater intrusion mitigation.
 type: software
-version: "2.0.0"
-date-released: "2026-05-22"
+version: "1.0"
+date-released: "2026-05-28"
 license: Apache-2.0
 authors:
   - family-names: "Gonçalves"

@@ -86,7 +86,7 @@ from arcpy.management import CompositeBands
 arcpy.SetLogHistory(False)
 arcpy.SetLogMetadata(False)
 
-TOOLBOX_VERSION = "1.0.0-phase3"
+TOOLBOX_VERSION = "1.0"
 
 
 # ---------------------------------------------------------------------------
