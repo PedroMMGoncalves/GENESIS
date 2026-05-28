@@ -1037,6 +1037,22 @@ def _cleanup_per_scene_intermediates(scratch_dir, scene_id, keep_basenames):
     retry pass. Safe under ``preserve_scratch=True`` because resume only
     inspects the kept files.
 
+    Cross-product safety: ``AsterMosaic`` runs the same scene through
+    both VNIR-only and VNIR+SWIR pipelines in one run (pre-Apr-2008
+    scenes are eligible for both). Each product calls this cleanup
+    with its OWN ``stack_suffix`` in ``keep_basenames``. A literal
+    "delete everything not in keep_basenames" then has the second
+    product wipe out the first product's stack + cleaner output for
+    that scene, producing the ``DONE - 0 mosaic(s) written`` silent
+    failure observed on V14 (with the related Per-band-median
+    GDB-path bug swallowing the resulting Phase 8 RaisedException).
+    Defence: preserve any ``{scene_id}_stack*`` file unconditionally
+    so both product variants and their ``_clean.tif`` / ``.complete``
+    / sidecar siblings all survive whichever product runs last.
+    Single-product callers (Sentinel-2, Landsat) only ever produce
+    one stack family per scene, so the broader preserve is a no-op
+    for them.
+
     Scope: scratch directory hygiene. The cleanup keeps the per-scene
     file count flat at ~2 (stack + marker) instead of ~24, which
     bounds disk usage on long runs and makes end-of-run cleanup
@@ -1052,8 +1068,16 @@ def _cleanup_per_scene_intermediates(scratch_dir, scene_id, keep_basenames):
     if not scratch_dir or not scene_id or not os.path.isdir(scratch_dir):
         return
     keep_paths = {os.path.join(scratch_dir, b) for b in keep_basenames}
+    stack_prefix = f"{scene_id}_stack"
     for path in glob.glob(os.path.join(scratch_dir, scene_id + "*")):
         if path in keep_paths:
+            continue
+        # Cross-product preserve: any other stack-family file for this
+        # scene is a different product's final output, its cleaner
+        # output (``_clean.tif``), its resume marker, or a sidecar.
+        # The current product does not own these and must not delete
+        # them.
+        if os.path.basename(path).startswith(stack_prefix):
             continue
         try:
             if os.path.isdir(path):
