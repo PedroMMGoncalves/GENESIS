@@ -2762,7 +2762,8 @@ _GEOMETRIC_MEDIAN_EPSILON = 0.001
 _GEOMETRIC_MEDIAN_MAX_ITER = 20
 
 
-def _save_geomedian_clean(median_raster, output_path):
+def _save_geomedian_clean(median_raster, output_path,
+                          reflectance_bounded=True):
     """Save a GeometricMedian output with placeholder leak cleanup.
 
     arcpy.ia.GeometricMedian writes float32 -MAX (-3.4e38) and other
@@ -2774,18 +2775,36 @@ def _save_geomedian_clean(median_raster, output_path):
     renderings (e.g. uniform green when only one band escapes the
     leak).
 
-    Surface reflectance is physically bounded to [0, ~1.5]. Mark
-    anything outside [-0.01, 1.5] as NoData before save. The
+    When ``reflectance_bounded=True`` (the default, used by S2 and
+    ASTER): surface reflectance is physically bounded to [0, ~1.5].
+    Mark anything outside [-0.01, 1.5] as NoData before save. The
     -0.01 lower bound preserves legitimate near-zero shadow pixels
     that may carry a small negative noise offset from atmospheric
     correction; values outside that are either placeholder leaks
-    (-3.4e38) or partially-converged GM outputs (~-1e29).
+    (-3.4e38) or partially-converged GM outputs (~-1e29). This
+    assumes the input rasters have already been scaled to [0, 1]
+    reflectance (S2 multiplies by 0.0001, ASTER by 0.001 during
+    ingestion).
+
+    When ``reflectance_bounded=False`` (used by Landsat): the per-
+    scene composites stay in their native Collection 2 uint16
+    encoding (0-65535, representing scaled surface reflectance via
+    ``value * 0.0000275 - 0.2``); the [-0.01, 1.5] bounds would mark
+    every valid pixel as NoData and the saved output would be all
+    zeros. The float32 -MAX placeholder cannot fit in uint16 anyway,
+    so the cleanup is moot - any placeholder value either saturates
+    to the uint16 NoData sentinel during the cast or never appears
+    because GeometricMedian on integer inputs returns integer
+    outputs. Save directly without SetNull.
     """
-    cleaned = arcpy.sa.SetNull(
-        (median_raster < -0.01) | (median_raster > 1.5),
-        median_raster,
-    )
-    cleaned.save(output_path)
+    if reflectance_bounded:
+        cleaned = arcpy.sa.SetNull(
+            (median_raster < -0.01) | (median_raster > 1.5),
+            median_raster,
+        )
+        cleaned.save(output_path)
+    else:
+        median_raster.save(output_path)
 
 # ASTER per-scene multi-spectral cloud test. The AST_07XT QA Data Plane
 # only flags SR retrieval status (not clouds), so the per-scene path
@@ -5345,7 +5364,16 @@ class LandsatMosaic(object):
                         extent_type="UnionOf",
                         cellsize_type="FirstOf",
                     )
-                    _save_geomedian_clean(geomedian, output_path)
+                    # reflectance_bounded=False: Landsat C2 L2 SR
+                    # composites stay in raw uint16 (0-65535); the
+                    # default [-0.01, 1.5] reflectance bounds would
+                    # flag every valid pixel as NoData. See
+                    # _save_geomedian_clean docstring for the full
+                    # sensor-scale rationale.
+                    _save_geomedian_clean(
+                        geomedian, output_path,
+                        reflectance_bounded=False,
+                    )
                 arcpy.ResetProgressor()
             arcpy.AddMessage(
                 f"  ✓ {compositor_tag} complete in {ph.elapsed:.1f}s "
@@ -5932,6 +5960,24 @@ class LandsatMosaic(object):
             from arcpy.sa import ExtractByMask
             extracted = ExtractByMask(mosaic_path, mask_feature)
             extracted.save(masked_path)
+
+            # Set nodata=0 on every band + rebuild statistics so
+            # Pro's auto-stretch ignores the out-of-AOI fill pixels
+            # rather than squeezing the real reflectance range against
+            # them. Without this, two identical Landsat outputs with
+            # different sentinel fills (0 vs 65535) render with
+            # dramatically different apparent contrast even though
+            # the underlying data is byte-identical - a Pro auto-
+            # stretch artefact, not a data-quality issue. Verified
+            # against the V07 / V08 pixel-level diff: outside-AOI
+            # sentinel value alone changed the visible composite
+            # from washed-out uniform-green to honest terrain detail.
+            n_bands = int(arcpy.Raster(masked_path).bandCount)
+            arcpy.management.SetRasterProperties(
+                masked_path,
+                nodata=[[i + 1, 0] for i in range(n_bands)],
+            )
+            arcpy.management.CalculateStatistics(masked_path)
 
             arcpy.AddMessage(f"Masked mosaic saved as: {masked_path}")
             return masked_path
