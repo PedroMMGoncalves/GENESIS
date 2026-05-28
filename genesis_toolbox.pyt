@@ -1290,6 +1290,80 @@ def _per_band_median_composite(stacks, output_path, scratch_dir):
                 pass
 
 
+def _per_band_percentile_composite(stacks, output_path, scratch_dir,
+                                    percentile_value):
+    """Per-band, per-pixel percentile across a list of multi-band scene
+    stacks. Useful when the temporal median is biased toward residual
+    cloud / haze that the upstream cloud mask did not catch: at a
+    pixel where cloud is the modal observation, the 50th-percentile
+    median picks a cloud value; the 25th-percentile (default) picks
+    from the darker quartile, biasing away from bright cloud.
+
+    Mechanics mirror ``_per_band_median_composite``: for each band
+    index N, extract band N from every input stack, reduce via
+    ``arcpy.sa.CellStatistics(..., PERCENTILE, ...)`` with
+    ``ignore_nodata="DATA"`` and ``percentile_interpolation_type=
+    "LINEAR"`` (matches ``numpy.nanpercentile(method='linear')`` to
+    floating-point precision; verified by a synthetic test), then
+    combine per-band rasters via ``CompositeBands`` into the final
+    multi-band output. Per-band intermediates land in ``scratch_dir``
+    as ``_per_band_p{NN}_b{NN}.tif`` and are deleted at the end.
+
+    ``percentile_value`` is an integer 5-50 (see tool UI range). 25
+    is the recommended default for cloud-bias reduction. Values
+    above 50 don't help cloud bias since cloud is bright in
+    visible/NIR; the tool UI clamps the range accordingly.
+
+    Spectral-consistency caveat: as with per-band median, a pixel's
+    band-1 value may come from a different scene than its band-2
+    value. Acceptable for visual mosaicking and per-band indices;
+    less so for analyses that pull on cross-band ratios from the
+    same observation (mineral mapping).
+
+    Combines well with the temporal outlier cleaner: cleaner trims
+    extreme dark outliers (deep cloud shadow) before percentile is
+    computed, so a low percentile biases toward "clean dark ground"
+    rather than "deep shadow noise". Recommended pairing.
+
+    Caveat shared with ``_per_band_median_composite``: ``scratch_dir``
+    must be a real filesystem folder, NOT a File Geodatabase (arcpy
+    rejects intermediate ``.tif`` paths inside ``.gdb`` as FGDBR).
+    """
+    if not stacks:
+        raise ValueError(
+            "Empty stacks list passed to _per_band_percentile_composite"
+        )
+    p = int(percentile_value)
+    n_bands = int(arcpy.Raster(stacks[0]).bandCount)
+    per_band_paths = []
+    try:
+        for band_idx in range(1, n_bands + 1):
+            band_extracts = [
+                arcpy.ia.ExtractBand(s, [band_idx]) for s in stacks
+            ]
+            per_band_p = arcpy.sa.CellStatistics(
+                band_extracts,
+                statistics_type="PERCENTILE",
+                ignore_nodata="DATA",
+                percentile_value=p,
+                percentile_interpolation_type="LINEAR",
+            )
+            out_band_path = os.path.join(
+                scratch_dir,
+                f"_per_band_p{p:02d}_b{band_idx:02d}.tif",
+            )
+            per_band_p.save(out_band_path)
+            per_band_paths.append(out_band_path)
+        arcpy.management.CompositeBands(per_band_paths, output_path)
+    finally:
+        for q in per_band_paths:
+            try:
+                if os.path.exists(q):
+                    os.remove(q)
+            except OSError:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # Deep-learning cloud mask helpers (OmniCloudMask)
 # ---------------------------------------------------------------------------
@@ -4707,8 +4781,71 @@ class LandsatMosaic(object):
         )
         preserve_scratch.value = False
 
+        # Compositor — Phase 4 reducer over the per-scene stack.
+        # GeometricMedian (default, behaviour-preserving) computes
+        # the L1 multivariate median; Per-band median reduces band-
+        # by-band via arcpy.sa.CellStatistics with explicit
+        # ignore_nodata="DATA"; Per-band percentile (p25 default)
+        # biases toward the darker quartile, useful when residual
+        # cloud / haze that QA_PIXEL did not catch drags the median
+        # upward at persistently cloudy pixels. The two Per-band
+        # reducers have a spectral-consistency caveat: a pixel's
+        # band-1 value may come from a different scene than its
+        # band-2. Output name unchanged across compositor choices
+        # (existing `<mosaic_name>_Geomedian` retained for default;
+        # users pick distinct mosaic_name for A/B between
+        # compositors).
+        compositor = arcpy.Parameter(
+            displayName=(
+                "Compositor (advanced; the per-pixel reducer over the "
+                "cleaned multi-scene stack. GeometricMedian (default) "
+                "computes the L1-median across the multi-band spectral "
+                "signature, preserving same-scene consistency across "
+                "bands. Per-band median reduces each band independently "
+                "via arcpy.sa.CellStatistics with explicit ignore_nodata "
+                "semantics. Per-band percentile (p25 default) is the "
+                "per-band reducer at a lower percentile - useful when "
+                "residual cloud / haze biases the median upward at "
+                "persistently cloudy pixels; p25 biases toward the "
+                "darker quartile and discards bright cloud-contaminated "
+                "observations."
+            ),
+            name="compositor",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        compositor.filter.list = [
+            "GeometricMedian (default)",
+            "Per-band median",
+            "Per-band percentile",
+        ]
+        compositor.value = "GeometricMedian (default)"
+
+        percentile_value = arcpy.Parameter(
+            displayName=(
+                "Per-band percentile value (5-50; only used when "
+                "Compositor is set to Per-band percentile). Default 25 "
+                "biases toward the darker quartile at each pixel, "
+                "discarding bright cloud-contaminated observations. "
+                "Lower values bias more aggressively but risk picking "
+                "deep cloud shadow; values above 50 return to median-"
+                "like behaviour and are intentionally not allowed."
+            ),
+            name="percentile_value",
+            datatype="GPLong",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        percentile_value.value = 25
+        percentile_value.filter.type = "Range"
+        percentile_value.filter.list = [5, 50]
+
         params = [gdb, mosaic_name, data_folder, region, time_type,
-                 year, month, season, mask, save_stats, preserve_scratch]
+                 year, month, season, mask, save_stats, preserve_scratch,
+                 compositor, percentile_value]
         return params
     
     def updateParameters(self, parameters):
@@ -4777,6 +4914,15 @@ class LandsatMosaic(object):
             parameters[5].enabled = time_type in ["Specific Year", "Month in Year", "Season in Year"]
             parameters[6].enabled = time_type in ["Month in Year", "Month All Years"]
             parameters[7].enabled = time_type in ["Season in Year", "Season All Years"]
+
+        # Compositor gate: percentile_value (idx 12) is only meaningful
+        # when compositor (idx 11) is set to Per-band percentile.
+        if len(parameters) > 12:
+            try:
+                comp_val = parameters[11].valueAsText or ""
+                parameters[12].enabled = comp_val.startswith("Per-band percentile")
+            except Exception:
+                pass
 
     def updateMessages(self, parameters):
             """Modify messages created by internal validation"""
@@ -5034,7 +5180,9 @@ class LandsatMosaic(object):
 
     def _create_geometric_median_mosaic(self, clean_scenes, gdb_path, mosaic_name,
                                          preserve_scratch=False,
-                                         mask_feature=None):
+                                         mask_feature=None,
+                                         compositor="GeometricMedian (default)",
+                                         percentile_value=25):
         """Create geometric median mosaic preserving multi-band structure.
 
         Cleanup fix: previously the temp composites (one per scene) were
@@ -5153,10 +5301,21 @@ class LandsatMosaic(object):
                     time.time() - t0_phase, failures,
                 )
 
-            # Phase 4 — GeometricMedian
+            # Phase 4 — Compositor.
+            # Output naming preserved across compositor choices: the
+            # `_Geomedian` suffix is retained (even when not strictly
+            # geomedian) to keep saved Pro tool runs and downstream
+            # consumers working. Users pick distinct mosaic_name for
+            # A/B between compositors (overwriteOutput is on).
+            if compositor.startswith("Per-band percentile"):
+                compositor_tag = f"PerBandPercentile{int(percentile_value):02d}"
+            elif compositor.startswith("Per-band"):
+                compositor_tag = "PerBandMedian"
+            else:
+                compositor_tag = "GeometricMedian"
             output_path = os.path.join(gdb_path, f"{mosaic_name}_Geomedian")
             with phase(
-                f"Phase 4 — GeometricMedian over {len(multiband_rasters)} stacks",
+                f"Phase 4 — {compositor_tag} over {len(multiband_rasters)} stacks",
                 quiet_close=True,
                 # Outer except in _create_geometric_median_mosaic logs the
                 # canonical failure message — suppress phase's own warning
@@ -5164,20 +5323,32 @@ class LandsatMosaic(object):
                 silent_error=True,
             ) as ph:
                 arcpy.AddMessage(
-                    "  Silent phase (arcpy.ia.GeometricMedian has no per-iteration hook)."
+                    f"  Silent phase ({compositor_tag} has no per-iteration hook)."
                 )
-                arcpy.SetProgressor("default", "Computing GeometricMedian...")
-                geomedian = arcpy.ia.GeometricMedian(
-                    multiband_rasters,
-                    epsilon=_GEOMETRIC_MEDIAN_EPSILON,
-                    max_iteration=_GEOMETRIC_MEDIAN_MAX_ITER,
-                    extent_type="UnionOf",
-                    cellsize_type="FirstOf",
+                arcpy.SetProgressor(
+                    "default", f"Computing {compositor_tag}...",
                 )
-                _save_geomedian_clean(geomedian, output_path)
+                if compositor.startswith("Per-band percentile"):
+                    _per_band_percentile_composite(
+                        multiband_rasters, output_path, scratch_dir,
+                        percentile_value,
+                    )
+                elif compositor.startswith("Per-band"):
+                    _per_band_median_composite(
+                        multiband_rasters, output_path, scratch_dir,
+                    )
+                else:
+                    geomedian = arcpy.ia.GeometricMedian(
+                        multiband_rasters,
+                        epsilon=_GEOMETRIC_MEDIAN_EPSILON,
+                        max_iteration=_GEOMETRIC_MEDIAN_MAX_ITER,
+                        extent_type="UnionOf",
+                        cellsize_type="FirstOf",
+                    )
+                    _save_geomedian_clean(geomedian, output_path)
                 arcpy.ResetProgressor()
             arcpy.AddMessage(
-                f"  ✓ GeometricMedian complete in {ph.elapsed:.1f}s "
+                f"  ✓ {compositor_tag} complete in {ph.elapsed:.1f}s "
                 f"→ {os.path.basename(output_path)}"
             )
 
@@ -5239,6 +5410,18 @@ class LandsatMosaic(object):
             mask_feature = parameters[8].valueAsText
             save_stats = parameters[9].value
             preserve_scratch = bool(parameters[10].value)
+            # Compositor (idx 11) and percentile_value (idx 12). Both
+            # are Optional with defaults preserving prior behaviour.
+            compositor = (
+                parameters[11].valueAsText
+                if len(parameters) > 11 and parameters[11].valueAsText
+                else "GeometricMedian (default)"
+            )
+            percentile_value = (
+                int(parameters[12].value)
+                if len(parameters) > 12 and parameters[12].value is not None
+                else 25
+            )
 
             # ----------------------------------------------------------------
             # AOI-first scoping. Set arcpy.env.mask + arcpy.env.extent BEFORE
@@ -5336,6 +5519,8 @@ class LandsatMosaic(object):
                         f"{mosaic_name}_UTM{utm_zone}{region_info['hemisphere']}",
                         preserve_scratch=preserve_scratch,
                         mask_feature=mask_feature,
+                        compositor=compositor,
+                        percentile_value=percentile_value,
                     )
 
                     if zone_mosaic:
@@ -6714,12 +6899,76 @@ class Sentinel2Mosaic(object):
         subprocess_batch_size.filter.type = "Range"
         subprocess_batch_size.filter.list = [0, 100]
 
+        # Compositor — Phase 4 reducer over the per-scene stack.
+        # GeometricMedian (default, behaviour-preserving) computes
+        # the L1 multivariate median; Per-band median reduces band-
+        # by-band via arcpy.sa.CellStatistics with explicit
+        # ignore_nodata="DATA"; Per-band percentile (p25 default)
+        # biases toward the darker quartile, useful when residual
+        # cloud / haze that SCL did not catch is dragging the
+        # median upward at persistently cloudy pixels. The two
+        # Per-band reducers have a spectral-consistency caveat: a
+        # pixel's band-1 value may come from a different scene than
+        # its band-2. Output naming distinguishes the choices:
+        # default compositor preserves the existing `<mosaic_name>_
+        # <tile>` per-tile output; Per-band variants get a
+        # `_PerBandMedian` / `_PerBandP{NN}` suffix per tile so
+        # users can A/B without overwriting.
+        compositor = arcpy.Parameter(
+            displayName=(
+                "Compositor (advanced; the per-pixel reducer over the "
+                "cleaned multi-scene stack. GeometricMedian (default) "
+                "computes the L1-median across the multi-band spectral "
+                "signature, preserving same-scene consistency across "
+                "bands. Per-band median reduces each band independently "
+                "via arcpy.sa.CellStatistics with explicit ignore_nodata "
+                "semantics. Per-band percentile (p25 default) is the "
+                "per-band reducer at a lower percentile - useful when "
+                "residual cloud / haze biases the median upward at "
+                "persistently cloudy pixels; p25 biases toward the "
+                "darker quartile and discards bright cloud-contaminated "
+                "observations."
+            ),
+            name="compositor",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        compositor.filter.list = [
+            "GeometricMedian (default)",
+            "Per-band median",
+            "Per-band percentile",
+        ]
+        compositor.value = "GeometricMedian (default)"
+
+        percentile_value = arcpy.Parameter(
+            displayName=(
+                "Per-band percentile value (5-50; only used when "
+                "Compositor is set to Per-band percentile). Default 25 "
+                "biases toward the darker quartile at each pixel, "
+                "discarding bright cloud-contaminated observations. "
+                "Lower values bias more aggressively but risk picking "
+                "deep cloud shadow; values above 50 return to median-"
+                "like behaviour and are intentionally not allowed."
+            ),
+            name="percentile_value",
+            datatype="GPLong",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        percentile_value.value = 25
+        percentile_value.filter.type = "Range"
+        percentile_value.filter.list = [5, 50]
+
         return [
             gdb, mosaic_name, data_folder, region, time_type,
             year, month, season,
             cloud_aggressiveness, cloud_buffer,
             mask_feature, save_stats, preserve_scratch,
             subprocess_batch_size,
+            compositor, percentile_value,
         ]
 
     def updateParameters(self, parameters):
@@ -6749,6 +6998,16 @@ class Sentinel2Mosaic(object):
                 year.enabled = False
                 month.enabled = False
                 season.enabled = True
+
+            # Compositor gate: percentile_value (idx 15) is only
+            # meaningful when compositor (idx 14) is set to Per-band
+            # percentile.
+            if len(parameters) > 15:
+                compositor = parameters[14]
+                percentile_value = parameters[15]
+                percentile_value.enabled = (
+                    (compositor.valueAsText or "").startswith("Per-band percentile")
+                )
         except Exception:
             pass
 
@@ -6793,6 +7052,19 @@ class Sentinel2Mosaic(object):
                 if len(parameters) > 13 and parameters[13].value is not None
                 else 10
             )
+            # Compositor (idx 14) and percentile_value (idx 15). Both
+            # are Optional with defaults preserving prior behaviour
+            # (GeometricMedian + p25 unused).
+            compositor = (
+                parameters[14].valueAsText
+                if len(parameters) > 14 and parameters[14].valueAsText
+                else "GeometricMedian (default)"
+            )
+            percentile_value = (
+                int(parameters[15].value)
+                if len(parameters) > 15 and parameters[15].value is not None
+                else 25
+            )
 
             # Resolve aggressiveness preset → SCL class tuple. The dropdown
             # constrains the value to the preset keys; fall back defensively
@@ -6821,6 +7093,12 @@ class Sentinel2Mosaic(object):
                 f"  Cloud mask: {cloud_aggressiveness} "
                 f"(SCL classes {list(scl_classes)}, buffer {cloud_buffer_pixels}px)"
             )
+            _compositor_log = (
+                f"{compositor} (p={percentile_value})"
+                if compositor.startswith("Per-band percentile")
+                else compositor
+            )
+            arcpy.AddMessage(f"  Compositor: {_compositor_log}")
 
             if mask_feature and arcpy.Exists(mask_feature):
                 arcpy.env.mask = mask_feature
@@ -7093,21 +7371,44 @@ class Sentinel2Mosaic(object):
                     try:
                         tile_mosaic_name = f"{mosaic_name}_{tile}"
                         tile_mosaic_path = os.path.join(gdb_path, tile_mosaic_name)
-                        median = arcpy.ia.GeometricMedian(
-                            stacked_paths,
-                            epsilon=_GEOMETRIC_MEDIAN_EPSILON,
-                            max_iteration=_GEOMETRIC_MEDIAN_MAX_ITER,
-                            extent_type="UnionOf",
-                            cellsize_type="FirstOf",
-                        )
-                        _save_geomedian_clean(median, tile_mosaic_path)
+                        # Compositor branch. Output naming unchanged
+                        # across compositor choices (mirrors ASTER's
+                        # convention: user picks distinct mosaic_name
+                        # for A/B comparisons, overwriteOutput is on).
+                        if compositor.startswith("Per-band percentile"):
+                            _per_band_percentile_composite(
+                                stacked_paths, tile_mosaic_path,
+                                scratch_dir, percentile_value,
+                            )
+                            _tag = f"PerBandP{int(percentile_value):02d}"
+                        elif compositor.startswith("Per-band"):
+                            _per_band_median_composite(
+                                stacked_paths, tile_mosaic_path, scratch_dir,
+                            )
+                            _tag = "PerBandMedian"
+                        else:
+                            median = arcpy.ia.GeometricMedian(
+                                stacked_paths,
+                                epsilon=_GEOMETRIC_MEDIAN_EPSILON,
+                                max_iteration=_GEOMETRIC_MEDIAN_MAX_ITER,
+                                extent_type="UnionOf",
+                                cellsize_type="FirstOf",
+                            )
+                            _save_geomedian_clean(median, tile_mosaic_path)
+                            _tag = "GeometricMedian"
                         tile_mosaics.append(tile_mosaic_path)
                         arcpy.AddMessage(
-                            f"  ✓ [{tile}] {len(stacked_paths)} scenes → "
+                            f"  ✓ [{tile}] {len(stacked_paths)} scenes ({_tag}) → "
                             f"{(datetime.now() - tile_start).total_seconds():.1f}s"
                         )
                     except arcpy.ExecuteError as e:
-                        arcpy.AddError(f"  ✗ [{tile}] GeometricMedian failed: {e}")
+                        arcpy.AddError(f"  ✗ [{tile}] compositor failed: {e}")
+                        continue
+                    except Exception as e:
+                        arcpy.AddError(
+                            f"  ✗ [{tile}] compositor failed "
+                            f"({type(e).__name__}): {e}"
+                        )
                         continue
                     arcpy.SetProgressorPosition(ti)
                 arcpy.ResetProgressor()
@@ -8190,9 +8491,13 @@ class AsterMosaic(object):
                 "median computes each band's median independently via "
                 "arcpy.sa.CellStatistics with explicit ignore_nodata "
                 "semantics; a pixel's band-1 value can come from a "
-                "different scene than its band-2 value. Use Per-band "
-                "median as an A/B for diagnosing GeometricMedian "
-                "artefacts on NoData-asymmetric inputs."
+                "different scene than its band-2 value. Per-band "
+                "percentile (p25 default) is the per-band reducer at a "
+                "lower percentile - useful when residual cloud / haze "
+                "biases the median upward at persistently cloudy "
+                "pixels; p25 biases toward the darker quartile and "
+                "discards bright cloud-contaminated observations. "
+                "Pairs well with the temporal cleaner."
             ),
             name="compositor",
             datatype="GPString",
@@ -8203,8 +8508,35 @@ class AsterMosaic(object):
         compositor.filter.list = [
             "GeometricMedian (default)",
             "Per-band median",
+            "Per-band percentile",
         ]
         compositor.value = "GeometricMedian (default)"
+
+        # percentile_value gates on compositor==Per-band percentile (see
+        # updateParameters). Range 5-50 sends the design intent: this
+        # is for cloud-bias reduction. Values >50 don't help bias since
+        # cloud is bright in visible/NIR. Default 25 matches the
+        # first-quartile convention.
+        percentile_value = arcpy.Parameter(
+            displayName=(
+                "Per-band percentile value (5-50; only used when "
+                "Compositor is set to Per-band percentile). Default 25 "
+                "biases toward the darker quartile at each pixel, "
+                "discarding bright cloud-contaminated observations. "
+                "Lower values (10-20) bias more aggressively but risk "
+                "picking deep cloud shadow; higher values (35-45) bias "
+                "less. Above 50 returns to median-like behaviour and "
+                "is intentionally not allowed."
+            ),
+            name="percentile_value",
+            datatype="GPLong",
+            parameterType="Optional",
+            direction="Input",
+            category="Advanced Options",
+        )
+        percentile_value.value = 25
+        percentile_value.filter.type = "Range"
+        percentile_value.filter.list = [5, 50]
 
         # DL cloud-mask family. ASTER AST_07XT ships without a cloud
         # mask (unlike S2 SCL / Landsat QA_PIXEL); OmniCloudMask
@@ -8259,8 +8591,8 @@ class AsterMosaic(object):
         # was always OFF and superseded by OmniCloudMask) and
         # use_dl_cloud_mask (OmniCloudMask is now mandatory; if the
         # install is missing execute() hard-fails with an install hint).
-        # Net: 23 parameters (was 25 after Stage 2; -4 removed + 2
-        # added).
+        # Net: 24 parameters (was 23; +1 added for percentile_value
+        # gating the Per-band percentile compositor).
         return [
             gdb, mosaic_name, data_folder,
             arosics_reference,
@@ -8270,7 +8602,7 @@ class AsterMosaic(object):
             cloud_buffer_px,
             enable_temporal_clean, temporal_k, temporal_min_obs,
             subprocess_batch_size,
-            compositor,
+            compositor, percentile_value,
             dl_mask_aggressiveness, dl_mask_folder,
         ]
 
@@ -8304,6 +8636,16 @@ class AsterMosaic(object):
             cleaner_on = bool(enable_temporal_clean.value)
             temporal_k.enabled = cleaner_on
             temporal_min_obs.enabled = cleaner_on
+
+            # Compositor gate: percentile_value (idx 21) is only
+            # meaningful when compositor (idx 20) is set to Per-band
+            # percentile. Hide it otherwise so the UI doesn't suggest
+            # a knob that has no effect.
+            compositor = parameters[20]
+            percentile_value = parameters[21]
+            percentile_value.enabled = (
+                (compositor.valueAsText or "").startswith("Per-band percentile")
+            )
         except Exception:
             pass
 
@@ -8409,14 +8751,23 @@ class AsterMosaic(object):
                 if len(parameters) > 20 and parameters[20].valueAsText
                 else "GeometricMedian (default)"
             )
+            # percentile_value at index 21 — only consumed when
+            # compositor == Per-band percentile (Phase 8 branch).
+            # Defaults to 25 (first quartile, recommended for cloud-
+            # bias reduction). UI clamps range to 5-50.
+            percentile_value = (
+                int(parameters[21].value)
+                if len(parameters) > 21 and parameters[21].value is not None
+                else 25
+            )
             dl_mask_aggressiveness = (
-                parameters[21].valueAsText
-                if len(parameters) > 21 and parameters[21].valueAsText
+                parameters[22].valueAsText
+                if len(parameters) > 22 and parameters[22].valueAsText
                 else "Aggressive (Thick + Thin + Shadow)"
             )
             dl_mask_folder_param = (
-                parameters[22].valueAsText
-                if len(parameters) > 22 else None
+                parameters[23].valueAsText
+                if len(parameters) > 23 else None
             )
 
             # ----------------------------------------------------------------
@@ -8449,7 +8800,12 @@ class AsterMosaic(object):
                 f"+ NDWI water guard > {_ASTER_WATER_NDWI_MIN}; "
                 f"+ {cloud_buffer_px}px edge dilation)"
             )
-            arcpy.AddMessage(f"  Compositor: {compositor}")
+            _compositor_log = (
+                f"{compositor} (p={percentile_value})"
+                if compositor.startswith("Per-band percentile")
+                else compositor
+            )
+            arcpy.AddMessage(f"  Compositor: {_compositor_log}")
             if enable_temporal_clean:
                 arcpy.AddMessage(
                     f"  Temporal:   outlier cleaner ON "
@@ -9089,6 +9445,7 @@ class AsterMosaic(object):
                         cloud_buffer_px=cloud_buffer_px,
                         subprocess_batch_size=subprocess_batch_size,
                         compositor=compositor,
+                        percentile_value=percentile_value,
                         dl_mask_folder=dl_mask_folder,
                         dl_cloud_classes=dl_cloud_classes,
                         coreg_cache_dir=coreg_cache_dir,
@@ -9121,6 +9478,7 @@ class AsterMosaic(object):
                     cloud_buffer_px=cloud_buffer_px,
                     subprocess_batch_size=subprocess_batch_size,
                     compositor=compositor,
+                    percentile_value=percentile_value,
                     dl_mask_folder=dl_mask_folder,
                     dl_cloud_classes=dl_cloud_classes,
                     coreg_cache_dir=coreg_cache_dir,
@@ -9213,6 +9571,7 @@ class AsterMosaic(object):
         cloud_buffer_px=_ASTER_CLOUD_BUFFER_PX,
         subprocess_batch_size=10,
         compositor="GeometricMedian (default)",
+        percentile_value=25,
         dl_mask_folder=None,
         dl_cloud_classes=None,
         coreg_cache_dir=None,
@@ -9516,10 +9875,12 @@ class AsterMosaic(object):
                         )
 
         # Phase 7 — compositor
-        compositor_tag = (
-            "PerBandMedian" if compositor.startswith("Per-band")
-            else "GeometricMedian"
-        )
+        if compositor.startswith("Per-band percentile"):
+            compositor_tag = f"PerBandPercentile{int(percentile_value):02d}"
+        elif compositor.startswith("Per-band"):
+            compositor_tag = "PerBandMedian"
+        else:
+            compositor_tag = "GeometricMedian"
         arcpy.SetProgressor(
             "default", f"Computing {compositor_tag} [{label}]...",
         )
@@ -9529,7 +9890,12 @@ class AsterMosaic(object):
                 f"{len(composite_inputs)} stacks",
                 quiet_close=True,
             ) as ph:
-                if compositor.startswith("Per-band"):
+                if compositor.startswith("Per-band percentile"):
+                    _per_band_percentile_composite(
+                        composite_inputs, output_path, scratch_dir,
+                        percentile_value,
+                    )
+                elif compositor.startswith("Per-band"):
                     _per_band_median_composite(
                         composite_inputs, output_path, scratch_dir,
                     )
@@ -9591,7 +9957,11 @@ class AsterMosaic(object):
                         if dl_cloud_classes else "off"
                     ),
                     "dl_mask_folder": dl_mask_folder or "n/a",
-                    "compositor": compositor,
+                    "compositor": (
+                        f"{compositor}(p={percentile_value})"
+                        if compositor.startswith("Per-band percentile")
+                        else compositor
+                    ),
                     "toolbox_version": TOOLBOX_VERSION,
                 }
                 self._write_provenance_csv(
