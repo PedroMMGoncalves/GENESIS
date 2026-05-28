@@ -35,7 +35,7 @@ The toolbox exposes seven tools in workflow order:
 | --- | --- | --- |
 | **01** | Sentinel-2 L2A Mosaic | Cloud-masked mosaic from S2 `.SAFE` archives or `.zip` downloads. Aggressive SCL preset (classes 1, 3, 7, 8, 9, 10, 11) with a 3-pixel cloud-edge buffer by default; output is a 12-band stack (B01-B12 minus B10) with the 20 m and 60 m bands resampled to 10 m via BILINEAR |
 | **02** | Landsat 8/9 C2L2 Mosaic | Cloud-masked mosaic from EarthExplorer `.tar` archives (QA_PIXEL bits 0-4 masked; multi-UTM-zone merging) |
-| **03** | ASTER L2 Mosaic | Mineral-mapping mosaic from AST_07XT V004 (TIFF + HDF input; SWIR 30m → 15m). Eight-phase pipeline: scene discovery → temporal filter → AOI intersection (drops zero-overlap scenes) → optional deep-learning cloud + shadow mask via [OmniCloudMask](https://github.com/DPIRD-DMA/OmniCloudMask) (Wright et al. 2025; opt-in, ASTER-specific because S2/Landsat ship with their own masks) → per-scene processing with QA Data Plane quality mask + hardened VNIR spectral cloud test (brightness + spectral flatness + NDVI guard + NDWI water guard + edge dilation) → optional Tmask temporal outlier cleaner (default OFF since DL became primary) → `arcpy.ia.GeometricMedian` compositor (with a Per-band median A/B alternative) → cleanup + provenance. Ships `obs_count` + `cloud_freq` evidence-quality sidecars and a per-scene `cloud_pct` in the provenance CSV |
+| **03** | ASTER L2 Mosaic | Mineral-mapping mosaic from AST_07XT V004 (TIFF + HDF input; SWIR 30m → 15m). Nine-phase pipeline: scene discovery → temporal filter → AOI intersection (drops zero-overlap scenes) → **AROSICS co-registration against a Sentinel-2 reference image** ([Scheffler et al. 2017](https://doi.org/10.3390/rs9070676); mandatory — corrects AST_07XT's L1B-grade ~20-50m per-scene geolocation drift that otherwise blurs the multi-scene median to ~30-50m effective resolution; applied as a global geotransform translation so the deshift is robust at any per-band resolution) → **deep-learning cloud + shadow mask via [OmniCloudMask](https://github.com/DPIRD-DMA/OmniCloudMask)** ([Wright et al. 2025](https://doi.org/10.1016/j.rse.2025.114694); mandatory primary cloud detection layer because AST_07XT ships without one, unlike S2 SCL / Landsat QA_PIXEL) → per-scene processing with QA Data Plane quality mask + hardened VNIR spectral cloud test as second-line defence (brightness + spectral flatness + NDVI guard + NDWI water guard + edge dilation) → temporal outlier cleaner (default ON; Tmask-style robust-z reduction; complementary to DL — catches per-pixel time-stack outliers DL doesn't see) → compositor (`arcpy.ia.GeometricMedian` default, with `Per-band median` and `Per-band percentile (p25 default)` alternatives — the latter biases toward the darker quartile to discard cloud-bright residuals) → cleanup + provenance. **Dual output**: `{name}_VnirSwir` (9-band, pre-Apr-2008 scenes only — the ASTER SWIR detector failed afterward) and `{name}_Vnir` (3-band, full archive). Ships `obs_count` + `cloud_freq` evidence-quality sidecars and a per-scene `cloud_pct` in the provenance CSV |
 | **04** | Spectral Indices & Composites | ~25 indices + ~8 RGB composites, sensor-filtered to what each sensor can compute (red-edge for S2; per-wavelength SWIR minerals for ASTER) |
 | **05** | Statistical Transformations | PCA, MNF, and ICA — sensor-agnostic algorithm with persisted `.npz` statistics for cross-AOI re-application |
 | **06** | Spectral Angle Mapper | Reference-spectra classification (table / training samples / endmember pixels) |
@@ -73,12 +73,30 @@ Each mosaic is shipped with a `{name}_bands.csv` sidecar documenting `band_index
 
 ## Requirements
 
-- **ArcGIS Pro 3.0 or higher**
+- **ArcGIS Pro 3.0 or higher** (Windows; `arcpy` is Windows-only on Pro 3.x)
 - **Spatial Analyst** extension (required for all seven tools)
 - **Image Analyst** extension (used by Mosaic and Transformations)
 - Python 3.9+ with `numpy`, `scipy` and `matplotlib` — all three included with ArcGIS Pro's bundled Python (no other ML or scientific-computing dependencies; the FastICA used in Tool 05 is a pure-numpy in-house implementation, and `matplotlib` is used only by Tool 05's HTML report generator with the headless `Agg` backend)
 - `osgeo.gdal` (also bundled with ArcGIS Pro) — used by Tool 03 for HDF input
-- *(Optional, only for Tool 03's deep-learning cloud-mask path)* PyTorch + torchvision via the [Esri Deep Learning Frameworks](https://github.com/Esri/deep-learning-frameworks) MSI installer, plus the `omnicloudmask` Python package installed into a clone of `arcgispro-py3` via Pro's Package Manager. The rest of the toolbox loads cleanly without these — they only fire when `Use DL cloud mask` is checked on Tool 03
+- `rasterio` — used by Tool 03 for the AROSICS per-band clip + deshift write path. Install into Pro's Python env via the Package Manager (`rasterio>=1.3`)
+
+### Tool 03 (ASTER) additional dependencies — *mandatory*
+
+Tool 03's pipeline includes a DL cloud-mask stage and an AROSICS co-registration stage; both are required for it to run.
+
+- **[Esri Deep Learning Frameworks](https://github.com/Esri/deep-learning-frameworks)** — PyTorch + torchvision MSI installer from Esri (CUDA-enabled build recommended; CPU-only works but is ~10-100× slower for OmniCloudMask inference). Install with the version that matches your Pro release.
+- **[OmniCloudMask](https://github.com/DPIRD-DMA/OmniCloudMask)** ([`omnicloudmask`](https://pypi.org/project/omnicloudmask/) on PyPI) — sensor-agnostic R/G/NIR U-Net ensemble for cloud + shadow segmentation. Install into a clone of `arcgispro-py3` via Pro's Package Manager (`pip install omnicloudmask`).
+- **[AROSICS](https://github.com/GFZ/arosics)** ([`arosics`](https://pypi.org/project/arosics/) on PyPI) — phase-correlation sub-pixel co-registration. The cleanest install is a separate conda env (`arosics`'s GDAL/pyproj versions can fight with Pro's pinned versions; the toolbox spawns AROSICS in its own subprocess and discovers the env automatically):
+
+  ```bash
+  conda create -n arosics_env -c conda-forge python=3.13 arosics rasterio
+  ```
+
+  Then either set `GENESIS_AROSICS_PYTHON=<path to that env's python.exe>` as a user env variable, or install into the convention path `D:\Genesis\ArcGISPRO_Environment\GENESIS\python.exe`. The toolbox probes both at startup and surfaces an install-hint error if neither resolves.
+
+- **GPU (recommended)** — any CUDA-capable NVIDIA card with ≥6 GB VRAM. OmniCloudMask inference on a 254-scene ASTER archive completes in ~15 min on an RTX 4090; CPU-only takes hours. AROSICS itself is CPU-bound and benefits from any modern multi-core CPU.
+
+Tools 01, 02, 04, 05, 06, 07 have *no* dependencies beyond the ArcGIS Pro base (numpy/scipy/matplotlib are bundled).
 
 ---
 
@@ -98,7 +116,7 @@ Each mosaic is shipped with a `{name}_bands.csv` sidecar documenting `band_index
 | --- | --- | --- |
 | Sentinel-2 L2A | `.SAFE` folders or `.zip` Copernicus archives | Archives read on the fly via GDAL VSI (no extraction needed); browser-style duplicate-download suffixes (`(1).zip`) are deduped by canonical `PRODUCT_URI` from the archive's MTD XML |
 | Landsat 8/9 | EarthExplorer `.tar` or `.zip` archives, or extracted scene folders | Both L2SR and L2SP accepted; archives read on the fly via GDAL VSI (no extraction needed) |
-| ASTER | AST_07XT V004 per-band TIFFs or `.hdf` archives; optionally paired AST_08 V004 Surface Kinetic Temperature files (`AST_08_*_SKT.tif` or HDF), supplied either co-located with the AST_07XT files or in a separate sibling folder via the optional *ASTER Thermal Data Folder* parameter (the natural LP DAAC by-product download layout; hidden in the dialog by default) | TIFFs grouped by 17-char scene ID; HDF read via `osgeo.gdal`. The AST_08 thermal cloud test is **opt-in** (default OFF) via the *Use AST_08 thermal cloud test* Advanced Option, with the *Thermal Cloud Threshold (K)* default 280 K (mid-latitude maritime). AST_08 is clear-sky-only by construction (produced by the TES algorithm after the operational cloud mask), so over a cloud it is NoData or a corrupted retrieval; the Phase 4 temporal outlier cleaner handles cloud removal in the default path. AST_08 V004 stores Surface Kinetic Temperature as Int16 with a 0.1 scale; the tool multiplies by 0.1 before threshold comparison |
+| ASTER | AST_07XT V004 per-band TIFFs or `.hdf` archives | TIFFs grouped by 17-char scene ID; HDF read via `osgeo.gdal`. The AST_08 thermal cloud test, present in earlier versions, was removed in the 2026-05-27 redesign when OmniCloudMask (Phase 5) became the mandatory primary cloud detection layer — AST_08 SKT is clear-sky-only by construction (produced by the TES algorithm after the operational cloud mask) so it duplicates cloud information OmniCloudMask now handles natively |
 
 ---
 
@@ -107,7 +125,7 @@ Each mosaic is shipped with a `{name}_bands.csv` sidecar documenting `band_index
 - Reflectance: **float 0–1** (analysis-friendly; Sentinel-2 ×0.0001, ASTER ×0.001 applied during ingestion)
 - Mosaic CRS: inherited from input (UTM for Landsat / S2; resample-aligned for ASTER)
 - Each mosaic: **multi-band GeoTIFF or geodatabase raster + `_provenance.csv` + `_bands.csv`** (band-mapping sidecar documenting which stack position is which satellite band)
-- Tool 03 (ASTER) additionally emits per-pixel evidence-quality sidecars (`{name}_obs_count.tif` for valid clear observations per pixel, `{name}_cloud_freq.tif` for flagged fraction per pixel) tied to the AOI-masked output name; treat these as inputs to downstream uncertainty propagation, not as QA to discard. The `_provenance.csv` carries a `# run config: ...` header line documenting every threshold plus the temporal-cleaner `k` and `min_obs`, plus a `cloud_pct` column per scene showing the per-scene cloud-mask flagged fraction.
+- Tool 03 (ASTER) additionally emits per-pixel evidence-quality sidecars (`{name}_obs_count.tif` for valid clear observations per pixel, `{name}_cloud_freq.tif` for flagged fraction per pixel) tied to the AOI-masked output name; treat these as inputs to downstream uncertainty propagation, not as QA to discard. The `_provenance.csv` carries a `# run config: ...` header line documenting every threshold plus the temporal-cleaner `k` and `min_obs`, plus a `cloud_pct` column per scene showing the per-scene cloud-mask flagged fraction. The compositor choice (`GeometricMedian`, `Per-band median`, or `Per-band percentile(p=N)`) is recorded in the run-config header so A/B comparisons are self-documenting.
 - Transformation statistics: each Tool 05 run emits THREE sidecars sharing the output raster's basename — a **`.npz`** (NumPy archive — machine-reloadable, so the fitted PCA/MNF/ICA can be re-applied to a new AOI without refitting), a **`.txt`** (human-readable numerical summary: eigenvalues, eigenvectors / mixing matrices, variance explained, mutual information, kurtosis — whichever applies) and a **`_report.html`** (self-contained dashboard with embedded matplotlib PNGs: scree / SNR / kurtosis plots and a loadings heatmap labelled with the satellite band names from `_bands.csv`). The HTML opens in any browser, works offline, and ships no external assets
 - Tool 04 outputs: when the workspace is a **folder**, indices and composites are written to sibling `indices/` and `composites/` subfolders (forced GeoTIFF, no 13-character ESRI-GRID name limit). When the workspace is a **`.gdb`**, both products are saved flat at the workspace root with no extension (geodatabases have no name-length limit and don't support nested folders).
 - Tool 05 outputs: the same folder / `.gdb` split applies. Folder workspaces get a per-transform subfolder (`pca/`, `mnf/`, or `ica/`) with the result saved as a `.tif`; `.gdb` workspaces save flat at the workspace root with no extension. Statistics (the `.npz` reloadable archive, the `.txt` human summary, and the `_report.html` dashboard, all three emitted for every transform) are co-located with the data by default — same folder as the `.tif` for folder workspaces, parent folder of the `.gdb` for geodatabase workspaces (GDB cannot store these sidecars). Set the optional *Statistics Folder* parameter explicitly to override the placement.
@@ -146,6 +164,10 @@ The author's contribution within GENESIS is the production of cloud-removed mult
 > Funded by the European Union. Views and opinions expressed are however those of the author(s) only and do not necessarily reflect those of the European Union or CINEA. Neither the European Union nor the granting authority can be held responsible for them.
 
 ### References
+
+#### Co-registration
+
+- *AROSICS (Tool 03 Phase 4 — phase-correlation sub-pixel co-registration).* Scheffler, D., Hollstein, A., Diedrich, H., Segl, K., & Hostert, P. (2017). AROSICS: An automated and robust open-source image co-registration software for multi-sensor satellite data. *Remote Sensing*, 9(7), 676. <https://doi.org/10.3390/rs9070676> — the toolbox runs `COREG_LOCAL` against a Sentinel-2 NIR reference to find tie points, then applies the mean shift as a global geotransform translation (rather than the local deformation warp `DESHIFTER` defaults to) so the deshift is robust at any per-band resolution and never introduces resampling artefacts.
 
 #### Cloud masking
 
