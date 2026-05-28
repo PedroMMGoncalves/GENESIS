@@ -1198,7 +1198,7 @@ def _emit_phase3_summary(ok, failed, total_elapsed_s, failures=None):
             arcpy.AddMessage(f"    [{idx}] {sid_clip} {msg}")
 
 
-def _per_band_median_composite(stacks, output_path):
+def _per_band_median_composite(stacks, output_path, scratch_dir):
     """Per-band, per-pixel median across a list of multi-band scene
     stacks. A/B alternative to ``arcpy.ia.GeometricMedian`` for
     diagnosing whether the L1-median iteration is producing artefacts
@@ -1210,6 +1210,19 @@ def _per_band_median_composite(stacks, output_path):
     ``arcpy.sa.CellStatistics(..., MEDIAN, DATA)``. The per-band
     median rasters are then combined via ``CompositeBands`` into the
     final multi-band output.
+
+    ``scratch_dir`` is required and must be a real filesystem folder
+    (NOT inside a File Geodatabase). The per-band intermediates are
+    written here as ``_per_band_median_b{NN}.tif`` and deleted at the
+    end. Earlier versions derived ``scratch_dir`` via
+    ``os.path.dirname(output_path)``; when ``output_path`` is a GDB
+    raster (e.g. ``Aster_Geodatabase.gdb/ASTER_V14_Vnir``) dirname
+    returns the .gdb itself and arcpy then interprets the intermediate
+    .tif path as FGDBR, raising ``ERROR 010240: Could not save raster
+    dataset ... with output format FGDBR``. Phase 8 then silently
+    returns from the except handler and the run completes with
+    ``0 mosaic(s) written``. Caller must pass the actual per-mosaic
+    scratch folder.
 
     Spectral-consistency caveat: a pixel's per-band values may come
     from different scenes (band 1 from scene A, band 2 from scene B).
@@ -1228,7 +1241,6 @@ def _per_band_median_composite(stacks, output_path):
     if not stacks:
         raise ValueError("Empty stacks list passed to _per_band_median_composite")
     n_bands = int(arcpy.Raster(stacks[0]).bandCount)
-    scratch_dir = os.path.dirname(output_path)
     per_band_paths = []
     try:
         for band_idx in range(1, n_bands + 1):
@@ -9494,7 +9506,9 @@ class AsterMosaic(object):
                 quiet_close=True,
             ) as ph:
                 if compositor.startswith("Per-band"):
-                    _per_band_median_composite(composite_inputs, output_path)
+                    _per_band_median_composite(
+                        composite_inputs, output_path, scratch_dir,
+                    )
                 else:
                     median = arcpy.ia.GeometricMedian(
                         composite_inputs,
