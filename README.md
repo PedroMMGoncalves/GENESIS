@@ -5,6 +5,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![ArcGIS Pro](https://img.shields.io/badge/ArcGIS_Pro-3.0%2B-green.svg)](https://www.esri.com/en-us/arcgis/products/arcgis-pro/overview)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org)
+[![CI](https://github.com/PedroMMGoncalves/GENESIS/actions/workflows/ci.yml/badge.svg)](https://github.com/PedroMMGoncalves/GENESIS/actions/workflows/ci.yml)
 [![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20430828-blue)](https://doi.org/10.5281/zenodo.20430828)
 
 GENESIS is an ArcGIS Pro toolbox for analysing **Sentinel-2 L2A**,
@@ -148,6 +149,32 @@ Tools 01, 02, 04, 05, 06, 07 have *no* dependencies beyond the ArcGIS Pro base (
 - Tool 07 outputs: a `temporal/` subfolder for folder workspaces (forced GeoTIFF) or flat at the workspace root for `.gdb`. Each indicator is a single-band raster prefixed with the user-chosen *Output Name Prefix*. *All scenes* stratification → 6-8 rasters (`{prefix}_NDVI_min/max/mean/std`, `{prefix}_NDVI_persistence`, `{prefix}_NDWI_max`, `{prefix}_NDWI_freq`, `{prefix}_obs_count`). *Per season* stratification → 12-16 rasters with `_dry` / `_wet` suffixes plus two cross-season composites (`{prefix}_GDV_ratio`, `{prefix}_GDV_dry_floor`). A `_temporal_provenance.csv` sidecar lists the scenes that contributed to each group + the threshold tunables used.
 - Tools 04 and 05 preserve the input raster's valid-data footprint in every output. Mosaic rasters saved to a file geodatabase commonly arrive without explicit NoData metadata but with outside-AOI fill pixels written at value 0 (the U16 default Pro uses on save). Without a guard, derived indices / composites / PCA / MNF / ICA treat those zeros as valid samples and produce visible rectangular artefacts in the corners of the result extent. Tool 04 builds a self-mask from the first band (`band > 0` → valid) and applies it via `SetNull` to every output. Tool 05 layers three NoData defences before the eigendecomposition — `raster.noDataValue` from explicit metadata when set, `arcpy.sa.IsNull` on the multi-band raster (OR-collapsed across bands; catches band-level masks the `Raster.noDataValue` API does not surface), and an all-band-zero numpy fallback for inputs with no NoData metadata at all — converting matched pixels to `NaN` so they propagate through PCA / MNF / ICA and become NoData on save via the single `NumPyArrayToRaster(value_to_nodata=np.nan)` write. Either way the result's NoData footprint matches the input's; no AOI-mask parameter and no double-save needed.
 - Each mosaic's median output is sanity-checked after save: per-band MIN / MEAN / MAX are logged, and a warning is emitted if any band's mean is suspiciously close to zero for that sensor's expected reflectance range — catches the class of NoData-handling regression that would otherwise pass type-checking and structural validation while producing visually-broken outputs.
+
+---
+
+## Tests
+
+A `pytest` regression suite under [`tests/`](tests/) covers the
+pure-Python surface of the toolbox: sensor and band-role detection,
+filename parsers (ASTER / Landsat / Sentinel-2), in-place archive
+readers (`/vsitar/...`, `/vsizip/...`), provenance CSV writers,
+pure-numpy ICA, the per-band percentile compositor, the
+OmniCloudMask observed-pixel reducer, and the Tmask-style temporal
+outlier cleaner. The suite runs without ArcGIS Pro — a small
+`arcpy` stub in [`tests/conftest.py`](tests/conftest.py) covers the
+import-time surface so a stock CI runner can exercise the helpers.
+
+```bash
+python -m pytest tests -q
+```
+
+Each push and pull request runs the suite across Python 3.11 / 3.12 / 3.13
+via the [CI workflow](.github/workflows/ci.yml). Raster-touching code
+(CellStatistics, GeometricMedian, SetRasterProperties, …) is validated
+through real mosaic runs against the Faial demonstrator data, not here.
+
+Author-side scratch (probes, A/B drivers, audit scripts) lives under
+`tests/_dev/` and is gitignored.
 
 ---
 

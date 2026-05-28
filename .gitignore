@@ -4,11 +4,11 @@
 # unified genesis_toolbox.pyt at root.
 legacy/
 
-# Tests are author-side development scaffolding, not part of the
-# public deliverable. Kept locally for re-running before changes;
-# excluded from the repo so the public-facing artefact stays focused
-# on the tool itself (genesis_toolbox.pyt + README + CITATION + LICENSE).
-tests/
+# The public regression suite lives in tests/. Author-side scratch
+# scripts (probes, A/B drivers, one-off audits) live in tests/_dev/
+# and stay out of the repo — they reference local scene data and
+# external GPUs that other users don't have.
+tests/_dev/
 
 # Python bytecode / cache
 __pycache__/

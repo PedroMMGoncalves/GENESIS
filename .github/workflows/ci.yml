@@ -1,0 +1,64 @@
+name: CI
+
+# Two jobs:
+#   syntax-check  — py_compile across the Python versions a user might
+#                   bring to ArcGIS Pro (3.11+). Catches the class of
+#                   syntax error that would otherwise only surface when
+#                   the .pyt is opened in Pro. py_compile does NOT
+#                   execute imports, so arcpy is not needed.
+#   unit-tests    — pytest against the regression suite under tests/.
+#                   The suite stubs arcpy at import time (see
+#                   tests/conftest.py) so it runs on a stock runner.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "genesis_toolbox.pyt"
+      - "tests/**"
+      - ".github/workflows/ci.yml"
+      - "pytest.ini"
+  pull_request:
+    paths:
+      - "genesis_toolbox.pyt"
+      - "tests/**"
+      - ".github/workflows/ci.yml"
+      - "pytest.ini"
+
+jobs:
+  syntax-check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: py_compile genesis_toolbox.pyt
+        run: |
+          python -m py_compile genesis_toolbox.pyt
+          echo "py_compile OK on Python ${{ matrix.python-version }}"
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # numpy + scipy are the only runtime deps the pure-Python
+          # surface needs; pytest drives the suite.
+          python -m pip install pytest numpy scipy
+      - name: pytest
+        run: |
+          python -m pytest tests -q
