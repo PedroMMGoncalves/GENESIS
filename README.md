@@ -82,19 +82,27 @@ Each mosaic is shipped with a `{name}_bands.csv` sidecar documenting `band_index
 
 ### Tool 03 (ASTER) additional dependencies — *mandatory*
 
-Tool 03's pipeline includes a DL cloud-mask stage and an AROSICS co-registration stage; both are required for it to run.
+Tool 03's pipeline includes a DL cloud-mask stage and an AROSICS co-registration stage; both are required for it to run. All three additions install cleanly into a Pro-cloned `arcgispro-py3` environment — there is no need for a separate conda env.
 
-- **[Esri Deep Learning Frameworks](https://github.com/Esri/deep-learning-frameworks)** — PyTorch + torchvision MSI installer from Esri (CUDA-enabled build recommended; CPU-only works but is ~10-100× slower for OmniCloudMask inference). Install with the version that matches your Pro release.
-- **[OmniCloudMask](https://github.com/DPIRD-DMA/OmniCloudMask)** ([`omnicloudmask`](https://pypi.org/project/omnicloudmask/) on PyPI) — sensor-agnostic R/G/NIR U-Net ensemble for cloud + shadow segmentation. Install into a clone of `arcgispro-py3` via Pro's Package Manager (`pip install omnicloudmask`).
-- **[AROSICS](https://github.com/GFZ/arosics)** ([`arosics`](https://pypi.org/project/arosics/) on PyPI) — phase-correlation sub-pixel co-registration. The cleanest install is a separate conda env (`arosics`'s GDAL/pyproj versions can fight with Pro's pinned versions; the toolbox spawns AROSICS in its own subprocess and discovers the env automatically):
+**Recommended setup (single env):**
 
-  ```bash
-  conda create -n arosics_env -c conda-forge python=3.13 arosics rasterio
-  ```
+1. In ArcGIS Pro → **Package Manager**, clone `arcgispro-py3` to a writable location (e.g. `D:\Genesis\ArcGISPRO_Environment\GENESIS\`) and **make the clone active**.
+2. In Pro's **Python Command Prompt** (uses the active env), install the three extras:
 
-  Then either set `GENESIS_AROSICS_PYTHON=<path to that env's python.exe>` as a user env variable, or install into the convention path `D:\Genesis\ArcGISPRO_Environment\GENESIS\python.exe`. The toolbox probes both at startup and surfaces an install-hint error if neither resolves.
+   ```bash
+   pip install omnicloudmask arosics rasterio
+   ```
 
-- **GPU (recommended)** — any CUDA-capable NVIDIA card with ≥6 GB VRAM. OmniCloudMask inference on a 254-scene ASTER archive completes in ~15 min on an RTX 4090; CPU-only takes hours. AROSICS itself is CPU-bound and benefits from any modern multi-core CPU.
+3. Install the **[Esri Deep Learning Frameworks](https://github.com/Esri/deep-learning-frameworks)** MSI matching your Pro release — adds PyTorch + torchvision to the active env (CUDA-enabled build recommended; CPU-only works but is ~10-100× slower for OmniCloudMask inference). Without this step `omnicloudmask` will install but its lazy `import torch` raises at Phase 5.
+
+Once the active env has `arcpy + torch + omnicloudmask + arosics + rasterio`, Tool 03 finds everything via its convention path (`<active_env>\python.exe`) and runs end-to-end. The library credits:
+
+- **[OmniCloudMask](https://github.com/DPIRD-DMA/OmniCloudMask)** — sensor-agnostic R/G/NIR U-Net ensemble for cloud + shadow segmentation, Wright et al. 2025.
+- **[AROSICS](https://github.com/GFZ/arosics)** — phase-correlation sub-pixel co-registration, Scheffler et al. 2017.
+
+**Two-env fallback (advanced).** If your specific Pro version's pinned `gdal` / `pyproj` versions reject the `arosics` install in the clone, install `arosics` into a separate conda env (`conda create -n arosics_env -c conda-forge python=3.13 arosics rasterio`) and set `GENESIS_AROSICS_PYTHON=<that env's python.exe>` as a user environment variable. The toolbox spawns AROSICS in its own subprocess and discovers the env via that variable. Single-env install is the documented path; the two-env path exists only as a workaround.
+
+**GPU (recommended)** — any CUDA-capable NVIDIA card with ≥6 GB VRAM. OmniCloudMask inference on a 254-scene ASTER archive completes in ~15 min on an RTX 4090; CPU-only takes hours. AROSICS itself is CPU-bound and benefits from any modern multi-core CPU.
 
 Tools 01, 02, 04, 05, 06, 07 have *no* dependencies beyond the ArcGIS Pro base (numpy/scipy/matplotlib are bundled).
 
