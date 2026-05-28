@@ -6841,7 +6841,7 @@ class Sentinel2Mosaic(object):
             parameterType="Optional",
             direction="Input",
         )
-        cloud_buffer.value = 2
+        cloud_buffer.value = 3
         cloud_buffer.filter.type = "Range"
         cloud_buffer.filter.list = [0, 10]
 
@@ -7039,7 +7039,7 @@ class Sentinel2Mosaic(object):
             month = parameters[6].value
             season = parameters[7].valueAsText
             cloud_aggressiveness = parameters[8].valueAsText or "Aggressive"
-            cloud_buffer_pixels = parameters[9].value if parameters[9].value is not None else 2
+            cloud_buffer_pixels = parameters[9].value if parameters[9].value is not None else 3
             mask_feature = parameters[10].valueAsText
             save_stats = bool(parameters[11].value)
             preserve_scratch = bool(parameters[12].value)
@@ -8405,20 +8405,27 @@ class AsterMosaic(object):
         cloud_buffer_px.filter.type = "Range"
         cloud_buffer_px.filter.list = [0, 10]
 
-        # Temporal outlier cleaner master toggle. Default flipped to OFF
-        # in 2026-05-26 alongside the DL cloud-mask integration: with
-        # OmniCloudMask (Phase 5) catching the persistent orographic
-        # cloud over Faial that the Tmask-reduction layer cannot flag
-        # (cloud is modal at those pixels, so robust-z does not see it
-        # as outlier), the cleaner's net value drops. Kept as an opt-in
-        # for archives where DL is unavailable or as a second line of
-        # defence; reconsider default after V8 comparison evidence.
+        # Temporal outlier cleaner master toggle. Default flipped back
+        # to ON in 2026-05-28 after V12 (cleaner OFF) vs V13 (cleaner
+        # ON, everything else identical) showed visibly worse output
+        # without it - black blotches across the central island that
+        # vanished when the cleaner ran. The 2026-05-26 redesign that
+        # flipped this to OFF assumed DL cloud masking would replace
+        # the cleaner; V13 evidence disproved that. DL and the cleaner
+        # are complementary: DL catches whole-region cloud (a U-Net
+        # seeing patches), the cleaner catches per-pixel time-stack
+        # outliers DL doesn't see (cloud-shadow values that survived
+        # the mask, sensor glitches, residual haze). Leave ON unless
+        # explicitly A/B-ing against DL-only output.
         enable_temporal_clean = arcpy.Parameter(
             displayName=(
-                "Enable temporal outlier cleaner (default OFF since "
-                "DL cloud masking became the primary path). Tmask-"
-                "reduction layer; opt in for archives without DL cloud "
-                "masks or to A/B against DL-only output."
+                "Enable temporal outlier cleaner (default ON; "
+                "complementary to DL cloud masking, not a replacement). "
+                "Tmask-reduction layer removes per-pixel time-stack "
+                "outliers that survived the cloud mask. V13 evidence: "
+                "with cleaner ON the central-island black blotches "
+                "seen in V12 (cleaner OFF) vanish. Turn OFF only for "
+                "explicit A/B comparison against DL-only output."
             ),
             name="enable_temporal_clean",
             datatype="GPBoolean",
@@ -8426,7 +8433,7 @@ class AsterMosaic(object):
             direction="Input",
             category="Advanced Options",
         )
-        enable_temporal_clean.value = False
+        enable_temporal_clean.value = True
 
         temporal_k = arcpy.Parameter(
             displayName=(
