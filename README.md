@@ -51,6 +51,16 @@ All three mosaic tools expose a **Preserve Scratch & Resume on Re-run** option u
 
 A late-phase failure (e.g. a transient GP error during the median or AOI-mask step) therefore costs only the time of the failed phase, not the hours of per-scene QA / mask / resample / composite work that preceded it.
 
+### Choosing a compositor
+
+All three mosaic tools expose three compositor options in the *Advanced Options*: `GeometricMedian (default)`, `Per-band median`, and `Per-band percentile` (with a `percentile_value` parameter, default 25, range 5-50). Empirical guidance based on the Faial demonstrator A/B runs:
+
+- **Sparse-cloud or temperate AOIs** (long clear-sky baseline per pixel): `GeometricMedian` is the right default. It preserves same-scene spectral consistency across bands and the median is robust to a handful of cloud-contaminated outliers.
+- **Persistent-cloud / orographic-cloud AOIs** (Faial caldera, Azores in general, tropical mountain ranges): **prefer `Per-band percentile` with `percentile_value=25`**. p25 biases each pixel toward the darker quartile of its time stack, discarding the bright cloud-contaminated observations that drag a temporal median upward when cloud is the modal observation at a pixel. Validated on Faial S2, Landsat, and ASTER 2026-05-28: GeometricMedian outputs showed residual cloud-brightness over the caldera floor and rim; p25 outputs cleaned the caldera, with the expected ~5-10% drop in band means (and ~10-15% drop in NIR — vegetation NIR has the widest temporal distribution, so it falls most under a lower-percentile reducer).
+- **Per-band median** (p50) is the middle option: explicit per-band NoData semantics like p25, but without the cloud-bias correction. Use as an A/B against GeometricMedian when you suspect GeometricMedian's NoData handling is producing artefacts but you don't want the darker bias of p25.
+
+Spectral-consistency caveat for both Per-band variants: a pixel's band-1 value may come from a different scene than its band-2 value. Acceptable for visual mosaicking, NDVI, NDWI, brightness; less ideal for analyses that pull on tight cross-band ratios from the same observation (mineral mapping). The cleaner (default ON) handles per-pixel outlier rejection before the compositor reduces, so cleaner + p25 is the recommended stack for persistent-cloud AOIs.
+
 ---
 
 ## Sensor-aware design
