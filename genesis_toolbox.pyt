@@ -607,7 +607,7 @@ _SANITY_MIN_MEAN = {
 
 
 def _sanity_check_output(raster_path, sensor_hint=None, label=None,
-                         message_callback=None, timeout_s=120.0):
+                         message_callback=None):
     """Per-band stats canary for newly-saved median outputs.
 
     Reads MIN/MEAN/MAX for each band and logs a one-line summary so the
@@ -619,12 +619,15 @@ def _sanity_check_output(raster_path, sensor_hint=None, label=None,
     This is a fast post-save sniff test — not a correctness proof.
     Visual inspection of the output is still required for publication.
 
-    Runs on a daemon thread with ``timeout_s`` second wall-clock budget.
-    A hung ``CalculateStatistics`` or ``GetRasterProperties`` call must
-    NEVER block Phase 9 — the sanity check is non-essential. If the
-    thread doesn't finish in time, a warning is logged and the caller
-    proceeds. The thread is left to die with the tool process; arcpy
-    GP calls can't be safely interrupted mid-flight on Windows.
+    Call site invariant: this MUST be invoked only after the pipeline's
+    in-flight Phase 8 / Phase 9 work for **every** output of the tool
+    is complete and the GDB workspace is quiescent. Concurrent arcpy
+    GDB writes from a still-running ``CalculateStatistics`` in this
+    helper and a parallel ``GeometricMedian`` write from the next
+    mosaic in a dual-output pipeline corrupted ASTER V16's VNIR
+    output ("The table already exists" at Phase 8 save). The helper
+    is intentionally synchronous and single-threaded; if it hangs the
+    pipeline outputs are already on disk, so the user can safely stop.
 
     Args:
         raster_path: Path to the saved raster to inspect.
@@ -635,70 +638,51 @@ def _sanity_check_output(raster_path, sensor_hint=None, label=None,
             the raster's basename.
         message_callback: Optional logging callback. Defaults to
             ``arcpy.AddMessage``.
-        timeout_s: Wall-clock budget in seconds before the canary
-            degrades to a single warning. 120s is generous enough for
-            every current product (Faial-sized 3-band sub-5s, 9-band
-            sub-30s); raise only if a real workflow needs longer.
     """
     msg = message_callback or arcpy.AddMessage
     label = label or os.path.basename(raster_path)
+    # Newly-saved file-geodatabase rasters arrive without statistics
+    # computed, which makes every GetRasterProperties call below fail
+    # with ERROR 001100 ("no statistics available"). One BUILD pass
+    # over the saved raster fixes it; cheap relative to the geomedian
+    # we just ran. Wrapped in try / except so a failure here only
+    # demotes the sanity check to "stats unavailable" instead of
+    # bringing the run down.
+    try:
+        arcpy.management.CalculateStatistics(raster_path)
+    except Exception:
+        pass
+    try:
+        band_count = int(arcpy.Raster(raster_path).bandCount)
+    except Exception as e:
+        arcpy.AddWarning(f"  Sanity check [{label}]: cannot open ({e})")
+        return
 
-    def _do_check():
-        # Newly-saved file-geodatabase rasters arrive without statistics
-        # computed, which makes every GetRasterProperties call below
-        # fail with ERROR 001100 ("no statistics available"). One BUILD
-        # pass over the saved raster fixes it; cheap relative to the
-        # geomedian we just ran. Wrapped in try / except so an arcpy
-        # error here only demotes the sanity check to "stats
-        # unavailable" instead of bringing the run down. A HANG (not an
-        # exception) is handled by the surrounding thread+timeout
-        # guard — this is the call that deadlocked V15.
+    threshold = _SANITY_MIN_MEAN.get(sensor_hint)
+    msg(f"  Sanity check [{label}]: {band_count} band(s)")
+    suspicious = []
+    for i in range(1, band_count + 1):
+        band_ref = f"{raster_path}/Band_{i}"
         try:
-            arcpy.management.CalculateStatistics(raster_path)
-        except Exception:
-            pass
-        try:
-            band_count = int(arcpy.Raster(raster_path).bandCount)
+            min_v = float(arcpy.management.GetRasterProperties(
+                band_ref, "MINIMUM").getOutput(0).replace(",", "."))
+            mean_v = float(arcpy.management.GetRasterProperties(
+                band_ref, "MEAN").getOutput(0).replace(",", "."))
+            max_v = float(arcpy.management.GetRasterProperties(
+                band_ref, "MAXIMUM").getOutput(0).replace(",", "."))
+            msg(f"    Band {i}: mean={mean_v:.4g}, min={min_v:.4g}, max={max_v:.4g}")
+            if threshold is not None and mean_v < threshold:
+                suspicious.append(i)
         except Exception as e:
-            arcpy.AddWarning(f"  Sanity check [{label}]: cannot open ({e})")
-            return
+            arcpy.AddWarning(f"    Band {i}: stats unavailable ({e})")
 
-        threshold = _SANITY_MIN_MEAN.get(sensor_hint)
-        msg(f"  Sanity check [{label}]: {band_count} band(s)")
-        suspicious = []
-        for i in range(1, band_count + 1):
-            band_ref = f"{raster_path}/Band_{i}"
-            try:
-                min_v = float(arcpy.management.GetRasterProperties(
-                    band_ref, "MINIMUM").getOutput(0).replace(",", "."))
-                mean_v = float(arcpy.management.GetRasterProperties(
-                    band_ref, "MEAN").getOutput(0).replace(",", "."))
-                max_v = float(arcpy.management.GetRasterProperties(
-                    band_ref, "MAXIMUM").getOutput(0).replace(",", "."))
-                msg(f"    Band {i}: mean={mean_v:.4g}, min={min_v:.4g}, max={max_v:.4g}")
-                if threshold is not None and mean_v < threshold:
-                    suspicious.append(i)
-            except Exception as e:
-                arcpy.AddWarning(f"    Band {i}: stats unavailable ({e})")
-
-        if suspicious:
-            arcpy.AddWarning(
-                f"  Sanity check: band(s) {suspicious} have a mean below "
-                f"{threshold} for sensor {sensor_hint!r}. This is the signature "
-                "of a NoData-handling regression in the compositing step "
-                "(values pulled toward zero). Verify the output visually "
-                "before publishing."
-            )
-
-    t = threading.Thread(target=_do_check, daemon=True, name=f"sanity-{label}")
-    t.start()
-    t.join(timeout_s)
-    if t.is_alive():
+    if suspicious:
         arcpy.AddWarning(
-            f"  Sanity check [{label}]: timed out after {timeout_s:.0f}s "
-            "(CalculateStatistics or GetRasterProperties likely deadlocked "
-            "on the saved raster). Stats logging skipped; pipeline continues. "
-            "Verify the output visually before publishing."
+            f"  Sanity check: band(s) {suspicious} have a mean below "
+            f"{threshold} for sensor {sensor_hint!r}. This is the signature "
+            "of a NoData-handling regression in the compositing step "
+            "(values pulled toward zero). Verify the output visually "
+            "before publishing."
         )
 
 
@@ -9570,6 +9554,20 @@ class AsterMosaic(object):
                     "(produce_vnir = False)"
                 )
 
+            # Per-output sanity check runs AFTER both _run_mosaic_pipeline
+            # calls return. The GDB workspace is quiescent at this point
+            # — no concurrent Phase 8 writes or Phase 9 sidecar work can
+            # collide with CalculateStatistics or GetRasterProperties.
+            # If the sanity check ever hangs here, both mosaics are
+            # already committed to the GDB and the user can safely stop.
+            if outputs:
+                arcpy.AddMessage("")
+                for p in outputs:
+                    _sanity_check_output(
+                        p, sensor_hint="aster",
+                        label=os.path.basename(p),
+                    )
+
             total_elapsed = (datetime.now() - total_start).total_seconds()
             mins, secs = divmod(int(total_elapsed), 60)
             hrs, mins = divmod(mins, 60)
@@ -9992,10 +9990,11 @@ class AsterMosaic(object):
                 f"  ✓ {compositor_tag} in {ph.elapsed:.1f}s "
                 f"→ {os.path.basename(output_path)}"
             )
-            _sanity_check_output(
-                output_path, sensor_hint="aster",
-                label=f"{os.path.basename(output_path)} [{label}]",
-            )
+            # NOTE: per-output sanity check moved out of this helper
+            # and into AsterMosaic.execute() — running it here between
+            # Phase 8 and Phase 9 of the FIRST mosaic raced with the
+            # GeometricMedian save of the SECOND mosaic and corrupted
+            # the VNIR output as a table (V16 incident, 2026-05-28).
         except arcpy.ExecuteError:
             # phase manager already warned with the canonical "✗ Phase 8
             # ... failed after Xs" line; no need for a duplicate AddError.
