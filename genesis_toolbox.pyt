@@ -607,7 +607,7 @@ _SANITY_MIN_MEAN = {
 
 
 def _sanity_check_output(raster_path, sensor_hint=None, label=None,
-                         message_callback=None):
+                         message_callback=None, timeout_s=120.0):
     """Per-band stats canary for newly-saved median outputs.
 
     Reads MIN/MEAN/MAX for each band and logs a one-line summary so the
@@ -619,6 +619,13 @@ def _sanity_check_output(raster_path, sensor_hint=None, label=None,
     This is a fast post-save sniff test — not a correctness proof.
     Visual inspection of the output is still required for publication.
 
+    Runs on a daemon thread with ``timeout_s`` second wall-clock budget.
+    A hung ``CalculateStatistics`` or ``GetRasterProperties`` call must
+    NEVER block Phase 9 — the sanity check is non-essential. If the
+    thread doesn't finish in time, a warning is logged and the caller
+    proceeds. The thread is left to die with the tool process; arcpy
+    GP calls can't be safely interrupted mid-flight on Windows.
+
     Args:
         raster_path: Path to the saved raster to inspect.
         sensor_hint: One of "landsat", "sentinel-2", "aster" to enable
@@ -628,51 +635,70 @@ def _sanity_check_output(raster_path, sensor_hint=None, label=None,
             the raster's basename.
         message_callback: Optional logging callback. Defaults to
             ``arcpy.AddMessage``.
+        timeout_s: Wall-clock budget in seconds before the canary
+            degrades to a single warning. 120s is generous enough for
+            every current product (Faial-sized 3-band sub-5s, 9-band
+            sub-30s); raise only if a real workflow needs longer.
     """
     msg = message_callback or arcpy.AddMessage
     label = label or os.path.basename(raster_path)
-    # Newly-saved file-geodatabase rasters arrive without statistics
-    # computed, which makes every GetRasterProperties call below fail
-    # with ERROR 001100 ("no statistics available"). One BUILD pass
-    # over the saved raster fixes it; cheap relative to the geomedian
-    # we just ran. Wrapped in try / except so a failure here only
-    # demotes the sanity check to "stats unavailable" instead of
-    # bringing the run down.
-    try:
-        arcpy.management.CalculateStatistics(raster_path)
-    except Exception:
-        pass
-    try:
-        band_count = int(arcpy.Raster(raster_path).bandCount)
-    except Exception as e:
-        arcpy.AddWarning(f"  Sanity check [{label}]: cannot open ({e})")
-        return
 
-    threshold = _SANITY_MIN_MEAN.get(sensor_hint)
-    msg(f"  Sanity check [{label}]: {band_count} band(s)")
-    suspicious = []
-    for i in range(1, band_count + 1):
-        band_ref = f"{raster_path}/Band_{i}"
+    def _do_check():
+        # Newly-saved file-geodatabase rasters arrive without statistics
+        # computed, which makes every GetRasterProperties call below
+        # fail with ERROR 001100 ("no statistics available"). One BUILD
+        # pass over the saved raster fixes it; cheap relative to the
+        # geomedian we just ran. Wrapped in try / except so an arcpy
+        # error here only demotes the sanity check to "stats
+        # unavailable" instead of bringing the run down. A HANG (not an
+        # exception) is handled by the surrounding thread+timeout
+        # guard — this is the call that deadlocked V15.
         try:
-            min_v = float(arcpy.management.GetRasterProperties(
-                band_ref, "MINIMUM").getOutput(0).replace(",", "."))
-            mean_v = float(arcpy.management.GetRasterProperties(
-                band_ref, "MEAN").getOutput(0).replace(",", "."))
-            max_v = float(arcpy.management.GetRasterProperties(
-                band_ref, "MAXIMUM").getOutput(0).replace(",", "."))
-            msg(f"    Band {i}: mean={mean_v:.4g}, min={min_v:.4g}, max={max_v:.4g}")
-            if threshold is not None and mean_v < threshold:
-                suspicious.append(i)
+            arcpy.management.CalculateStatistics(raster_path)
+        except Exception:
+            pass
+        try:
+            band_count = int(arcpy.Raster(raster_path).bandCount)
         except Exception as e:
-            arcpy.AddWarning(f"    Band {i}: stats unavailable ({e})")
+            arcpy.AddWarning(f"  Sanity check [{label}]: cannot open ({e})")
+            return
 
-    if suspicious:
+        threshold = _SANITY_MIN_MEAN.get(sensor_hint)
+        msg(f"  Sanity check [{label}]: {band_count} band(s)")
+        suspicious = []
+        for i in range(1, band_count + 1):
+            band_ref = f"{raster_path}/Band_{i}"
+            try:
+                min_v = float(arcpy.management.GetRasterProperties(
+                    band_ref, "MINIMUM").getOutput(0).replace(",", "."))
+                mean_v = float(arcpy.management.GetRasterProperties(
+                    band_ref, "MEAN").getOutput(0).replace(",", "."))
+                max_v = float(arcpy.management.GetRasterProperties(
+                    band_ref, "MAXIMUM").getOutput(0).replace(",", "."))
+                msg(f"    Band {i}: mean={mean_v:.4g}, min={min_v:.4g}, max={max_v:.4g}")
+                if threshold is not None and mean_v < threshold:
+                    suspicious.append(i)
+            except Exception as e:
+                arcpy.AddWarning(f"    Band {i}: stats unavailable ({e})")
+
+        if suspicious:
+            arcpy.AddWarning(
+                f"  Sanity check: band(s) {suspicious} have a mean below "
+                f"{threshold} for sensor {sensor_hint!r}. This is the signature "
+                "of a NoData-handling regression in the compositing step "
+                "(values pulled toward zero). Verify the output visually "
+                "before publishing."
+            )
+
+    t = threading.Thread(target=_do_check, daemon=True, name=f"sanity-{label}")
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
         arcpy.AddWarning(
-            f"  Sanity check: band(s) {suspicious} have a mean below "
-            f"{threshold} for sensor {sensor_hint!r}. This is the signature "
-            "of a NoData-handling regression in the compositing step "
-            "(values pulled toward zero). Verify the output visually "
-            "before publishing."
+            f"  Sanity check [{label}]: timed out after {timeout_s:.0f}s "
+            "(CalculateStatistics or GetRasterProperties likely deadlocked "
+            "on the saved raster). Stats logging skipped; pipeline continues. "
+            "Verify the output visually before publishing."
         )
 
 
