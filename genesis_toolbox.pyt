@@ -2981,16 +2981,35 @@ _TIME_FILTER_LABELS = [
     "Season All Years",
 ]
 
+# Legacy → canonical internal key remap. Earlier S2/ASTER releases
+# offered ``year_month`` in the dropdown as the snake_case label for
+# what Landsat already called ``Month in Year`` (resolved internally
+# to ``month_in_year``). When the v1.0 unification picked Landsat's
+# label, ``year_month`` became orphaned: a saved Pro workflow / a
+# scripted call still passing ``"year_month"`` would normalise to
+# itself and then silently drop every scene because
+# ``_scene_passes_filter`` only recognises ``month_in_year`` now.
+# This table catches the orphan and the (smaller) parallel risk that
+# someone serialised a snake_case lowercase form of any of the new
+# labels.
+_LEGACY_TYPE_KEY_REMAP = {
+    "year_month": "month_in_year",
+}
+
 
 def _time_filter_key(label):
     """Normalise a TitleCase dropdown label to its snake_case
     internal type key (consumed by ``_scene_passes_filter`` and
     ``_create_temporal_filter``). Idempotent: passing an already
     snake_case key returns it unchanged. None / empty resolves to
-    ``all_images`` (the most permissive default)."""
+    ``all_images`` (the most permissive default). Legacy snake_case
+    values from pre-v1.0 releases are remapped to their current
+    canonical key via ``_LEGACY_TYPE_KEY_REMAP`` so saved Pro
+    workflows and scripted callers don't silently fail."""
     if not label:
         return "all_images"
-    return str(label).lower().replace(" ", "_")
+    normalized = str(label).lower().replace(" ", "_")
+    return _LEGACY_TYPE_KEY_REMAP.get(normalized, normalized)
 
 
 # Tool 07 stack discovery: auto-detect across the three per-scene

@@ -15,6 +15,58 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
+# Shared time-filter helper (_time_filter_key) — unified across mosaic
+# tools 01/02/03 in v1.0. Direct tests of the resolver so the
+# behaviour is pinned at the helper level, not only via the per-tool
+# _create_temporal_filter integration tests.
+# ---------------------------------------------------------------------------
+
+def test_time_filter_key_normalises_titlecase_labels(genesis):
+    """Every TitleCase dropdown label resolves to its canonical
+    snake_case internal key."""
+    assert genesis._time_filter_key("All Images") == "all_images"
+    assert genesis._time_filter_key("Specific Year") == "specific_year"
+    assert genesis._time_filter_key("Month in Year") == "month_in_year"
+    assert genesis._time_filter_key("Month All Years") == "month_all_years"
+    assert genesis._time_filter_key("Season in Year") == "season_in_year"
+    assert genesis._time_filter_key("Season All Years") == "season_all_years"
+
+
+def test_time_filter_key_is_idempotent_on_canonical_snake_case(genesis):
+    """Already-canonical snake_case keys pass through unchanged so
+    internal callers don't have to know whether they hold a label or
+    a key."""
+    for key in (
+        "all_images", "specific_year", "month_in_year",
+        "month_all_years", "season_in_year", "season_all_years",
+    ):
+        assert genesis._time_filter_key(key) == key
+
+
+def test_time_filter_key_remaps_legacy_year_month_to_month_in_year(genesis):
+    """Pre-v1.0 S2 and ASTER releases used ``year_month`` as the
+    snake_case label for what is now ``month_in_year``. Saved Pro
+    workflows and scripted callers passing the legacy value must
+    keep working — silent-drop in ``_scene_passes_filter`` otherwise."""
+    assert genesis._time_filter_key("year_month") == "month_in_year"
+
+
+def test_time_filter_key_empty_and_none_default_to_all_images(genesis):
+    """None / empty string is the most-permissive fallback so a
+    blank dropdown doesn't silently filter out every scene."""
+    assert genesis._time_filter_key(None) == "all_images"
+    assert genesis._time_filter_key("") == "all_images"
+
+
+def test_time_filter_key_unknown_label_passes_through_normalised(genesis):
+    """A future dropdown value that isn't in the canonical set must
+    still produce a clean snake_case key — the resolver is a
+    normaliser, not a whitelist. Validation that the value is in
+    ``_TIME_FILTER_LABELS`` is a separate concern."""
+    assert genesis._time_filter_key("Future Label X") == "future_label_x"
+
+
+# ---------------------------------------------------------------------------
 # Foundation copied from the audited landsat_toolbox is intact
 # ---------------------------------------------------------------------------
 
