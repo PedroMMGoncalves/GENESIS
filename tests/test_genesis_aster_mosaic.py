@@ -255,9 +255,24 @@ def aster_january_2019_meta():
     return {"acquisition_date": date(2019, 1, 15), "scene_id": "y"}
 
 
-def test_temporal_filter_year_month(genesis, aster_september_2006_meta, aster_january_2019_meta):
+def test_temporal_filter_month_in_year(genesis, aster_september_2006_meta, aster_january_2019_meta):
+    """v1.0 unified the time-filter dropdown across mosaic tools:
+    ``Month in Year`` (the Landsat label) replaces the old
+    ``year_month`` snake_case value. The canonical internal key is
+    ``month_in_year``."""
     tool = genesis.AsterMosaic()
-    f = tool._create_temporal_filter("year_month", 2006, 9, None)
+    f = tool._create_temporal_filter("Month in Year", 2006, 9, None)
+    assert f["type"] == "month_in_year"
+    assert tool._scene_passes_filter(aster_september_2006_meta, f, "temperate")
+    assert not tool._scene_passes_filter(aster_january_2019_meta, f, "temperate")
+
+
+def test_temporal_filter_specific_year_landsat_parity(genesis, aster_september_2006_meta, aster_january_2019_meta):
+    """Specific Year (every scene in a year, regardless of month) was
+    Landsat-only until v1.0; ASTER honours it now too."""
+    tool = genesis.AsterMosaic()
+    f = tool._create_temporal_filter("Specific Year", 2006, None, None)
+    assert f["type"] == "specific_year"
     assert tool._scene_passes_filter(aster_september_2006_meta, f, "temperate")
     assert not tool._scene_passes_filter(aster_january_2019_meta, f, "temperate")
 

@@ -2963,6 +2963,36 @@ def _resolve_gdv_thresholds(seasonal_pattern):
     )
     return cfg["dry_floor"], cfg["wet_min"]
 
+# Canonical time-filter dropdown for the mosaic tools 01 / 02 / 03.
+# User-facing labels stay TitleCase (polished UX); ``_time_filter_key``
+# normalises them to the snake_case internal ``type`` key that
+# ``_scene_passes_filter`` consumes. Earlier versions had LandsatMosaic
+# offering 6 values in TitleCase while Sentinel2Mosaic and AsterMosaic
+# offered 5 values in snake_case, missing ``specific_year`` entirely
+# (process all scenes from a given year regardless of month). This
+# single source of truth keeps the three tools' dropdowns identical
+# and exposes ``Specific Year`` to S2 / ASTER.
+_TIME_FILTER_LABELS = [
+    "All Images",
+    "Specific Year",
+    "Month in Year",
+    "Month All Years",
+    "Season in Year",
+    "Season All Years",
+]
+
+
+def _time_filter_key(label):
+    """Normalise a TitleCase dropdown label to its snake_case
+    internal type key (consumed by ``_scene_passes_filter`` and
+    ``_create_temporal_filter``). Idempotent: passing an already
+    snake_case key returns it unchanged. None / empty resolves to
+    ``all_images`` (the most permissive default)."""
+    if not label:
+        return "all_images"
+    return str(label).lower().replace(" ", "_")
+
+
 # Tool 07 stack discovery: auto-detect across the three per-scene
 # scratch conventions emitted by tools 01/02/03. Each mosaic writes a
 # different filename suffix (S2 -> ``*_stack.tif``, Landsat ->
@@ -4812,8 +4842,7 @@ class LandsatMosaic(object):
             parameterType="Required",
             direction="Input"
         )
-        time_type.filter.list = ["All Images", "Specific Year", "Month in Year", 
-                                "Month All Years", "Season in Year", "Season All Years"]
+        time_type.filter.list = list(_TIME_FILTER_LABELS)
 
         # Year (optional, enabled for year-specific options)
         year = arcpy.Parameter(
@@ -5592,14 +5621,20 @@ class LandsatMosaic(object):
 
             # Process each UTM zone
             final_mosaics = []
+            # LandsatMosaic runs Phases 1-3 per UTM zone (S2 / ASTER are
+            # single-zone tools so their Phase markers don't recur). The
+            # banner below makes the per-zone boundary explicit so the
+            # cycling Phase numbers don't read as the tool restarting.
             for utm_zone in region_info['utm_zones']:
                 if arcpy.env.isCancelled:
                     arcpy.AddWarning("\n✗ Cancelled by user between UTM zones.")
                     return None
                 try:
-                    arcpy.AddMessage(
-                        f"\n▶ Phase 1 — UTM zone {utm_zone}{region_info['hemisphere']}: scene discovery"
-                    )
+                    zone_tag = f"UTM {utm_zone}{region_info['hemisphere']}"
+                    arcpy.AddMessage("\n" + "─" * 60)
+                    arcpy.AddMessage(f"  PROCESSING {zone_tag}")
+                    arcpy.AddMessage("─" * 60)
+                    arcpy.AddMessage(f"\n▶ Phase 1 — Scene discovery")
 
                     scenes = self._find_scenes(
                         data_folder=data_folder,
@@ -5739,16 +5774,19 @@ class LandsatMosaic(object):
                 pass
         
     def _create_temporal_filter(self, time_type, year, month, season):
-        """Create temporal filter dictionary"""
-        filter_dict = {'type': time_type.lower().replace(' ', '_')}
-        
+        """Create temporal filter dictionary. Accepts either the
+        TitleCase dropdown label ("All Images", "Specific Year", …) or
+        a pre-normalised snake_case key — ``_time_filter_key`` is
+        idempotent so callers don't have to know which they have."""
+        filter_dict = {'type': _time_filter_key(time_type)}
+
         if year:
             filter_dict['year'] = year
         if month:
             filter_dict['month'] = month
         if season:
             filter_dict['season'] = season
-            
+
         arcpy.AddMessage(f"Temporal filter: {filter_dict}")
         return filter_dict
         
@@ -6912,12 +6950,8 @@ class Sentinel2Mosaic(object):
         # for any scene to pass the filter — a usability footgun that
         # produced an immediate "No scenes match" crash when the user
         # accepted defaults.
-        time_type.filter.list = [
-            "all_images",
-            "year_month", "month_all_years",
-            "season_in_year", "season_all_years",
-        ]
-        time_type.value = "all_images"
+        time_type.filter.list = list(_TIME_FILTER_LABELS)
+        time_type.value = "All Images"
 
         year = arcpy.Parameter(
             displayName="Year (when applicable)",
@@ -7104,23 +7138,27 @@ class Sentinel2Mosaic(object):
             year = parameters[5]
             month = parameters[6]
             season = parameters[7]
-            if time_type.valueAsText == "all_images":
+            if time_type.valueAsText == "All Images":
                 year.enabled = False
                 month.enabled = False
                 season.enabled = False
-            elif time_type.valueAsText == "year_month":
+            elif time_type.valueAsText == "Specific Year":
+                year.enabled = True
+                month.enabled = False
+                season.enabled = False
+            elif time_type.valueAsText == "Month in Year":
                 year.enabled = True
                 month.enabled = True
                 season.enabled = False
-            elif time_type.valueAsText == "month_all_years":
+            elif time_type.valueAsText == "Month All Years":
                 year.enabled = False
                 month.enabled = True
                 season.enabled = False
-            elif time_type.valueAsText == "season_in_year":
+            elif time_type.valueAsText == "Season in Year":
                 year.enabled = True
                 month.enabled = False
                 season.enabled = True
-            elif time_type.valueAsText == "season_all_years":
+            elif time_type.valueAsText == "Season All Years":
                 year.enabled = False
                 month.enabled = False
                 season.enabled = True
@@ -8122,8 +8160,11 @@ class Sentinel2Mosaic(object):
 
     @staticmethod
     def _create_temporal_filter(time_type, year, month, season):
+        """Normalise ``time_type`` to the canonical snake_case key so
+        the dropdown label and the internal value stay in lockstep
+        across the three mosaic tools (see ``_time_filter_key``)."""
         return {
-            "type": time_type,
+            "type": _time_filter_key(time_type),
             "year": year,
             "month": month,
             "season": season,
@@ -8137,7 +8178,9 @@ class Sentinel2Mosaic(object):
         if ftype == "all_images":
             return True
         try:
-            if ftype == "year_month":
+            if ftype == "specific_year":
+                return d.year == temporal_filter["year"]
+            if ftype == "month_in_year":
                 return (
                     d.year == temporal_filter["year"]
                     and d.month == temporal_filter["month"]
@@ -8446,12 +8489,8 @@ class AsterMosaic(object):
         # for any scene to pass the filter — a usability footgun that
         # produced an immediate "No scenes match" crash when the user
         # accepted defaults.
-        time_type.filter.list = [
-            "all_images",
-            "year_month", "month_all_years",
-            "season_in_year", "season_all_years",
-        ]
-        time_type.value = "all_images"
+        time_type.filter.list = list(_TIME_FILTER_LABELS)
+        time_type.value = "All Images"
 
         year = arcpy.Parameter(
             displayName="Year (when applicable)",
@@ -8749,15 +8788,17 @@ class AsterMosaic(object):
             year = parameters[8]
             month = parameters[9]
             season = parameters[10]
-            if time_type.valueAsText == "all_images":
+            if time_type.valueAsText == "All Images":
                 year.enabled = False; month.enabled = False; season.enabled = False
-            elif time_type.valueAsText == "year_month":
+            elif time_type.valueAsText == "Specific Year":
+                year.enabled = True; month.enabled = False; season.enabled = False
+            elif time_type.valueAsText == "Month in Year":
                 year.enabled = True; month.enabled = True; season.enabled = False
-            elif time_type.valueAsText == "month_all_years":
+            elif time_type.valueAsText == "Month All Years":
                 year.enabled = False; month.enabled = True; season.enabled = False
-            elif time_type.valueAsText == "season_in_year":
+            elif time_type.valueAsText == "Season in Year":
                 year.enabled = True; month.enabled = False; season.enabled = True
-            elif time_type.valueAsText == "season_all_years":
+            elif time_type.valueAsText == "Season All Years":
                 year.enabled = False; month.enabled = False; season.enabled = True
 
             # Temporal cleaner family gate: enable_temporal_clean
@@ -10896,7 +10937,13 @@ class AsterMosaic(object):
 
     @staticmethod
     def _create_temporal_filter(time_type, year, month, season):
-        return {"type": time_type, "year": year, "month": month, "season": season}
+        """Normalise ``time_type`` to the canonical snake_case key so
+        the dropdown label and the internal value stay in lockstep
+        across the three mosaic tools (see ``_time_filter_key``)."""
+        return {
+            "type": _time_filter_key(time_type),
+            "year": year, "month": month, "season": season,
+        }
 
     def _scene_passes_filter(self, meta, temporal_filter, seasonal_pattern):
         d = meta.get("acquisition_date")
@@ -10906,7 +10953,9 @@ class AsterMosaic(object):
         if ftype == "all_images":
             return True
         try:
-            if ftype == "year_month":
+            if ftype == "specific_year":
+                return d.year == temporal_filter["year"]
+            if ftype == "month_in_year":
                 return d.year == temporal_filter["year"] and d.month == temporal_filter["month"]
             if ftype == "month_all_years":
                 return d.month == temporal_filter["month"]
@@ -14544,7 +14593,11 @@ class TemporalStatistics(object):
         anchor = _build_workspace_subfolder_path(
             out_workspace, prefix, "temporal",
         )
-        csv_path = _sidecar_path_for_raster(anchor, "_temporal_provenance.csv")
+        # The redundant ``_temporal_`` infix that earlier releases used
+        # is gone — Tool 07 outputs already live in a ``temporal/``
+        # subfolder so the prefix duplicated context that other tools'
+        # provenance CSVs ({output}_provenance.csv) don't carry.
+        csv_path = _sidecar_path_for_raster(anchor, "_provenance.csv")
         try:
             with open(csv_path, "w", encoding="utf-8", newline="") as fh:
                 writer = csv.writer(fh, quoting=csv.QUOTE_MINIMAL)
@@ -14732,6 +14785,12 @@ class TemporalStatistics(object):
             obs = arcpy.sa.CellStatistics(
                 valid_masks, statistics_type="SUM", ignore_nodata="DATA",
             )
+            # The ``LST_`` prefix on this filename (and the persistence
+            # rasters below) is deliberate — it prevents collision with
+            # the NDVI path's ``{prefix}_obs_count`` when a user re-runs
+            # the same output prefix under both stat_source modes. Other
+            # tools' obs_count layers don't carry a mode prefix because
+            # there is only one mode that emits one.
             obs_path = _build_workspace_subfolder_path(
                 out_workspace, f"{prefix}_LST_obs_count{suffix}", "temporal",
             )
@@ -14793,7 +14852,11 @@ class TemporalStatistics(object):
         anchor = _build_workspace_subfolder_path(
             out_workspace, prefix, "temporal",
         )
-        csv_path = _sidecar_path_for_raster(anchor, "_temporal_provenance.csv")
+        # The redundant ``_temporal_`` infix that earlier releases used
+        # is gone — Tool 07 outputs already live in a ``temporal/``
+        # subfolder so the prefix duplicated context that other tools'
+        # provenance CSVs ({output}_provenance.csv) don't carry.
+        csv_path = _sidecar_path_for_raster(anchor, "_provenance.csv")
         config = {
             "stat_source": mode_tag,
             "stratification": stratification,
@@ -14852,6 +14915,7 @@ class TemporalStatistics(object):
         arcpy.AddMessage(f"  Cool delta:     {cool_delta_k} K")
         arcpy.AddMessage(f"  Warm delta:     {warm_delta_k} K")
 
+        arcpy.AddMessage("\n▶ Phase 1 — AST_08 scene discovery")
         paths, metas = self._discover_ast08(ast08_folder)
         if not paths:
             arcpy.AddError(
@@ -14862,6 +14926,7 @@ class TemporalStatistics(object):
         arcpy.AddMessage(f"  AST_08 scenes:  {len(paths)}")
 
         # Per-season grouping reuses the helpers used by the NDVI path.
+        arcpy.AddMessage("\n▶ Phase 2 — Scene grouping")
         seasonal_pattern = self._seasonal_pattern_for_region(region or "")
         dated = [(p, m["acquisition_date"]) for p, m in zip(paths, metas)]
         n_dated = sum(1 for _, d in dated if d is not None)

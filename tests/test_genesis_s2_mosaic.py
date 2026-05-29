@@ -185,11 +185,27 @@ def january_2024_scene():
     }
 
 
-def test_temporal_filter_year_month(genesis, june_2024_scene, january_2024_scene):
+def test_temporal_filter_month_in_year(genesis, june_2024_scene, january_2024_scene):
+    """v1.0 unified the time-filter dropdown: ``Month in Year`` (the
+    Landsat label) replaces the old ``year_month`` snake_case value.
+    _create_temporal_filter normalises both forms via
+    _time_filter_key, but tests assert the canonical key."""
     tool = genesis.Sentinel2Mosaic()
-    f = tool._create_temporal_filter("year_month", 2024, 6, None)
+    f = tool._create_temporal_filter("Month in Year", 2024, 6, None)
+    assert f["type"] == "month_in_year"
     assert tool._scene_passes_filter(june_2024_scene["metadata"], f, "temperate")
     assert not tool._scene_passes_filter(january_2024_scene["metadata"], f, "temperate")
+
+
+def test_temporal_filter_specific_year_landsat_parity(genesis, june_2024_scene, january_2024_scene):
+    """Specific Year was a Landsat-only capability until v1.0.
+    Now S2 honours it too: every scene from the chosen year passes,
+    regardless of month."""
+    tool = genesis.Sentinel2Mosaic()
+    f = tool._create_temporal_filter("Specific Year", 2024, None, None)
+    assert f["type"] == "specific_year"
+    assert tool._scene_passes_filter(june_2024_scene["metadata"], f, "temperate")
+    assert tool._scene_passes_filter(january_2024_scene["metadata"], f, "temperate")
 
 
 def test_temporal_filter_month_all_years(genesis, june_2024_scene, january_2024_scene):
