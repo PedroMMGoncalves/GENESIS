@@ -4970,12 +4970,18 @@ class LandsatMosaic(object):
             "Output naming: {Mosaic Name}_{compositor} — e.g., "
             "Faial_V18_Geomedian, Faial_V18_PerBandMedian, or "
             "Faial_V18_PerBandP25 (where 25 is the percentile value). "
-            "Multi-UTM-zone regions like Angola process per zone "
-            "internally; the final user-facing output drops the "
-            "_UTM{zone}{H} suffix. AOI-masked outputs do NOT carry "
-            "a _Masked suffix — the masked result is the canonical "
-            "output. Provenance CSV sidecar is co-located and named "
-            "{output}_provenance.csv."
+            "Single-UTM-zone regions like Faial / Madeira / Portugal "
+            "Mainland produce one per-zone output (..._UTM26N_...) "
+            "that is renamed in place to drop the zone tag. Multi-"
+            "zone regions like Angola (UTM 32/33/34) merge the per-"
+            "zone outputs into a ..._Merged intermediate which is "
+            "then renamed to drop the _Merged suffix; per-zone "
+            "files are deleted as intermediates. Either way the "
+            "final user-facing output carries only the run name "
+            "and the compositor tag. AOI-masked outputs do NOT "
+            "carry a _Masked suffix — the masked result is the "
+            "canonical output. Provenance CSV sidecar is co-located "
+            "and named {output}_provenance.csv."
         )
         self.canRunInBackground = True
 
@@ -7996,8 +8002,14 @@ class Sentinel2Mosaic(object):
                     intermediates_to_delete.extend(unmasked_to_delete)
                 # When the helper applied a mask, it renamed
                 # ``{tagged_name}_Masked`` (temp) into the canonical
-                # name. Log that for the audit trail.
-                if (mask_feature
+                # name. Log that for the audit trail. The
+                # ``arcpy.Exists`` guard mirrors the helper's own
+                # internal check — without it a typo'd / dropped
+                # ``mask_feature`` layer would produce a misleading
+                # ``drop_masked_suffix`` row in the CSV even though no
+                # masking happened (the helper printed a warning and
+                # returned the unmasked path unchanged).
+                if (mask_feature and arcpy.Exists(mask_feature)
                         and final_mosaic == os.path.join(gdb_path, tagged_name)
                         and pre_mask_basename == tagged_name):
                     rename_log.append((
