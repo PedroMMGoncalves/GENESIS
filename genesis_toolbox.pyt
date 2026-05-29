@@ -3012,6 +3012,97 @@ def _time_filter_key(label):
     return _LEGACY_TYPE_KEY_REMAP.get(normalized, normalized)
 
 
+def _canonical_time_filter_label(raw):
+    """Given any ``time_type`` value (TitleCase dropdown label,
+    pre-v1.0 lowercase form, or legacy snake_case alias), return
+    the canonical TitleCase label that lives in
+    ``_TIME_FILTER_LABELS``. Returns ``None`` when the input is
+    blank or doesn't resolve to any known canonical key. The
+    reverse-lookup uses ``_time_filter_key`` so legacy aliases
+    (``year_month``) resolve to their new canonical equivalent
+    (``Month in Year``) automatically."""
+    if not raw:
+        return None
+    if raw in _TIME_FILTER_LABELS:
+        return raw
+    target_key = _time_filter_key(raw)
+    for label in _TIME_FILTER_LABELS:
+        if _time_filter_key(label) == target_key:
+            return label
+    return None
+
+
+def _coerce_legacy_time_filter_label(time_type_param):
+    """In-place ``updateParameters`` coercion: if a saved Pro
+    workflow / scripted call holds a pre-v1.0 lowercase value, rewrite
+    it to the canonical TitleCase label so the dropdown round-trips
+    cleanly instead of Pro auto-clearing the value on a filter-list
+    mismatch. No-op when the value already matches a canonical
+    label or doesn't resolve. Defensive against arcpy errors so a
+    coercion failure never blocks the rest of updateParameters."""
+    try:
+        raw = time_type_param.valueAsText
+        if not raw or raw in _TIME_FILTER_LABELS:
+            return
+        canonical = _canonical_time_filter_label(raw)
+        if canonical and canonical != raw:
+            time_type_param.value = canonical
+    except Exception:
+        pass
+
+
+def _validate_time_filter_messages(time_type_param, year_param,
+                                   month_param, season_param):
+    """Shared ``updateMessages`` validator for the mosaic tools'
+    time-filter group. Each ``time_type`` mode has a different set
+    of required companion parameters; pre-v1.0 the tools either
+    silently dropped scenes (Specific Year with no year value) or
+    raised mid-run errors. This validator surfaces the requirement
+    inline in the GP dialog before the user clicks Run.
+
+    Tool-side call sites pass their own parameter objects so the
+    parameter-index drift between tools 01/02/03 (Landsat has the
+    group at idx 4-7, ASTER at 7-10) stays the caller's problem,
+    not the helper's. Defensive against arcpy errors."""
+    try:
+        key = _time_filter_key(time_type_param.valueAsText or "")
+        if key == "specific_year":
+            if year_param.value is None:
+                year_param.setErrorMessage(
+                    "Specific Year requires a Year value."
+                )
+        elif key == "month_in_year":
+            if year_param.value is None:
+                year_param.setErrorMessage(
+                    "Month in Year requires a Year value."
+                )
+            if month_param.value is None:
+                month_param.setErrorMessage(
+                    "Month in Year requires a Month value."
+                )
+        elif key == "month_all_years":
+            if month_param.value is None:
+                month_param.setErrorMessage(
+                    "Month All Years requires a Month value."
+                )
+        elif key == "season_in_year":
+            if year_param.value is None:
+                year_param.setErrorMessage(
+                    "Season in Year requires a Year value."
+                )
+            if not season_param.valueAsText:
+                season_param.setErrorMessage(
+                    "Season in Year requires a Season selection."
+                )
+        elif key == "season_all_years":
+            if not season_param.valueAsText:
+                season_param.setErrorMessage(
+                    "Season All Years requires a Season selection."
+                )
+    except Exception:
+        pass
+
+
 # Tool 07 stack discovery: auto-detect across the three per-scene
 # scratch conventions emitted by tools 01/02/03. Each mosaic writes a
 # different filename suffix (S2 -> ``*_stack.tif``, Landsat ->
@@ -5004,6 +5095,13 @@ class LandsatMosaic(object):
         We now cache (folder_path → sorted_years) on `self` and only
         rescan when the folder path actually changes.
         """
+        # Backward-compat: saved Pro workflows holding a pre-v1.0
+        # lowercase time_type value get coerced to the new canonical
+        # label so the dropdown round-trips. Runs unconditionally
+        # because the data-folder early-return below skips the rest of
+        # updateParameters before the user has touched anything.
+        _coerce_legacy_time_filter_label(parameters[4])
+
         if not parameters[2].altered:  # If data folder not set
             return
 
@@ -5143,7 +5241,15 @@ class LandsatMosaic(object):
                         "read on the fly via GDAL, or already-extracted scene "
                         "folders containing *_MTL.txt files."
                     )
-                    
+
+            # Time-filter required-companion validation. Surfaces
+            # "Specific Year requires a Year value" etc. inline in the
+            # GP dialog instead of silently dropping every scene at
+            # run time when the user forgets to fill the gated field.
+            _validate_time_filter_messages(
+                parameters[4], parameters[5], parameters[6], parameters[7],
+            )
+
     def remove_cloud(self, scenes, stats):
         """Validate scenes and pass band_paths through to the composite stage.
 
@@ -7154,6 +7260,9 @@ class Sentinel2Mosaic(object):
         """Enable/disable time-detail parameters based on time_type."""
         try:
             time_type = parameters[4]
+            # Backward-compat: pre-v1.0 lowercase value -> canonical
+            # TitleCase label (saved workflows / scripted callers).
+            _coerce_legacy_time_filter_label(time_type)
             year = parameters[5]
             month = parameters[6]
             season = parameters[7]
@@ -7193,6 +7302,16 @@ class Sentinel2Mosaic(object):
                 )
         except Exception:
             pass
+
+    def updateMessages(self, parameters):
+        """Time-filter required-companion validation. Surfaces
+        "Specific Year requires a Year value" etc. inline in the GP
+        dialog instead of silently dropping every scene at run time
+        when the user forgets to fill the gated field. time_type at
+        index 4 gates year (5), month (6), season (7)."""
+        _validate_time_filter_messages(
+            parameters[4], parameters[5], parameters[6], parameters[7],
+        )
 
     # ------------------------------------------------------------------
     # Execute
@@ -8804,6 +8923,9 @@ class AsterMosaic(object):
             # parameter layout (see getParameterInfo return list for the
             # canonical order).
             time_type = parameters[7]
+            # Backward-compat: pre-v1.0 lowercase value -> canonical
+            # TitleCase label (saved workflows / scripted callers).
+            _coerce_legacy_time_filter_label(time_type)
             year = parameters[8]
             month = parameters[9]
             season = parameters[10]
@@ -8846,7 +8968,9 @@ class AsterMosaic(object):
         """Validate the product-output gates: at least one of
         produce_vnir / produce_vnir_swir must be ON or the run has
         nothing to write. The two booleans are at indices 4 and 5
-        per the post-stripping parameter layout.
+        per the post-stripping parameter layout. Also runs the
+        shared time-filter required-companion validator on the
+        time_type group (indices 7-10).
         """
         try:
             produce_vnir = parameters[4]
@@ -8863,6 +8987,12 @@ class AsterMosaic(object):
                 )
         except Exception:
             pass
+
+        # Time-filter required-companion validation (time_type at 7,
+        # year at 8, month at 9, season at 10).
+        _validate_time_filter_messages(
+            parameters[7], parameters[8], parameters[9], parameters[10],
+        )
 
     # ------------------------------------------------------------------
     # Execute

@@ -67,6 +67,161 @@ def test_time_filter_key_unknown_label_passes_through_normalised(genesis):
 
 
 # ---------------------------------------------------------------------------
+# Saved-Pro-workflow round-trip — _canonical_time_filter_label
+# ---------------------------------------------------------------------------
+
+def test_canonical_time_filter_label_recognises_canonical(genesis):
+    """A value already in ``_TIME_FILTER_LABELS`` passes through
+    unchanged — no coercion needed when the GP dialog state is
+    already current-version."""
+    for label in genesis._TIME_FILTER_LABELS:
+        assert genesis._canonical_time_filter_label(label) == label
+
+
+def test_canonical_time_filter_label_lifts_legacy_lowercase(genesis):
+    """Pre-v1.0 saved Pro workflows held ``"all_images"`` etc. in
+    snake_case. The coercion helper lifts those to the canonical
+    TitleCase label so the dropdown round-trips on load instead of
+    Pro auto-clearing the value on a filter-list mismatch."""
+    assert genesis._canonical_time_filter_label("all_images") == "All Images"
+    assert genesis._canonical_time_filter_label("specific_year") == "Specific Year"
+    assert genesis._canonical_time_filter_label("month_all_years") == "Month All Years"
+    assert genesis._canonical_time_filter_label("season_in_year") == "Season in Year"
+
+
+def test_canonical_time_filter_label_lifts_pre_v1_year_month_alias(genesis):
+    """The pre-v1.0 ``year_month`` alias resolves to its current
+    canonical label ``Month in Year`` via the legacy remap chain."""
+    assert genesis._canonical_time_filter_label("year_month") == "Month in Year"
+
+
+def test_canonical_time_filter_label_none_for_blank_or_unknown(genesis):
+    """Blank input or an unknown value returns ``None`` so the
+    coercion helper can detect "nothing to do" cheaply and skip."""
+    assert genesis._canonical_time_filter_label(None) is None
+    assert genesis._canonical_time_filter_label("") is None
+    assert genesis._canonical_time_filter_label("Random Garbage XYZ") is None
+
+
+# ---------------------------------------------------------------------------
+# _validate_time_filter_messages — required-companion validation
+# ---------------------------------------------------------------------------
+
+class _FakeParam:
+    """Minimal stand-in for arcpy.Parameter — captures setErrorMessage
+    calls and exposes ``value`` / ``valueAsText`` like the real thing."""
+    def __init__(self, value=None, value_as_text=None):
+        self.value = value
+        self.valueAsText = value_as_text if value_as_text is not None else (
+            str(value) if value is not None else None
+        )
+        self._error = None
+
+    def setErrorMessage(self, msg):
+        self._error = msg
+
+    def clearMessage(self):
+        self._error = None
+
+
+def test_validate_time_filter_specific_year_requires_year(genesis):
+    """``Specific Year`` with no year value must surface a clear
+    inline error instead of silently dropping every scene at run
+    time."""
+    time_type = _FakeParam(value_as_text="Specific Year")
+    year = _FakeParam(value=None)
+    month = _FakeParam(value=None)
+    season = _FakeParam(value=None)
+    genesis._validate_time_filter_messages(time_type, year, month, season)
+    assert year._error is not None
+    assert "Year" in year._error
+    assert month._error is None  # not required for this mode
+    assert season._error is None
+
+
+def test_validate_time_filter_month_in_year_requires_both(genesis):
+    time_type = _FakeParam(value_as_text="Month in Year")
+    year = _FakeParam(value=None)
+    month = _FakeParam(value=None)
+    season = _FakeParam(value=None)
+    genesis._validate_time_filter_messages(time_type, year, month, season)
+    assert year._error is not None
+    assert month._error is not None
+    assert season._error is None
+
+
+def test_validate_time_filter_all_images_no_error(genesis):
+    """``All Images`` requires no companion parameters; the
+    validator must not over-report."""
+    time_type = _FakeParam(value_as_text="All Images")
+    year = _FakeParam(value=None)
+    month = _FakeParam(value=None)
+    season = _FakeParam(value=None)
+    genesis._validate_time_filter_messages(time_type, year, month, season)
+    assert year._error is None
+    assert month._error is None
+    assert season._error is None
+
+
+def test_validate_time_filter_specific_year_with_year_supplied_no_error(genesis):
+    """Happy path: Specific Year with year filled in raises no
+    validation error."""
+    time_type = _FakeParam(value_as_text="Specific Year")
+    year = _FakeParam(value=2024)
+    month = _FakeParam(value=None)
+    season = _FakeParam(value=None)
+    genesis._validate_time_filter_messages(time_type, year, month, season)
+    assert year._error is None
+    assert month._error is None
+    assert season._error is None
+
+
+def test_validate_time_filter_season_all_years_requires_season(genesis):
+    time_type = _FakeParam(value_as_text="Season All Years")
+    year = _FakeParam(value=None)
+    month = _FakeParam(value=None)
+    season = _FakeParam(value=None, value_as_text=None)
+    genesis._validate_time_filter_messages(time_type, year, month, season)
+    assert season._error is not None
+    assert year._error is None
+    assert month._error is None
+
+
+# ---------------------------------------------------------------------------
+# _coerce_legacy_time_filter_label — saved-workflow lift
+# ---------------------------------------------------------------------------
+
+def test_coerce_legacy_lifts_lowercase_in_place(genesis):
+    """A saved Pro workflow value gets rewritten in-place to the
+    canonical TitleCase label so the dropdown round-trips."""
+    p = _FakeParam(value_as_text="all_images")
+    genesis._coerce_legacy_time_filter_label(p)
+    assert p.value == "All Images"
+
+
+def test_coerce_legacy_lifts_pre_v1_year_month_alias(genesis):
+    """The pre-v1.0 S2/ASTER ``year_month`` alias coerces to
+    ``Month in Year`` (the current canonical label)."""
+    p = _FakeParam(value_as_text="year_month")
+    genesis._coerce_legacy_time_filter_label(p)
+    assert p.value == "Month in Year"
+
+
+def test_coerce_legacy_noop_on_canonical_value(genesis):
+    """A value already in ``_TIME_FILTER_LABELS`` doesn't get
+    rewritten — the coercion is a one-way migration, not a
+    constantly-firing normaliser that would fight a user's
+    intentional dropdown choice."""
+    p = _FakeParam(value_as_text="Specific Year")
+    original_value = p.value
+    genesis._coerce_legacy_time_filter_label(p)
+    # When valueAsText was already canonical, the helper returns early
+    # without touching .value. _FakeParam sets value = str(valueAsText)
+    # in __init__, so the value should not have been re-assigned.
+    assert p.value == original_value
+
+
+# ---------------------------------------------------------------------------
 # Foundation copied from the audited landsat_toolbox is intact
 # ---------------------------------------------------------------------------
 
