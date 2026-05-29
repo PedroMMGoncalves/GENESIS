@@ -2902,17 +2902,66 @@ _ASTER_TIR_SCALE = 0.1
 # 200 K.
 _ASTER_TIR_VALID_K_FLOOR = 200.0
 
-# Tool 07 — temporal-statistics tunables. ``NDVI_PERSISTENCE_THRESHOLD``
-# is the cut-off used to count how many scenes had "vegetated" canopy
-# at a pixel — Howard & Merrifield (2010) GDV-mapping uses 0.5 for
-# temperate / Mediterranean biomes, 0.3 for arid / semi-arid; raise for
-# tropical dense forest. ``NDWI_WATER_THRESHOLD`` follows McFeeters
-# (1996): NDWI > 0 marks open water. ``GDV_DRY_FLOOR`` is the
-# dry-season NDVI floor that Eamus / Naumburg use to flag persistent
-# canopy (groundwater-dependent vegetation candidates).
-_NDVI_PERSISTENCE_THRESHOLD = 0.5
+# Tool 07 — temporal-statistics tunables, per-biome where the
+# literature distinguishes. Keys mirror ``_DRY_MONTHS_BY_PATTERN`` so
+# the dispatch in ``_seasonal_pattern_for_region`` is one source of
+# truth across the seasonal logic and the threshold logic.
+#
+# ``_PERSISTENCE_THRESHOLD_BY_PATTERN`` — Howard & Merrifield (2010)
+# GDV-mapping uses 0.5 for temperate / Mediterranean biomes (canopy
+# is consistently vegetated above this NDVI floor) and 0.3 for
+# arid / semi-arid (sparse canopy and bare-soil background drag the
+# NDVI distribution down; 0.5 under-counts genuine persistent
+# vegetation by ~10-30 % depending on cover).
+#
+# ``_NDWI_WATER_THRESHOLD`` — McFeeters (1996): NDWI > 0 marks open
+# water across all biomes; no per-pattern variant.
+#
+# ``_GDV_THRESHOLDS_BY_PATTERN`` — Eamus / Naumburg dry-season NDVI
+# floor for GDV candidacy ("dry_floor") plus the wet-season NDVI
+# denominator guard for the Lv 2013 ratio ("wet_min"). Arid patterns
+# shift both downward to match the lower vegetation baseline.
+#
+# ``_resolve_persistence_threshold`` / ``_resolve_gdv_thresholds``
+# (defined just below) are the resolver functions the call sites
+# use; pass them a seasonal pattern and they return the right value
+# with a sensible fallback for unknown patterns (temperate defaults
+# preserve historical behaviour on Faial / Azores runs).
+_PERSISTENCE_THRESHOLD_BY_PATTERN = {
+    "temperate":  0.5,
+    "mozambique": 0.3,
+    "angola":     0.3,
+    "cape_verde": 0.3,
+}
 _NDWI_WATER_THRESHOLD = 0.0
-_GDV_DRY_FLOOR = 0.3
+_GDV_THRESHOLDS_BY_PATTERN = {
+    "temperate":  {"dry_floor": 0.3,  "wet_min": 0.1},
+    "mozambique": {"dry_floor": 0.2,  "wet_min": 0.05},
+    "angola":     {"dry_floor": 0.2,  "wet_min": 0.05},
+    "cape_verde": {"dry_floor": 0.2,  "wet_min": 0.05},
+}
+
+
+def _resolve_persistence_threshold(seasonal_pattern):
+    """Return the NDVI persistence threshold for a seasonal pattern.
+
+    Falls back to the temperate value (0.5) when the pattern is
+    unrecognised — preserves historical behaviour for any future
+    pattern key added before the dict is extended.
+    """
+    return _PERSISTENCE_THRESHOLD_BY_PATTERN.get(
+        seasonal_pattern, _PERSISTENCE_THRESHOLD_BY_PATTERN["temperate"],
+    )
+
+
+def _resolve_gdv_thresholds(seasonal_pattern):
+    """Return the (dry_floor, wet_min) GDV thresholds for a seasonal
+    pattern. Falls back to temperate (0.3 / 0.1) on unknown patterns.
+    """
+    cfg = _GDV_THRESHOLDS_BY_PATTERN.get(
+        seasonal_pattern, _GDV_THRESHOLDS_BY_PATTERN["temperate"],
+    )
+    return cfg["dry_floor"], cfg["wet_min"]
 
 # Tool 07 stack discovery: auto-detect across the three per-scene
 # scratch conventions emitted by tools 01/02/03. Each mosaic writes a
@@ -13955,7 +14004,6 @@ class TemporalStatistics(object):
         stat_source.filter.list = [
             "NDVI/NDWI (multispectral stacks)",
             "LST (AST_08 thermal)",
-            "LST (Landsat ST_B10 thermal)",
         ]
         stat_source.value = "NDVI/NDWI (multispectral stacks)"
 
@@ -14034,8 +14082,7 @@ class TemporalStatistics(object):
     def updateMessages(self, parameters):
         """Mode-aware required-input validation. ``scratch`` is declared
         Required in getParameterInfo for NDVI/NDWI; for the LST modes we
-        forgive the missing scratch and instead require ast08_folder.
-        Landsat ST_B10 is parameter-flagged as not yet implemented."""
+        forgive the missing scratch and instead require ast08_folder."""
         try:
             stat_source = (parameters[9].valueAsText or "")
             scratch = parameters[0]
@@ -14047,12 +14094,6 @@ class TemporalStatistics(object):
                         "AST_08 Folder is required for the LST (AST_08 "
                         "thermal) mode."
                     )
-            elif stat_source == "LST (Landsat ST_B10 thermal)":
-                scratch.clearMessage()
-                parameters[9].setErrorMessage(
-                    "LST (Landsat ST_B10 thermal) mode is not yet "
-                    "implemented. Pick NDVI/NDWI or LST (AST_08 thermal)."
-                )
         except Exception:
             pass
 
@@ -14142,19 +14183,13 @@ class TemporalStatistics(object):
                 arcpy.AddMessage("DONE")
                 arcpy.AddMessage("=" * 60)
                 return None
-            if stat_source == "LST (Landsat ST_B10 thermal)":
-                arcpy.AddError(
-                    "LST (Landsat ST_B10 thermal) mode is not yet "
-                    "implemented. Pick NDVI/NDWI or LST (AST_08 thermal)."
-                )
-                return None
-
             # NDVI/NDWI path. Restore the mode-specific header lines
             # that don't apply to the LST modes.
             arcpy.AddMessage(f"  Scratch:        {scratch_dir}")
             arcpy.AddMessage(f"  Pattern:        {pattern_display}")
 
             # Discover stacks across all selected patterns and union.
+            arcpy.AddMessage("\n▶ Phase 1 — Stack discovery")
             found = []
             for pat in discovery_patterns:
                 found.extend(glob.glob(os.path.join(scratch_dir, pat)))
@@ -14187,6 +14222,7 @@ class TemporalStatistics(object):
 
             # Parse acquisition dates per scene (None when filename
             # doesn't match a known sensor pattern).
+            arcpy.AddMessage("\n▶ Phase 2 — Scene grouping")
             dated = [(p, _scene_date_from_stack_filename(p)) for p in stacks]
             n_dated = sum(1 for _, d in dated if d is not None)
             if n_dated < len(dated):
@@ -14208,7 +14244,7 @@ class TemporalStatistics(object):
                     )
 
             # Per-group outputs
-            arcpy.AddMessage("\n▶ Computing temporal statistics per group...")
+            arcpy.AddMessage("\n▶ Phase 3 — Per-group temporal statistics")
             group_outputs = {}
             for group_name, paths in groups.items():
                 if len(paths) < 2:
@@ -14221,6 +14257,7 @@ class TemporalStatistics(object):
                 outs = self._compute_group_outputs(
                     group_name, paths, sensor, out_prefix, out_workspace,
                     stratified=(stratification == "Per season"),
+                    seasonal_pattern=seasonal_pattern,
                 )
                 arcpy.ResetProgressor()
                 group_outputs[group_name] = outs
@@ -14231,11 +14268,12 @@ class TemporalStatistics(object):
 
             # Cross-group GDV composites (Per season only)
             if stratification == "Per season" and {"dry", "wet"} <= set(group_outputs.keys()):
-                arcpy.AddMessage("\n▶ Computing cross-season GDV composites...")
+                arcpy.AddMessage("\n▶ Phase 4 — Cross-season GDV composites")
                 gdv_outs = self._compute_gdv_compounds(
                     out_prefix, out_workspace,
                     group_outputs["dry"].get("NDVI_mean"),
                     group_outputs["wet"].get("NDVI_mean"),
+                    seasonal_pattern=seasonal_pattern,
                 )
                 if gdv_outs:
                     arcpy.AddMessage(
@@ -14244,9 +14282,10 @@ class TemporalStatistics(object):
 
             # Provenance
             if save_stats:
+                arcpy.AddMessage("\n▶ Phase 5 — Provenance")
                 self._write_provenance_csv(
                     out_workspace, out_prefix, sensor, stratification,
-                    groups, region,
+                    groups, region, seasonal_pattern,
                 )
 
             arcpy.AddMessage("\n" + "=" * 60)
@@ -14298,12 +14337,19 @@ class TemporalStatistics(object):
         return groups
 
     def _compute_group_outputs(self, group_name, scene_paths, sensor,
-                                prefix, out_workspace, stratified):
+                                prefix, out_workspace, stratified,
+                                seasonal_pattern):
         """Build and save the per-group output rasters.
 
         Returns a dict mapping the indicator name to its on-disk path,
         so the caller (Per-season GDV composites) can look up the dry /
         wet ``NDVI_mean`` paths without re-resolving the names.
+
+        ``seasonal_pattern`` (one of the keys in
+        ``_PERSISTENCE_THRESHOLD_BY_PATTERN``) selects the per-biome
+        NDVI persistence cut-off so arid regions don't silently use
+        the temperate 0.5 threshold and under-report persistent
+        vegetation.
         """
         roles = SENSOR_BAND_ROLES[sensor]
         nir_idx = roles["NIR"]
@@ -14356,8 +14402,9 @@ class TemporalStatistics(object):
                 arcpy.AddWarning(f"    ✗ {stat_tag} failed: {e}")
 
         # ---- NDVI persistence ----
+        persistence_threshold = _resolve_persistence_threshold(seasonal_pattern)
         above_list = [
-            arcpy.sa.Con(ndvi > _NDVI_PERSISTENCE_THRESHOLD, 1, 0)
+            arcpy.sa.Con(ndvi > persistence_threshold, 1, 0)
             for ndvi in ndvi_list
         ]
         n_above = arcpy.sa.CellStatistics(
@@ -14429,8 +14476,15 @@ class TemporalStatistics(object):
         return outputs
 
     def _compute_gdv_compounds(self, prefix, out_workspace,
-                                ndvi_mean_dry_path, ndvi_mean_wet_path):
-        """GDV-family cross-season composites (Lv 2013 + Eamus/Naumburg)."""
+                                ndvi_mean_dry_path, ndvi_mean_wet_path,
+                                seasonal_pattern):
+        """GDV-family cross-season composites (Lv 2013 + Eamus/Naumburg).
+
+        ``seasonal_pattern`` picks the per-biome ``dry_floor`` (Eamus /
+        Naumburg cut-off) and ``wet_min`` (Lv 2013 denominator guard).
+        Arid patterns shift both downward to match the lower vegetation
+        baseline; see ``_GDV_THRESHOLDS_BY_PATTERN``.
+        """
         outputs = []
         if not (ndvi_mean_dry_path and ndvi_mean_wet_path):
             arcpy.AddWarning(
@@ -14440,12 +14494,15 @@ class TemporalStatistics(object):
 
         dry = arcpy.sa.Raster(ndvi_mean_dry_path)
         wet = arcpy.sa.Raster(ndvi_mean_wet_path)
+        gdv_dry_floor_value, gdv_wet_min = _resolve_gdv_thresholds(
+            seasonal_pattern,
+        )
 
         # Lv 2013 GDV ratio: NDVI_mean_dry / NDVI_mean_wet. Cap the
-        # denominator at 0.1 so pixels with near-zero wet-season NDVI
-        # (water, bare soil) don't blow up the ratio.
+        # denominator at the per-biome wet-min so pixels with near-zero
+        # wet-season NDVI (water, bare soil) don't blow up the ratio.
         try:
-            gdv_ratio = arcpy.sa.Con(wet > 0.1, dry / wet)
+            gdv_ratio = arcpy.sa.Con(wet > gdv_wet_min, dry / wet)
             gdv_ratio_path = _build_workspace_subfolder_path(
                 out_workspace, f"{prefix}_GDV_ratio", "temporal",
             )
@@ -14457,7 +14514,7 @@ class TemporalStatistics(object):
 
         # Eamus / Naumburg dry-season NDVI floor → binary candidate mask.
         try:
-            gdv_dry_floor = arcpy.sa.Con(dry > _GDV_DRY_FLOOR, 1, 0)
+            gdv_dry_floor = arcpy.sa.Con(dry > gdv_dry_floor_value, 1, 0)
             gdv_floor_path = _build_workspace_subfolder_path(
                 out_workspace, f"{prefix}_GDV_dry_floor", "temporal",
             )
@@ -14471,10 +14528,17 @@ class TemporalStatistics(object):
 
     @staticmethod
     def _write_provenance_csv(out_workspace, prefix, sensor,
-                               stratification, groups, region):
+                               stratification, groups, region,
+                               seasonal_pattern):
         """One CSV per Tool 07 run listing the scenes that contributed
         to each group, plus the run metadata. Lives next to the first
-        temporal output (or alongside the workspace for .gdb)."""
+        temporal output (or alongside the workspace for .gdb).
+
+        ``seasonal_pattern`` is recorded so the resolved per-biome
+        NDVI persistence + GDV thresholds in the CSV are self-
+        documenting (e.g., re-running the same scratch under a
+        different region prints different threshold values).
+        """
         # Anchor the CSV to the first written output path so it lands
         # in the same folder / sibling location as the rasters.
         anchor = _build_workspace_subfolder_path(
@@ -14500,10 +14564,17 @@ class TemporalStatistics(object):
                 writer.writerow(["sensor", sensor])
                 writer.writerow(["stratification", stratification])
                 writer.writerow(["region", region or ""])
+                writer.writerow(["seasonal_pattern", seasonal_pattern])
                 writer.writerow(["toolbox_version", TOOLBOX_VERSION])
+                persistence_threshold = _resolve_persistence_threshold(
+                    seasonal_pattern,
+                )
+                gdv_dry_floor_value, gdv_wet_min = _resolve_gdv_thresholds(
+                    seasonal_pattern,
+                )
                 writer.writerow([
                     "ndvi_persistence_threshold",
-                    f"{_NDVI_PERSISTENCE_THRESHOLD}",
+                    f"{persistence_threshold}",
                 ])
                 writer.writerow([
                     "ndwi_water_threshold",
@@ -14511,7 +14582,11 @@ class TemporalStatistics(object):
                 ])
                 writer.writerow([
                     "gdv_dry_floor",
-                    f"{_GDV_DRY_FLOOR}",
+                    f"{gdv_dry_floor_value}",
+                ])
+                writer.writerow([
+                    "gdv_wet_min",
+                    f"{gdv_wet_min}",
                 ])
                 writer.writerow([
                     "generated", datetime.now().isoformat(timespec="seconds"),
@@ -14809,7 +14884,7 @@ class TemporalStatistics(object):
         scratch = tempfile.mkdtemp(prefix="genesis_lst_ast08_")
         arcpy.AddMessage(f"  Scratch:        {scratch}")
         try:
-            arcpy.AddMessage("\n▶ Computing thermal statistics per group...")
+            arcpy.AddMessage("\n▶ Phase 3 — Per-group thermal statistics")
             for group_name, group_paths in groups.items():
                 if len(group_paths) < 2:
                     continue
