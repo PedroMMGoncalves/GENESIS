@@ -1765,6 +1765,15 @@ _AROSICS_PYTHON_CONVENTIONAL = (
 # Soft cap on the import probe; cold-starts of arcpy + arosics in
 # Pro 3.x are usually 5-12 s, never minutes.
 _AROSICS_IMPORT_PROBE_TIMEOUT_S = 30
+# Retry guard. Concurrent Pro tools (S2 or Landsat mosaic running in
+# parallel with ASTER) can transiently fail the AROSICS import probe
+# with a PROJ database lock, a GDAL driver init race, or a Windows
+# DLL search-path race even though AROSICS is fully installed; a
+# second attempt typically succeeds. 3 attempts × 2 s backoff absorbs
+# the flake without significantly delaying a genuine "AROSICS not
+# installed" verdict (~4 s extra before the install hint surfaces).
+_AROSICS_IMPORT_PROBE_RETRIES = 3
+_AROSICS_IMPORT_PROBE_BACKOFF_S = 2.0
 
 
 def _validate_arosics_python(python_path):
@@ -1777,19 +1786,31 @@ def _validate_arosics_python(python_path):
     AROSICS install (e.g., bare arcgispro-py3 when the user hasn't
     cloned + installed AROSICS into the existing worker env).
 
-    Errors during the probe (timeout, subprocess crash) return False
-    so the caller falls through to the next candidate.
+    Retries up to ``_AROSICS_IMPORT_PROBE_RETRIES`` times with
+    ``_AROSICS_IMPORT_PROBE_BACKOFF_S`` second backoff between
+    attempts. Catches the transient concurrent-Pro-tool failures
+    described above. A genuinely missing install is deterministic
+    and fails every retry — the install hint still surfaces, just
+    ~4 s later.
+
+    Errors during every probe attempt (timeout, subprocess crash)
+    return False so the caller falls through to the next candidate.
     """
-    try:
-        proc = subprocess.run(
-            [python_path, "-c",
-             "from arosics import COREG_LOCAL, DESHIFTER"],
-            capture_output=True,
-            timeout=_AROSICS_IMPORT_PROBE_TIMEOUT_S,
-        )
-        return proc.returncode == 0
-    except Exception:
-        return False
+    for attempt in range(_AROSICS_IMPORT_PROBE_RETRIES):
+        try:
+            proc = subprocess.run(
+                [python_path, "-c",
+                 "from arosics import COREG_LOCAL, DESHIFTER"],
+                capture_output=True,
+                timeout=_AROSICS_IMPORT_PROBE_TIMEOUT_S,
+            )
+            if proc.returncode == 0:
+                return True
+        except Exception:
+            pass
+        if attempt < _AROSICS_IMPORT_PROBE_RETRIES - 1:
+            time.sleep(_AROSICS_IMPORT_PROBE_BACKOFF_S)
+    return False
 
 
 def _resolve_arosics_python():
