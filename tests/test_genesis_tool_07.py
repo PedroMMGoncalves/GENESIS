@@ -138,3 +138,43 @@ def test_classify_season_bucket_temperate_dry_months(genesis):
     february = _dt.date(2024, 2, 15)
     assert genesis._classify_season_bucket(july, "temperate") == "dry"
     assert genesis._classify_season_bucket(february, "temperate") == "wet"
+
+
+# ---------------------------------------------------------------------------
+# Provenance sidecar compat shim
+# ---------------------------------------------------------------------------
+
+def test_legacy_temporal_provenance_copy_writes_both_filenames(genesis, tmp_path):
+    """v1.0 renamed Tool 07's sidecar from
+    ``_temporal_provenance.csv`` to ``_provenance.csv``. The shim
+    also writes the legacy name so scripts that pre-date the rename
+    don't break this release. The shim is scheduled for removal in
+    the release after next; this test will switch to asserting the
+    legacy name DOESN'T appear when that lands."""
+    # Build the canonical sidecar path the way Tool 07 does.
+    anchor = str(tmp_path / "Faial_S2_temporal")
+    canonical = genesis._sidecar_path_for_raster(anchor, "_provenance.csv")
+    # The canonical file has to exist for the shim to copy it.
+    with open(canonical, "w", encoding="utf-8") as fh:
+        fh.write("scene_id,date\nXYZ123,2024-06-01\n")
+
+    genesis._write_legacy_temporal_provenance_copy(anchor, canonical)
+
+    legacy = genesis._sidecar_path_for_raster(
+        anchor, "_temporal_provenance.csv",
+    )
+    import os
+    assert os.path.isfile(canonical), "canonical CSV must remain"
+    assert os.path.isfile(legacy), "legacy CSV must be produced too"
+    with open(legacy, "r", encoding="utf-8") as fh:
+        assert fh.read().startswith("scene_id,date")
+
+
+def test_legacy_temporal_provenance_copy_noop_on_missing_canonical(genesis, tmp_path):
+    """If the canonical CSV write failed earlier in the pipeline,
+    the shim must not raise — it surfaces a warning and returns."""
+    anchor = str(tmp_path / "no_canonical_csv")
+    missing = genesis._sidecar_path_for_raster(anchor, "_provenance.csv")
+    # No actual file written. The shim should warn but not raise.
+    genesis._write_legacy_temporal_provenance_copy(anchor, missing)
+    # If we got here without raising, the defensive guard worked.

@@ -902,6 +902,29 @@ def _build_workspace_subfolder_path(out_workspace, name, subfolder):
 # Tool 07 helpers — temporal statistics over per-scene scratch stacks
 # ---------------------------------------------------------------------------
 
+
+def _write_legacy_temporal_provenance_copy(anchor, csv_path):
+    """Compat shim: also write the pre-v1.0 Tool 07 provenance filename
+    (``{anchor}_temporal_provenance.csv``) by copying the just-written
+    ``{anchor}_provenance.csv``. Anyone with a script reading the old
+    filename keeps working through this release; the shim is
+    scheduled for removal in the release after next.
+
+    Defensive: a copy failure surfaces as a warning but never aborts
+    the run — the canonical CSV is already on disk."""
+    try:
+        legacy_path = _sidecar_path_for_raster(
+            anchor, "_temporal_provenance.csv",
+        )
+        if legacy_path != csv_path:
+            shutil.copy2(csv_path, legacy_path)
+    except OSError as e:
+        arcpy.AddWarning(
+            f"  Could not write legacy provenance CSV ({e}); scripts "
+            "depending on _temporal_provenance.csv may break this run."
+        )
+
+
 # Dry-month sets per regional climate pattern. Mirrors
 # _seasonal_pattern_for_region (defined on each mosaic tool) but bucketed
 # into a single binary dry/wet axis suitable for Tool 07's temporal
@@ -5246,9 +5269,15 @@ class LandsatMosaic(object):
             # "Specific Year requires a Year value" etc. inline in the
             # GP dialog instead of silently dropping every scene at
             # run time when the user forgets to fill the gated field.
-            _validate_time_filter_messages(
-                parameters[4], parameters[5], parameters[6], parameters[7],
-            )
+            # Defensive wrap per the file-wide convention — a partial
+            # dialog load with fewer than 8 parameters would IndexError
+            # otherwise.
+            try:
+                _validate_time_filter_messages(
+                    parameters[4], parameters[5], parameters[6], parameters[7],
+                )
+            except Exception:
+                pass
 
     def remove_cloud(self, scenes, stats):
         """Validate scenes and pass band_paths through to the composite stage.
@@ -7308,10 +7337,20 @@ class Sentinel2Mosaic(object):
         "Specific Year requires a Year value" etc. inline in the GP
         dialog instead of silently dropping every scene at run time
         when the user forgets to fill the gated field. time_type at
-        index 4 gates year (5), month (6), season (7)."""
-        _validate_time_filter_messages(
-            parameters[4], parameters[5], parameters[6], parameters[7],
-        )
+        index 4 gates year (5), month (6), season (7).
+
+        Wrapped in try / except per the file-wide defensive
+        convention — Pro can call updateMessages during a partial
+        dialog load with fewer parameters than expected, and an
+        IndexError here would surface as a dialog-blocking traceback
+        instead of just skipping the validation cycle.
+        """
+        try:
+            _validate_time_filter_messages(
+                parameters[4], parameters[5], parameters[6], parameters[7],
+            )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Execute
@@ -8989,10 +9028,15 @@ class AsterMosaic(object):
             pass
 
         # Time-filter required-companion validation (time_type at 7,
-        # year at 8, month at 9, season at 10).
-        _validate_time_filter_messages(
-            parameters[7], parameters[8], parameters[9], parameters[10],
-        )
+        # year at 8, month at 9, season at 10). Defensive wrap per the
+        # file-wide convention — a partial dialog load with fewer than
+        # 11 parameters would IndexError otherwise.
+        try:
+            _validate_time_filter_messages(
+                parameters[7], parameters[8], parameters[9], parameters[10],
+            )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Execute
@@ -14794,6 +14838,7 @@ class TemporalStatistics(object):
                     "generated", datetime.now().isoformat(timespec="seconds"),
                 ])
             arcpy.AddMessage(f"  Provenance CSV: {csv_path}")
+            _write_legacy_temporal_provenance_copy(anchor, csv_path)
         except OSError as e:
             arcpy.AddWarning(f"  Could not write provenance CSV ({e})")
 
@@ -15042,6 +15087,7 @@ class TemporalStatistics(object):
                             p,
                         ])
             arcpy.AddMessage(f"  Provenance CSV: {csv_path}")
+            _write_legacy_temporal_provenance_copy(anchor, csv_path)
         except OSError as e:
             arcpy.AddWarning(f"  Could not write provenance CSV ({e})")
 
