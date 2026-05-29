@@ -348,6 +348,72 @@ def test_provenance_csv_handles_empty_scenes(genesis, tmp_path):
     assert not os.path.exists(expected)
 
 
+def test_provenance_csv_includes_rename_audit_when_supplied(genesis, tmp_path):
+    """v1.0 added a rename audit trail to the provenance CSV so a
+    post-mortem of an unexpectedly-named output can be done from the
+    sidecar. Single rename → header + rows visible after scene rows."""
+    output_raster = str(tmp_path / "Faial_V18_PerBandP25.tif")
+    scenes_used = [
+        {
+            "path": "D:/data/S2A_MSIL2A_20240601T103021_N0500_R108_T29SQB_20240601T142319.SAFE",
+            "metadata": {
+                "date_acquired": date(2024, 6, 1),
+                "tile_id": "T29SQB",
+                "cloud_cover": 10.0,
+                "product_uri": "S2A_MSIL2A_20240601T103021_N0500_R108_T29SQB_20240601T142319.SAFE",
+            },
+        },
+    ]
+    rename_log = [
+        ("drop_tile_id",
+         "Faial_V18_T29SQB_PerBandP25",
+         "Faial_V18_PerBandP25"),
+        ("drop_masked_suffix",
+         "Faial_V18_PerBandP25_Masked",
+         "Faial_V18_PerBandP25"),
+    ]
+    genesis.Sentinel2Mosaic._write_provenance_csv(
+        output_raster, scenes_used, rename_log=rename_log,
+    )
+    csv_path = genesis._sidecar_path_for_raster(
+        output_raster, "_provenance.csv",
+    )
+    with open(csv_path, "r", encoding="utf-8") as fh:
+        body = fh.read()
+    assert "# rename_audit" in body
+    assert "drop_tile_id" in body
+    assert "drop_masked_suffix" in body
+    assert "Faial_V18_T29SQB_PerBandP25" in body
+
+
+def test_provenance_csv_skips_rename_audit_when_empty(genesis, tmp_path):
+    """No renames happened (e.g., GeometricMedian over a multi-tile
+    AOI where the merge created the canonical name directly) → the
+    rename_audit section is omitted entirely. Backwards compatible
+    with consumers that didn't expect it."""
+    output_raster = str(tmp_path / "Faial_V18_Geomedian.tif")
+    scenes_used = [
+        {
+            "path": "D:/data/S2A.SAFE",
+            "metadata": {
+                "date_acquired": date(2024, 6, 1),
+                "tile_id": "T29SQB",
+                "cloud_cover": 5.0,
+                "product_uri": "S2A_MSIL2A.SAFE",
+            },
+        },
+    ]
+    genesis.Sentinel2Mosaic._write_provenance_csv(
+        output_raster, scenes_used, rename_log=[],
+    )
+    csv_path = genesis._sidecar_path_for_raster(
+        output_raster, "_provenance.csv",
+    )
+    with open(csv_path, "r", encoding="utf-8") as fh:
+        body = fh.read()
+    assert "# rename_audit" not in body
+
+
 # ---------------------------------------------------------------------------
 # Structural integration with the rest of the toolbox
 # ---------------------------------------------------------------------------

@@ -4966,7 +4966,16 @@ class LandsatMosaic(object):
             "archives (auto-extracted) or already-extracted scene folders. "
             "QA_PIXEL bits 0-4 are masked; the temporal stack is reduced "
             "to a geometric median. A provenance CSV is written alongside "
-            "the output documenting every contributing scene."
+            "the output documenting every contributing scene.\n\n"
+            "Output naming: {Mosaic Name}_{compositor} — e.g., "
+            "Faial_V18_Geomedian, Faial_V18_PerBandMedian, or "
+            "Faial_V18_PerBandP25 (where 25 is the percentile value). "
+            "Multi-UTM-zone regions like Angola process per zone "
+            "internally; the final user-facing output drops the "
+            "_UTM{zone}{H} suffix. AOI-masked outputs do NOT carry "
+            "a _Masked suffix — the masked result is the canonical "
+            "output. Provenance CSV sidecar is co-located and named "
+            "{output}_provenance.csv."
         )
         self.canRunInBackground = True
 
@@ -5891,6 +5900,10 @@ class LandsatMosaic(object):
             # ONE raster in the output GDB, not a trail of per-zone /
             # pre-mask intermediates.
             intermediates_to_delete = []
+            # Rename audit trail — appended to the provenance CSV so a
+            # post-mortem of an unexpectedly-named output can be done
+            # from the sidecar without scrolling the Pro message log.
+            rename_log = []
 
             with phase(
                 "Phase 5 — Merge / mask / cleanup",
@@ -5929,10 +5942,21 @@ class LandsatMosaic(object):
                 # entry in the GDB Catalog named after the run +
                 # compositor — what the user actually wants to see.
                 if final_mosaic and final_mosaic != canonical_path:
+                    src_basename = os.path.basename(final_mosaic)
+                    rename_event = (
+                        "drop_merged_suffix"
+                        if src_basename.endswith("_Merged")
+                        else "drop_utm_zone"
+                    )
                     try:
                         if arcpy.Exists(canonical_path):
                             arcpy.management.Delete(canonical_path)
                         arcpy.management.Rename(final_mosaic, canonical_path)
+                        rename_log.append((
+                            rename_event,
+                            src_basename,
+                            canonical_name,
+                        ))
                         final_mosaic = canonical_path
                     except arcpy.ExecuteError as e:
                         arcpy.AddWarning(
@@ -5942,6 +5966,7 @@ class LandsatMosaic(object):
 
                 # Apply mask if specified
                 if final_mosaic and mask_feature:
+                    pre_mask_basename = os.path.basename(final_mosaic)
                     masked = self._apply_mask(
                         final_mosaic, mask_feature, gdb_path, canonical_name
                     )
@@ -5949,6 +5974,15 @@ class LandsatMosaic(object):
                         intermediates_to_delete.append(final_mosaic)
                         final_mosaic = masked
                         arcpy.AddMessage(f"  ✓ AOI mask applied → {os.path.basename(masked)}")
+                    elif masked == final_mosaic:
+                        # _apply_mask renamed {canonical_name}_Masked into
+                        # canonical_name in-place (the v1.0 _Masked drop).
+                        # Capture that for the audit trail.
+                        rename_log.append((
+                            "drop_masked_suffix",
+                            f"{canonical_name}_Masked",
+                            canonical_name,
+                        ))
 
                 # Clean up superseded intermediates so the GDB ends with
                 # one raster, not a trail.
@@ -5975,7 +6009,10 @@ class LandsatMosaic(object):
 
             if final_mosaic:
                 try:
-                    self._write_provenance_csv(final_mosaic, all_scenes_used, stats)
+                    self._write_provenance_csv(
+                        final_mosaic, all_scenes_used, stats,
+                        rename_log=rename_log,
+                    )
                 except Exception as e:
                     arcpy.AddWarning(f"  Provenance CSV write failed (non-fatal): {e}")
                 _write_band_sidecar_csv(final_mosaic, "landsat")
@@ -6989,7 +7026,8 @@ class LandsatMosaic(object):
             arcpy.AddWarning(f"  Could not read MTL from {archive_path}: {e}")
         return None
 
-    def _write_provenance_csv(self, output_raster_path, scenes_used, stats):
+    def _write_provenance_csv(self, output_raster_path, scenes_used, stats,
+                               rename_log=None):
         """Write `{output_raster}_provenance.csv` documenting every scene
         that fed into the mosaic.
 
@@ -6997,6 +7035,13 @@ class LandsatMosaic(object):
             scene_id, sensor, acquisition_datetime, path_row,
             cloud_cover_pct, input_path, processing_baseline,
             toolbox_version, processing_datetime
+
+        ``rename_log`` is an optional sequence of
+        ``(event, source_basename, target_basename)`` tuples capturing
+        intermediate-to-canonical renames (UTM-zone drop, _Merged drop,
+        _Masked drop). When present they're appended as a
+        ``# rename_audit`` section so a post-mortem of an unexpectedly-
+        named output can be done from the sidecar.
 
         Failures are non-fatal — a missing provenance file is annoying
         but doesn't invalidate the mosaic itself.
@@ -7038,6 +7083,12 @@ class LandsatMosaic(object):
                         TOOLBOX_VERSION,
                         now_iso,
                     ])
+                if rename_log:
+                    writer.writerow([])
+                    writer.writerow(["# rename_audit"])
+                    writer.writerow(["event", "rename_source", "rename_target"])
+                    for event, src, tgt in rename_log:
+                        writer.writerow([event, src, tgt])
             arcpy.AddMessage(f"Provenance CSV: {csv_path}")
         except OSError as e:
             arcpy.AddWarning(f"Failed to write provenance CSV: {e}")
@@ -7133,7 +7184,16 @@ class Sentinel2Mosaic(object):
             "folders. SCL classes 3/8/9/10 are masked; the temporal "
             "stack is reduced to a geometric median per MGRS tile. "
             "20m bands are resampled to 10m. A provenance CSV is "
-            "written alongside the output."
+            "written alongside the output.\n\n"
+            "Output naming: {Mosaic Name}_{compositor} — e.g., "
+            "Faial_V18_Geomedian, Faial_V18_PerBandMedian, or "
+            "Faial_V18_PerBandP25 (where 25 is the percentile value). "
+            "Per-MGRS-tile intermediates carry the tile id "
+            "(..._T29SQB_...) but the final user-facing output drops "
+            "it. AOI-masked outputs do NOT carry a _Masked suffix — "
+            "the masked result is the canonical output. Provenance "
+            "CSV sidecar is co-located and named "
+            "{output}_provenance.csv."
         )
         self.canRunInBackground = True
 
@@ -7869,6 +7929,10 @@ class Sentinel2Mosaic(object):
                 silent_error=True,
             ) as ph5:
                 intermediates_to_delete = []
+                # Rename audit trail — appended to the provenance CSV so a
+                # post-mortem of an unexpectedly-named output can be done
+                # from the sidecar without scrolling the Pro message log.
+                rename_log = []
 
                 # Output_tag was computed inside the per-tile loop above;
                 # recompute here so the merge/mask phase doesn't depend on
@@ -7909,6 +7973,11 @@ class Sentinel2Mosaic(object):
                             arcpy.management.Delete(canonical)
                         arcpy.management.Rename(src, canonical)
                         final_mosaic = canonical
+                        rename_log.append((
+                            "drop_tile_id",
+                            os.path.basename(src),
+                            os.path.basename(canonical),
+                        ))
                     except arcpy.ExecuteError:
                         final_mosaic = src
                     arcpy.AddMessage(
@@ -7919,11 +7988,23 @@ class Sentinel2Mosaic(object):
                 # masked result into the canonical tagged name (no
                 # ``_Masked`` suffix surfaces in the GDB Catalog) and
                 # returns an empty deletion list.
+                pre_mask_basename = os.path.basename(final_mosaic)
                 final_mosaic, unmasked_to_delete = _apply_aoi_mask_and_save(
                     final_mosaic, mask_feature, gdb_path, tagged_name,
                 )
                 if unmasked_to_delete:
                     intermediates_to_delete.extend(unmasked_to_delete)
+                # When the helper applied a mask, it renamed
+                # ``{tagged_name}_Masked`` (temp) into the canonical
+                # name. Log that for the audit trail.
+                if (mask_feature
+                        and final_mosaic == os.path.join(gdb_path, tagged_name)
+                        and pre_mask_basename == tagged_name):
+                    rename_log.append((
+                        "drop_masked_suffix",
+                        f"{tagged_name}_Masked",
+                        tagged_name,
+                    ))
 
                 # Delete superseded intermediates so only the final mosaic
                 # remains in the output GDB.
@@ -7942,7 +8023,10 @@ class Sentinel2Mosaic(object):
                     arcpy.AddMessage(f"  ✓ Cleaned up {cleaned_count} intermediate(s)")
 
                 if save_stats:
-                    self._write_provenance_csv(final_mosaic, all_scenes_used)
+                    self._write_provenance_csv(
+                        final_mosaic, all_scenes_used,
+                        rename_log=rename_log,
+                    )
                 _write_band_sidecar_csv(final_mosaic, "sentinel-2")
 
             _sanity_check_output(
@@ -8397,7 +8481,14 @@ class Sentinel2Mosaic(object):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _write_provenance_csv(output_raster_path, scenes_used):
+    def _write_provenance_csv(output_raster_path, scenes_used, rename_log=None):
+        """Write the per-scene provenance CSV. ``rename_log`` is an
+        optional sequence of ``(event, source_basename, target_basename)``
+        tuples capturing intermediate-to-canonical renames (tile-id
+        drop, _Masked drop, etc.). When present they're appended as a
+        ``# rename_audit`` section so a post-mortem of an unexpectedly-
+        named output can be done from the sidecar without scrolling
+        the Pro message log."""
         if not output_raster_path or not scenes_used:
             return
         try:
@@ -8432,6 +8523,12 @@ class Sentinel2Mosaic(object):
                         TOOLBOX_VERSION,
                         now_iso,
                     ])
+                if rename_log:
+                    writer.writerow([])
+                    writer.writerow(["# rename_audit"])
+                    writer.writerow(["event", "rename_source", "rename_target"])
+                    for event, src, tgt in rename_log:
+                        writer.writerow([event, src, tgt])
             arcpy.AddMessage(f"Provenance CSV: {csv_path}")
         except OSError as e:
             arcpy.AddWarning(f"Failed to write provenance CSV: {e}")
@@ -8680,7 +8777,18 @@ class AsterMosaic(object):
             "reduced to a GeometricMedian composite. Two products are "
             "produced per run: a 3-band VNIR mosaic from all scenes and "
             "a 9-band VNIR+SWIR mosaic from the pre-Apr-2008 subset. A "
-            "provenance CSV is written alongside each output."
+            "provenance CSV is written alongside each output.\n\n"
+            "Output naming: {Mosaic Name}_Vnir_{compositor} AND "
+            "{Mosaic Name}_VnirSwir_{compositor} — e.g., "
+            "Aster_V18_Vnir_Geomedian + Aster_V18_VnirSwir_Geomedian, "
+            "or Aster_V18_Vnir_PerBandP25 + Aster_V18_VnirSwir_PerBandP25 "
+            "for percentile composites. The product axis "
+            "(Vnir / VnirSwir) sits between the mosaic name and the "
+            "compositor tag so the two products of a single run sort "
+            "next to each other in Pro's Catalog. AOI clipping is "
+            "applied via env.mask / env.extent during processing — no "
+            "_Masked suffix surfaces. Each output gets its own "
+            "{output}_provenance.csv sidecar."
         )
         self.canRunInBackground = True
 
