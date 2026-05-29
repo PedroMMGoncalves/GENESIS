@@ -19,14 +19,19 @@ These changes will land in the next tagged release. They tighten consistency acr
 
 - **`Specific Year` time-filter mode is now available on Sentinel-2 and ASTER mosaics**, matching Landsat. Selects every scene from a chosen year regardless of month — useful for annual mosaics on archives that span many years.
 - **Required-companion validation** for every time-filter mode. `Specific Year` with no year value (and analogous gaps for `Month in Year`, `Season in Year`, etc.) now surface an inline error in the GP dialog before Run, instead of silently dropping every scene at the filter step.
+- **Saved-workflow coercion.** Pre-v1.0 lowercase `time_type` values held by saved Pro workflows (e.g., `"all_images"`) are rewritten on dialog load to the new canonical TitleCase label (`"All Images"`) so saved state round-trips. Defensive `try/except` wraps the validator calls in every mosaic tool's `updateMessages` so a partial dialog load can't raise an IndexError that blocks the dialog.
 - **Per-biome NDVI persistence threshold** (Tool 07). Howard & Merrifield (2010) per-biome value: `temperate = 0.5`, `mozambique / angola / cape_verde = 0.3`. Pre-v1.0 the threshold was hardcoded to 0.5 across all biomes, under-reporting persistent vegetation in arid regions.
 - **Per-biome GDV thresholds** (Tool 07). Eamus / Naumburg dry-season floor and Lv 2013 ratio denominator guard both shift downward for arid patterns.
 - **AROSICS detection retries 3× with 2 s backoff** so a transient concurrent-Pro-tool flake (PROJ database lock, GDAL driver init race) no longer aborts the run.
+- **Tool dialog descriptions document the v1.0 output naming convention by example** so users running each mosaic tool fresh see what filenames to expect (compositor tag, dropped `_Masked`, sidecar location) at the point of action rather than only in the CHANGELOG.
+- **Provenance CSV `# rename_audit` section** (S2 + Landsat). When the tool renames intermediates into the canonical compositor-tagged name (drop tile id, drop UTM zone, drop `_Merged`, drop `_Masked`), each rename is logged as a row in the provenance CSV so a post-mortem of an unexpectedly-named output can be done from the sidecar.
 
 ### Fixed
 
 - **`_sanity_check_output` deadlock** that hung Phase 9 indefinitely on certain `CalculateStatistics` calls. Sanity check now runs after both ASTER mosaics are committed to the GDB, never during the per-mosaic pipeline. The earlier daemon-thread fix corrupted Aster_V16_Vnir as a stub table when the daemon held an arcpy handle into the next mosaic's Phase 8 write; this has been superseded by moving the call to a quiescent workspace.
 - **Dead `LST (Landsat ST_B10)` dropdown option** (Tool 07) removed. Validation already rejected it as "not yet implemented"; the dropdown no longer offers it.
+- **Landsat misleading `_Geomedian` filename suffix** regardless of compositor choice. The suffix now reflects the actual compositor (`_Geomedian`, `_PerBandMedian`, `_PerBandP{N}`); pre-fix runs that chose Per-band but produced `_Geomedian`-named outputs would have mislabelled the algorithm in the GDB.
+- **S2 false-positive `drop_masked_suffix` row** in the provenance CSV. A saved Pro workflow with a typo'd or dropped `mask_feature` layer reference would emit a misleading rename-audit row even though no mask was applied. The condition now mirrors the helper's internal `arcpy.Exists` check.
 
 ## [1.0] — 2026-05-28
 

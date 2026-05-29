@@ -24,6 +24,9 @@ Horizon Europe project (grant 101157447,
 multisensor satellite mosaics for the **Faial Island** demonstrator site
 in the Azores.
 
+See [`CHANGELOG.md`](CHANGELOG.md) for release notes including the breaking
+and additive changes between v1.0 and the next release.
+
 ---
 
 ## Tools
@@ -34,7 +37,7 @@ The toolbox exposes seven tools in workflow order:
 | --- | --- | --- |
 | **01** | Sentinel-2 L2A Mosaic | Cloud-masked mosaic from S2 `.SAFE` archives or `.zip` downloads. Aggressive SCL preset (classes 1, 3, 7, 8, 9, 10, 11) with a 3-pixel cloud-edge buffer by default; output is a 12-band stack (B01-B12 minus B10) with the 20 m and 60 m bands resampled to 10 m via BILINEAR |
 | **02** | Landsat 8/9 C2L2 Mosaic | Cloud-masked mosaic from EarthExplorer `.tar` archives (QA_PIXEL bits 0-4 masked; multi-UTM-zone merging) |
-| **03** | ASTER L2 Mosaic | Mineral-mapping mosaic from AST_07XT V004 (TIFF + HDF input; SWIR 30m → 15m). Nine-phase pipeline: scene discovery → temporal filter → AOI intersection (drops zero-overlap scenes) → **AROSICS co-registration against a Sentinel-2 reference image** ([Scheffler et al. 2017](https://doi.org/10.3390/rs9070676); mandatory — corrects AST_07XT's L1B-grade ~20-50m per-scene geolocation drift that otherwise blurs the multi-scene median to ~30-50m effective resolution; applied as a global geotransform translation so the deshift is robust at any per-band resolution) → **deep-learning cloud + shadow mask via [OmniCloudMask](https://github.com/DPIRD-DMA/OmniCloudMask)** ([Wright et al. 2025](https://doi.org/10.1016/j.rse.2025.114694); mandatory primary cloud detection layer because AST_07XT ships without one, unlike S2 SCL / Landsat QA_PIXEL) → per-scene processing with QA Data Plane quality mask + hardened VNIR spectral cloud test as second-line defence (brightness + spectral flatness + NDVI guard + NDWI water guard + edge dilation) → temporal outlier cleaner (default ON; Tmask-style robust-z reduction; complementary to DL — catches per-pixel time-stack outliers DL doesn't see) → compositor (`arcpy.ia.GeometricMedian` default, with `Per-band median` and `Per-band percentile (p25 default)` alternatives — the latter biases toward the darker quartile to discard cloud-bright residuals) → cleanup + provenance. **Dual output**: `{name}_VnirSwir` (9-band, pre-Apr-2008 scenes only — the ASTER SWIR detector failed afterward) and `{name}_Vnir` (3-band, full archive). Ships `obs_count` + `cloud_freq` evidence-quality sidecars and a per-scene `cloud_pct` in the provenance CSV |
+| **03** | ASTER L2 Mosaic | Mineral-mapping mosaic from AST_07XT V004 (TIFF + HDF input; SWIR 30m → 15m). Nine-phase pipeline: scene discovery → temporal filter → AOI intersection (drops zero-overlap scenes) → **AROSICS co-registration against a Sentinel-2 reference image** ([Scheffler et al. 2017](https://doi.org/10.3390/rs9070676); mandatory — corrects AST_07XT's L1B-grade ~20-50m per-scene geolocation drift that otherwise blurs the multi-scene median to ~30-50m effective resolution; applied as a global geotransform translation so the deshift is robust at any per-band resolution) → **deep-learning cloud + shadow mask via [OmniCloudMask](https://github.com/DPIRD-DMA/OmniCloudMask)** ([Wright et al. 2025](https://doi.org/10.1016/j.rse.2025.114694); mandatory primary cloud detection layer because AST_07XT ships without one, unlike S2 SCL / Landsat QA_PIXEL) → per-scene processing with QA Data Plane quality mask + hardened VNIR spectral cloud test as second-line defence (brightness + spectral flatness + NDVI guard + NDWI water guard + edge dilation) → temporal outlier cleaner (default ON; Tmask-style robust-z reduction; complementary to DL — catches per-pixel time-stack outliers DL doesn't see) → compositor (`arcpy.ia.GeometricMedian` default, with `Per-band median` and `Per-band percentile (p25 default)` alternatives — the latter biases toward the darker quartile to discard cloud-bright residuals) → cleanup + provenance. **Dual output**: `{name}_VnirSwir_{compositor}` (9-band, pre-Apr-2008 scenes only — the ASTER SWIR detector failed afterward) and `{name}_Vnir_{compositor}` (3-band, full archive). Ships `obs_count` + `cloud_freq` evidence-quality sidecars and a per-scene `cloud_pct` in the provenance CSV |
 | **04** | Spectral Indices & Composites | ~25 indices + ~8 RGB composites, sensor-filtered to what each sensor can compute (red-edge for S2; per-wavelength SWIR minerals for ASTER) |
 | **05** | Statistical Transformations | PCA, MNF, and ICA — sensor-agnostic algorithm with persisted `.npz` statistics for cross-AOI re-application |
 | **06** | Spectral Angle Mapper | Reference-spectra classification (table / training samples / endmember pixels) |
@@ -54,7 +57,7 @@ A late-phase failure (e.g. a transient GP error during the median or AOI-mask st
 
 ### Choosing a compositor
 
-All three mosaic tools expose three compositor options in the *Advanced Options*: `GeometricMedian (default)`, `Per-band median`, and `Per-band percentile` (with a `percentile_value` parameter, default 25, range 5-50). Empirical guidance based on the Faial demonstrator A/B runs:
+All three mosaic tools expose three compositor options in the *Advanced Options*: `GeometricMedian (default)`, `Per-band median`, and `Per-band percentile` (with a `percentile_value` parameter, default 25, range 5-50). The chosen compositor is reflected in the output filename (see [Filename convention](#filename-convention)) so two A/B runs over the same mosaic name produce distinct, self-documenting filenames. Empirical guidance based on the Faial demonstrator A/B runs:
 
 - **Sparse-cloud or temperate AOIs** (long clear-sky baseline per pixel): `GeometricMedian` is the right default. It preserves same-scene spectral consistency across bands and the median is robust to a handful of cloud-contaminated outliers.
 - **Persistent-cloud / orographic-cloud AOIs** (Faial caldera, Azores in general, tropical mountain ranges): **prefer `Per-band percentile` with `percentile_value=25`**. p25 biases each pixel toward the darker quartile of its time stack, discarding the bright cloud-contaminated observations that drag a temporal median upward when cloud is the modal observation at a pixel. Validated on Faial S2, Landsat, and ASTER 2026-05-28: GeometricMedian outputs showed residual cloud-brightness over the caldera floor and rim; p25 outputs cleaned the caldera, with the expected ~5-10% drop in band means (and ~10-15% drop in NIR — vegetation NIR has the widest temporal distribution, so it falls most under a lower-percentile reducer).
@@ -139,6 +142,22 @@ Tools 01, 02, 04, 05, 06, 07 have *no* dependencies beyond the ArcGIS Pro base (
 
 ## Output convention
 
+### Filename convention
+
+All three mosaic tools name their final output `{Mosaic Name}_{compositor_tag}`, where `compositor_tag` reflects the algorithm actually used:
+
+| Compositor choice | Filename suffix | Example |
+| --- | --- | --- |
+| `GeometricMedian (default)` | `_Geomedian` | `Faial_V18_Geomedian` |
+| `Per-band median` | `_PerBandMedian` | `Faial_V18_PerBandMedian` |
+| `Per-band percentile (p25 default)` | `_PerBandP{N}` (`N` = percentile value) | `Faial_V18_PerBandP25` |
+
+ASTER's two products keep the product axis (`_Vnir`, `_VnirSwir`) between the user-supplied name and the compositor tag, so the two outputs of a single run sort next to each other in Pro's Catalog: `Aster_V18_Vnir_PerBandP25` and `Aster_V18_VnirSwir_PerBandP25`.
+
+Intermediates that exist internally — `_UTM{zone}{H}` for Landsat per-zone work, `_T{mgrs}` for Sentinel-2 per-tile work, `_Merged` for Landsat multi-zone merges, `_Masked` for AOI-mask outputs — are dropped from the final user-facing filename via a post-processing rename, so the GDB Catalog shows one entry per run instead of a trail. The renames are recorded as a `# rename_audit` section appended to the provenance CSV (S2 and Landsat) so a post-mortem of an unexpectedly-named output can be done from the sidecar without scrolling the Pro message log. ASTER doesn't perform any renames (output filename is the final canonical name from the start) so its provenance CSV has no rename-audit section.
+
+### General conventions
+
 - Reflectance: **float 0–1** (analysis-friendly; Sentinel-2 ×0.0001, ASTER ×0.001 applied during ingestion)
 - Mosaic CRS: inherited from input (UTM for Landsat / S2; resample-aligned for ASTER)
 - Each mosaic: **multi-band GeoTIFF or geodatabase raster + `_provenance.csv` + `_bands.csv`** (band-mapping sidecar documenting which stack position is which satellite band)
@@ -157,10 +176,14 @@ Tools 01, 02, 04, 05, 06, 07 have *no* dependencies beyond the ArcGIS Pro base (
 A `pytest` regression suite under [`tests/`](tests/) covers the
 pure-Python surface of the toolbox: sensor and band-role detection,
 filename parsers (ASTER / Landsat / Sentinel-2), in-place archive
-readers (`/vsitar/...`, `/vsizip/...`), provenance CSV writers,
-pure-numpy ICA, the per-band percentile compositor, the
-OmniCloudMask observed-pixel reducer, and the Tmask-style temporal
-outlier cleaner. The suite runs without ArcGIS Pro — a small
+readers (`/vsitar/...`, `/vsizip/...`), the shared `time_type`
+dropdown helpers (canonical label resolution, legacy snake_case
+remap, required-companion validation), the compositor filename-tag
+resolver, provenance CSV writers (including the rename-audit
+trail), pure-numpy ICA, the per-band percentile compositor, the
+OmniCloudMask observed-pixel reducer, the Tmask-style temporal
+outlier cleaner, and Tool 07's per-biome NDVI persistence / GDV
+threshold dispatch. The suite runs without ArcGIS Pro — a small
 `arcpy` stub in [`tests/conftest.py`](tests/conftest.py) covers the
 import-time surface so a stock CI runner can exercise the helpers.
 
