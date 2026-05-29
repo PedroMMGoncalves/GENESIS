@@ -222,6 +222,55 @@ def test_coerce_legacy_noop_on_canonical_value(genesis):
 
 
 # ---------------------------------------------------------------------------
+# Compositor filename tagging (output naming convention v1.0)
+# ---------------------------------------------------------------------------
+
+def test_compositor_filename_tag_geomedian_default(genesis):
+    """GeometricMedian -> ``Geomedian`` (preserves the Landsat 1.0
+    convention so existing Pro layouts pointing at the default-
+    compositor filename keep working)."""
+    assert genesis._compositor_filename_tag(
+        "GeometricMedian (default)", None,
+    ) == "Geomedian"
+
+
+def test_compositor_filename_tag_per_band_median(genesis):
+    assert genesis._compositor_filename_tag(
+        "Per-band median", None,
+    ) == "PerBandMedian"
+
+
+def test_compositor_filename_tag_per_band_percentile_uses_value(genesis):
+    """Per-band percentile encodes the percentile value, matching
+    the user's manual naming style ``S2_V09_T26SLH_PerBandP25``."""
+    assert genesis._compositor_filename_tag(
+        "Per-band percentile (p25 default)", 25,
+    ) == "PerBandP25"
+    assert genesis._compositor_filename_tag(
+        "Per-band percentile (p10)", 10,
+    ) == "PerBandP10"
+
+
+def test_compositor_filename_tag_per_band_percentile_falls_back_to_25(genesis):
+    """When percentile_value is None the tag defaults to p25 — the
+    documented Per-band percentile default."""
+    assert genesis._compositor_filename_tag(
+        "Per-band percentile", None,
+    ) == "PerBandP25"
+
+
+def test_compositor_filename_tag_unknown_returns_geomedian(genesis):
+    """Unknown / blank compositor returns ``Geomedian`` so a stale
+    saved Pro workflow that no longer matches any current option
+    still produces a sensible filename rather than a blank suffix."""
+    assert genesis._compositor_filename_tag(None, None) == "Geomedian"
+    assert genesis._compositor_filename_tag("", None) == "Geomedian"
+    assert genesis._compositor_filename_tag(
+        "Future Compositor", None,
+    ) == "Geomedian"
+
+
+# ---------------------------------------------------------------------------
 # Foundation copied from the audited landsat_toolbox is intact
 # ---------------------------------------------------------------------------
 

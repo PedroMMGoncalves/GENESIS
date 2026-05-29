@@ -120,22 +120,53 @@ def _make_mosaic_scratch_dir(gdb_path, prefix, mosaic_name):
     return scratch_dir
 
 
+def _compositor_filename_tag(compositor, percentile_value=None):
+    """Map a compositor choice to a short filename suffix tag.
+
+    Used by every mosaic tool so the output filename advertises which
+    reduction method produced it. Earlier Landsat releases hardcoded
+    ``_Geomedian`` even when the user picked Per-band; this helper
+    centralises the mapping so all three tools (and ASTER's two
+    products) stay in lockstep.
+
+    - GeometricMedian → ``Geomedian`` (preserves the Landsat 1.0
+      convention; existing layouts pointing at the default-compositor
+      filename keep working).
+    - Per-band median → ``PerBandMedian``.
+    - Per-band percentile → ``PerBandP{N}`` where N is the percentile
+      value (e.g., ``PerBandP25``) — matches the user's own manual
+      naming style for percentile composites.
+    """
+    if not compositor:
+        return "Geomedian"
+    if compositor.startswith("Per-band percentile"):
+        try:
+            p = int(percentile_value) if percentile_value is not None else 25
+        except (TypeError, ValueError):
+            p = 25
+        return f"PerBandP{p}"
+    if compositor.startswith("Per-band"):
+        return "PerBandMedian"
+    return "Geomedian"
+
+
 def _apply_aoi_mask_and_save(unmasked_path, mask_feature, gdb_path,
                               output_name, log_prefix=""):
-    """Apply an optional AOI mask to a saved median output.
+    """Apply an optional AOI mask. Final output ALWAYS lands at the
+    canonical ``{gdb_path}/{output_name}`` regardless of whether the
+    mask was applied — no ``_Masked`` suffix surfaces in the GDB
+    Catalog. The Catalog stays compact (one entry per run, not two)
+    and the filename communicates the compositor cleanly.
 
-    Returns ``(final_path, unmasked_to_delete)``:
+    Returns ``(final_path, [])``:
 
-      - If ``mask_feature`` is missing or does not exist, returns the
-        unmasked path unchanged and ``None`` for the deletion target.
-      - Otherwise, runs ``arcpy.sa.ExtractByMask``, saves the result
-        next to the unmasked output as ``{output_name}_Masked``, and
-        returns the masked path plus the unmasked path so the caller
-        can delete it during downstream cleanup.
-
-    The helper does NOT delete the unmasked output itself — the caller
-    typically batches deletions with other intermediates after
-    provenance has been written.
+      - If ``mask_feature`` is missing or does not exist, returns
+        ``unmasked_path`` unchanged and an empty list (nothing for
+        the caller to clean up).
+      - Otherwise: runs ``arcpy.sa.ExtractByMask`` to a temp name,
+        deletes the unmasked output, and renames the masked result
+        into the canonical name. Caller has nothing left to delete,
+        so the returned list is always empty.
     """
     if not (mask_feature and arcpy.Exists(mask_feature)):
         if mask_feature:
@@ -143,18 +174,36 @@ def _apply_aoi_mask_and_save(unmasked_path, mask_feature, gdb_path,
                 f"{log_prefix}  ✗ AOI mask {mask_feature!r} not found — "
                 f"output is unmasked."
             )
-        return unmasked_path, None
+        return unmasked_path, []
 
     mask_start = datetime.now()
+    canonical_path = os.path.join(gdb_path, output_name)
+    tmp_masked_path = os.path.join(gdb_path, f"{output_name}_Masked")
     masked = arcpy.sa.ExtractByMask(unmasked_path, mask_feature)
-    masked_path = os.path.join(gdb_path, f"{output_name}_Masked")
-    masked.save(masked_path)
+    masked.save(tmp_masked_path)
+    # Drop the unmasked output, then rename the masked result into its
+    # place so the final output carries the compositor tag without a
+    # noisy ``_Masked`` suffix.
+    try:
+        if arcpy.Exists(unmasked_path):
+            arcpy.management.Delete(unmasked_path)
+        if arcpy.Exists(canonical_path):
+            # Defensive: a stale canonical from a previous interrupted
+            # run would block the rename below.
+            arcpy.management.Delete(canonical_path)
+        arcpy.management.Rename(tmp_masked_path, canonical_path)
+    except arcpy.ExecuteError as e:
+        arcpy.AddWarning(
+            f"{log_prefix}  ⚠ Final rename failed ({e}); output stays "
+            f"at temp name {os.path.basename(tmp_masked_path)}."
+        )
+        return tmp_masked_path, []
     arcpy.AddMessage(
         f"{log_prefix}  ✓ AOI mask applied in "
         f"{(datetime.now() - mask_start).total_seconds():.1f}s "
-        f"→ {os.path.basename(masked_path)}"
+        f"→ {os.path.basename(canonical_path)}"
     )
-    return masked_path, unmasked_path
+    return canonical_path, []
 
 
 # ---------------------------------------------------------------------------
@@ -907,8 +956,9 @@ def _write_legacy_temporal_provenance_copy(anchor, csv_path):
     """Compat shim: also write the pre-v1.0 Tool 07 provenance filename
     (``{anchor}_temporal_provenance.csv``) by copying the just-written
     ``{anchor}_provenance.csv``. Anyone with a script reading the old
-    filename keeps working through this release; the shim is
-    scheduled for removal in the release after next.
+    filename keeps working through this release; **scheduled for
+    removal in v1.2** so the dual-write doesn't become permanent
+    technical debt.
 
     Defensive: a copy failure surfaces as a warning but never aborts
     the run — the canonical CSV is already on disk."""
@@ -5584,18 +5634,20 @@ class LandsatMosaic(object):
                 )
 
             # Phase 4 — Compositor.
-            # Output naming preserved across compositor choices: the
-            # `_Geomedian` suffix is retained (even when not strictly
-            # geomedian) to keep saved Pro tool runs and downstream
-            # consumers working. Users pick distinct mosaic_name for
-            # A/B between compositors (overwriteOutput is on).
-            if compositor.startswith("Per-band percentile"):
-                compositor_tag = f"PerBandPercentile{int(percentile_value):02d}"
-            elif compositor.startswith("Per-band"):
-                compositor_tag = "PerBandMedian"
-            else:
-                compositor_tag = "GeometricMedian"
-            output_path = os.path.join(gdb_path, f"{mosaic_name}_Geomedian")
+            # Output filename now reflects the actual compositor choice
+            # via _compositor_filename_tag so the GDB Catalog stays
+            # self-documenting (e.g., ``..._UTM26N_PerBandP25`` vs
+            # ``..._UTM26N_Geomedian``). The default Geomedian path
+            # keeps producing the same name as Landsat 1.0.
+            output_tag = _compositor_filename_tag(compositor, percentile_value)
+            output_path = os.path.join(
+                gdb_path, f"{mosaic_name}_{output_tag}",
+            )
+            # Phase header label keeps the long human-readable form.
+            compositor_tag = (
+                "GeometricMedian" if output_tag == "Geomedian"
+                else output_tag
+            )
             with phase(
                 f"Phase 4 — {compositor_tag} over {len(multiband_rasters)} stacks",
                 quiet_close=True,
@@ -5845,6 +5897,16 @@ class LandsatMosaic(object):
                 quiet_close=True,
                 silent_error=True,
             ) as ph5:
+                # Compositor tag is the canonical end-of-name suffix
+                # across all three mosaic tools — recompute here so the
+                # rename below targets the user-facing filename
+                # ``{mosaic_name}_{tag}`` (no UTM, no _Masked).
+                final_tag = _compositor_filename_tag(
+                    compositor, percentile_value,
+                )
+                canonical_name = f"{mosaic_name}_{final_tag}"
+                canonical_path = os.path.join(gdb_path, canonical_name)
+
                 # Merge zones if needed
                 if len(final_mosaics) > 1:
                     merged = self._merge_zone_mosaics(
@@ -5860,10 +5922,28 @@ class LandsatMosaic(object):
                 else:
                     final_mosaic = final_mosaics[0]
 
+                # Rename into the canonical name so the output drops
+                # the per-zone ``_UTM{zone}{H}`` (single-zone case) or
+                # the merge helper's ``_Merged`` (multi-zone case)
+                # before the mask phase consumes it. The result is one
+                # entry in the GDB Catalog named after the run +
+                # compositor — what the user actually wants to see.
+                if final_mosaic and final_mosaic != canonical_path:
+                    try:
+                        if arcpy.Exists(canonical_path):
+                            arcpy.management.Delete(canonical_path)
+                        arcpy.management.Rename(final_mosaic, canonical_path)
+                        final_mosaic = canonical_path
+                    except arcpy.ExecuteError as e:
+                        arcpy.AddWarning(
+                            f"  ⚠ Canonical rename failed ({e}); output "
+                            f"stays at {os.path.basename(final_mosaic)}."
+                        )
+
                 # Apply mask if specified
                 if final_mosaic and mask_feature:
                     masked = self._apply_mask(
-                        final_mosaic, mask_feature, gdb_path, mosaic_name
+                        final_mosaic, mask_feature, gdb_path, canonical_name
                     )
                     if masked and masked != final_mosaic:
                         intermediates_to_delete.append(final_mosaic)
@@ -6200,10 +6280,13 @@ class LandsatMosaic(object):
             return None
         
     def _apply_mask(self, mosaic_path, mask_feature, gdb_path, mosaic_name):
-        """Apply mask to mosaic dataset.
+        """Apply AOI mask. The final masked output lands at the input
+        ``mosaic_path`` (e.g., ``{name}_Geomedian``) so no ``_Masked``
+        suffix surfaces in the GDB Catalog. The unmasked input is
+        deleted; the masked result is renamed into its place.
 
         Returns:
-            str: path to the masked mosaic on success.
+            str: path to the masked mosaic on success (== input path).
             str: the unchanged input path when no mask was requested
                  (legitimate "skip" — caller asked for no masking).
             None: on failure (mask feature missing, ExtractByMask raised,
@@ -6218,8 +6301,8 @@ class LandsatMosaic(object):
                 return mosaic_path
 
             arcpy.AddMessage("\nApplying mask...")
-            masked_name = f"{mosaic_name}_Masked"
-            masked_path = os.path.join(gdb_path, masked_name)
+            tmp_masked_path = os.path.join(gdb_path, f"{mosaic_name}_Masked")
+            canonical_path = mosaic_path
 
             if not arcpy.Exists(mask_feature):
                 arcpy.AddError(
@@ -6231,7 +6314,7 @@ class LandsatMosaic(object):
 
             from arcpy.sa import ExtractByMask
             extracted = ExtractByMask(mosaic_path, mask_feature)
-            extracted.save(masked_path)
+            extracted.save(tmp_masked_path)
 
             # Set nodata=0 on every band + rebuild statistics so
             # Pro's auto-stretch ignores the out-of-AOI fill pixels
@@ -6244,15 +6327,30 @@ class LandsatMosaic(object):
             # against the V07 / V08 pixel-level diff: outside-AOI
             # sentinel value alone changed the visible composite
             # from washed-out uniform-green to honest terrain detail.
-            n_bands = int(arcpy.Raster(masked_path).bandCount)
+            n_bands = int(arcpy.Raster(tmp_masked_path).bandCount)
             arcpy.management.SetRasterProperties(
-                masked_path,
+                tmp_masked_path,
                 nodata=[[i + 1, 0] for i in range(n_bands)],
             )
-            arcpy.management.CalculateStatistics(masked_path)
+            arcpy.management.CalculateStatistics(tmp_masked_path)
 
-            arcpy.AddMessage(f"Masked mosaic saved as: {masked_path}")
-            return masked_path
+            # Drop the unmasked input and rename the masked output
+            # into its place so the Catalog shows one entry per run,
+            # named after the compositor (no ``_Masked`` suffix).
+            try:
+                if arcpy.Exists(canonical_path):
+                    arcpy.management.Delete(canonical_path)
+                arcpy.management.Rename(tmp_masked_path, canonical_path)
+                arcpy.AddMessage(
+                    f"Masked mosaic saved as: {canonical_path}"
+                )
+                return canonical_path
+            except arcpy.ExecuteError as e:
+                arcpy.AddWarning(
+                    f"Final rename failed ({e}); output stays at "
+                    f"{tmp_masked_path}."
+                )
+                return tmp_masked_path
 
         except Exception as e:
             arcpy.AddError(
@@ -7710,23 +7808,26 @@ class Sentinel2Mosaic(object):
                     )
                     tile_start = datetime.now()
                     try:
-                        tile_mosaic_name = f"{mosaic_name}_{tile}"
+                        # Per-tile + merged + masked outputs all carry the
+                        # compositor tag so the GDB Catalog is self-
+                        # documenting (A/B runs no longer need the user
+                        # to bake the algorithm into mosaic_name by hand).
+                        output_tag = _compositor_filename_tag(
+                            compositor, percentile_value,
+                        )
+                        tile_mosaic_name = (
+                            f"{mosaic_name}_{tile}_{output_tag}"
+                        )
                         tile_mosaic_path = os.path.join(gdb_path, tile_mosaic_name)
-                        # Compositor branch. Output naming unchanged
-                        # across compositor choices (mirrors ASTER's
-                        # convention: user picks distinct mosaic_name
-                        # for A/B comparisons, overwriteOutput is on).
                         if compositor.startswith("Per-band percentile"):
                             _per_band_percentile_composite(
                                 stacked_paths, tile_mosaic_path,
                                 scratch_dir, percentile_value,
                             )
-                            _tag = f"PerBandP{int(percentile_value):02d}"
                         elif compositor.startswith("Per-band"):
                             _per_band_median_composite(
                                 stacked_paths, tile_mosaic_path, scratch_dir,
                             )
-                            _tag = "PerBandMedian"
                         else:
                             median = arcpy.ia.GeometricMedian(
                                 stacked_paths,
@@ -7736,10 +7837,9 @@ class Sentinel2Mosaic(object):
                                 cellsize_type="FirstOf",
                             )
                             _save_geomedian_clean(median, tile_mosaic_path)
-                            _tag = "GeometricMedian"
                         tile_mosaics.append(tile_mosaic_path)
                         arcpy.AddMessage(
-                            f"  ✓ [{tile}] {len(stacked_paths)} scenes ({_tag}) → "
+                            f"  ✓ [{tile}] {len(stacked_paths)} scenes ({output_tag}) → "
                             f"{(datetime.now() - tile_start).total_seconds():.1f}s"
                         )
                     except arcpy.ExecuteError as e:
@@ -7770,13 +7870,21 @@ class Sentinel2Mosaic(object):
             ) as ph5:
                 intermediates_to_delete = []
 
+                # Output_tag was computed inside the per-tile loop above;
+                # recompute here so the merge/mask phase doesn't depend on
+                # a loop-scoped variable (defensive — the loop may have
+                # zero iterations in the cancel path).
+                output_tag = _compositor_filename_tag(
+                    compositor, percentile_value,
+                )
+                tagged_name = f"{mosaic_name}_{output_tag}"
                 if len(tile_mosaics) > 1:
-                    final_path = os.path.join(gdb_path, mosaic_name)
+                    final_path = os.path.join(gdb_path, tagged_name)
                     merge_start = datetime.now()
                     arcpy.management.MosaicToNewRaster(
                         input_rasters=tile_mosaics,
                         output_location=gdb_path,
-                        raster_dataset_name_with_extension=mosaic_name,
+                        raster_dataset_name_with_extension=tagged_name,
                         coordinate_system_for_the_raster="",
                         pixel_type="32_BIT_FLOAT",
                         cellsize=10,
@@ -7791,15 +7899,31 @@ class Sentinel2Mosaic(object):
                     intermediates_to_delete.extend(tile_mosaics)
                     final_mosaic = final_path
                 else:
-                    final_mosaic = tile_mosaics[0]
-                    arcpy.AddMessage(f"  ✓ Single tile → {os.path.basename(final_mosaic)}")
+                    # Single-tile fast path: rename the per-tile result to
+                    # the canonical merged name so the final filename
+                    # doesn't carry the tile id (e.g., ``..._T29SQB_...``).
+                    src = tile_mosaics[0]
+                    canonical = os.path.join(gdb_path, tagged_name)
+                    try:
+                        if arcpy.Exists(canonical):
+                            arcpy.management.Delete(canonical)
+                        arcpy.management.Rename(src, canonical)
+                        final_mosaic = canonical
+                    except arcpy.ExecuteError:
+                        final_mosaic = src
+                    arcpy.AddMessage(
+                        f"  ✓ Single tile → {os.path.basename(final_mosaic)}"
+                    )
 
-                # Apply AOI mask if requested.
+                # Apply AOI mask if requested. The helper renames the
+                # masked result into the canonical tagged name (no
+                # ``_Masked`` suffix surfaces in the GDB Catalog) and
+                # returns an empty deletion list.
                 final_mosaic, unmasked_to_delete = _apply_aoi_mask_and_save(
-                    final_mosaic, mask_feature, gdb_path, mosaic_name,
+                    final_mosaic, mask_feature, gdb_path, tagged_name,
                 )
                 if unmasked_to_delete:
-                    intermediates_to_delete.append(unmasked_to_delete)
+                    intermediates_to_delete.extend(unmasked_to_delete)
 
                 # Delete superseded intermediates so only the final mosaic
                 # remains in the output GDB.
@@ -9800,10 +9924,17 @@ class AsterMosaic(object):
             # Gated by produce_vnir_swir (default True). Also skipped
             # automatically when full_scenes is empty (e.g., AOI only
             # has post-Apr-2008 coverage).
+            # Compositor tag goes on the END of the name so the product
+            # axis (Vnir / VnirSwir) stays nearest the user-supplied
+            # mosaic_name, making it easier to scan by run.
+            output_tag = _compositor_filename_tag(
+                compositor, percentile_value,
+            )
             if produce_vnir_swir:
                 if full_scenes:
                     output_full = self._run_mosaic_pipeline(
-                        full_scenes, gdb_path, f"{mosaic_name}_VnirSwir",
+                        full_scenes, gdb_path,
+                        f"{mosaic_name}_VnirSwir_{output_tag}",
                         scratch_dir, use_qa, mask_feature,
                         save_stats, _ASTER_MODE_FULL, "VNIR+SWIR (9-band)",
                         enable_temporal_clean=enable_temporal_clean,
@@ -9836,7 +9967,8 @@ class AsterMosaic(object):
             # Gated by produce_vnir (default True).
             if produce_vnir:
                 output_vnir = self._run_mosaic_pipeline(
-                    kept_scenes, gdb_path, f"{mosaic_name}_Vnir",
+                    kept_scenes, gdb_path,
+                    f"{mosaic_name}_Vnir_{output_tag}",
                     scratch_dir, use_qa, mask_feature,
                     save_stats, _ASTER_MODE_VNIR, "VNIR-only (3-band)",
                     enable_temporal_clean=enable_temporal_clean,
