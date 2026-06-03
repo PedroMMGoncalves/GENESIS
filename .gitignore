@@ -10,6 +10,11 @@ legacy/
 # external GPUs that other users don't have.
 tests/_dev/
 
+# Local-only handoff doc: an open-source (arcpy-free) extract of the
+# data-ingestion functions, generated for sharing with a colleague. Not
+# part of the repo; the canonical code is genesis_toolbox.pyt at root.
+docs/ingestao_dados_TAR_SAFE_HDF.md
+
 # Python bytecode / cache
 __pycache__/
 *.py[cod]
